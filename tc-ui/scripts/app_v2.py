@@ -2857,7 +2857,7 @@ function renderSources() {
     if (src.type === 'pdf') {
       body = src.content
         ? '<span class="src-file-name">✅ ' + src.content + '</span>'
-        : '<div class="src-dropzone" id="srcZone_' + src.id + '" onclick="document.getElementById(\'srcFile_' + src.id + '\').click()">클릭하여 PDF 파일 선택<br><span style="font-size:11px;color:var(--muted)">최대 50MB · PDF만 허용</span></div>';
+        : '<div class="src-dropzone" id="srcZone_' + src.id + '" onclick="document.getElementById(&#39;srcFile_' + src.id + '&#39;).click()">클릭하여 PDF 파일 선택<br><span style="font-size:11px;color:var(--muted)">최대 50MB · PDF만 허용</span></div>';
       body += '<input type="file" id="srcFile_' + src.id + '" accept=".pdf" style="display:none" onchange="onSrcFileChange(' + src.id + ', this)">';
     } else if (src.type === 'url') {
       body = '<input type="text" id="srcUrl_' + src.id + '" class="form-input" placeholder="https://github.com/user/repo" value="' + src.content + '" oninput="updateSourceContent(' + src.id + ', this.value)">';
