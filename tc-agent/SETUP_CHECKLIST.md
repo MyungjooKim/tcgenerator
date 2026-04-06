@@ -168,16 +168,16 @@ python scripts\build_excel.py `
 
 ---
 
-## Step 8. TC 웹앱 설치 및 실행 (tc.automation)
+## Step 8. TC 웹앱 설치 및 실행 (tc-ui)
 
-TC를 **웹 UI**에서 생성하려면 `tc.automation` 폴더를 별도로 설정해야 합니다.
-Git을 클론하면 `tc-agent`과 **같은 부모 폴더**에 `tc.automation`이 있어야 합니다.
+TC를 **웹 UI**에서 생성하려면 `tc-ui` 폴더를 별도로 설정해야 합니다.
+Git을 클론하면 `tc-agent`과 **같은 부모 폴더**에 `tc-ui`이 있어야 합니다.
 
 ### 8-1. Anthropic API 키 설정
 
 **Mac:**
 ```bash
-cd ../tc.automation
+cd ../tc-ui
 cp .env.example .env
 # .env 파일을 열어 본인의 API 키 입력
 open -e .env
@@ -185,7 +185,7 @@ open -e .env
 
 **Windows (PowerShell):**
 ```powershell
-cd ..\tc.automation
+cd ..\tc-ui
 Copy-Item .env.example .env
 # .env 파일을 열어 본인의 API 키 입력
 notepad .env
@@ -204,13 +204,13 @@ ANTHROPIC_API_KEY=sk-ant-api03-여기에-본인-키-입력
 
 **Mac:**
 ```bash
-cd ../tc.automation
+cd ../tc-ui
 pip3 install -r requirements.txt
 ```
 
 **Windows (PowerShell):**
 ```powershell
-cd ..\tc.automation
+cd ..\tc-ui
 pip install -r requirements.txt
 ```
 
@@ -223,13 +223,13 @@ pip install -r requirements.txt
 
 **Mac — 터미널에서 직접:**
 ```bash
-cd ../tc.automation
+cd ../tc-ui
 python3 scripts/app_v2.py
 ```
 
 **Windows (PowerShell):**
 ```powershell
-cd ..\tc.automation
+cd ..\tc-ui
 python scripts\app_v2.py
 ```
 
@@ -243,7 +243,7 @@ Google Drive 업로드 기능을 사용할 경우:
 
 1. `config.example.json`을 복사해 `config.json`으로 저장
 2. 본인의 Google Drive 폴더 ID 입력
-3. Google Cloud Console에서 `credentials.json` 발급 후 `tc.automation/` 폴더에 저장
+3. Google Cloud Console에서 `credentials.json` 발급 후 `tc-ui/` 폴더에 저장
 
 **Mac:**
 ```bash
