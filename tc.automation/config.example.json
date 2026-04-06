@@ -1,0 +1,7 @@
+{
+  "google_drive": {
+    "upload_folder_id": "여기에-Google-Drive-폴더-ID-입력",
+    "folder_url": "https://drive.google.com/drive/folders/여기에-폴더-URL-입력",
+    "upload_as_spreadsheet": false
+  }
+}

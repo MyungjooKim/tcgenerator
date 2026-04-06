@@ -1,0 +1,12 @@
+# Phase 3 입력 소스
+
+## GitHub Pages (목업 사이트)
+https://5kyo.github.io/supercycl-mockup/
+
+## GitHub 리포지토리
+https://github.com/5kyo/supercycl-mockup
+
+## Phase 정보
+- Phase 코드: P3_MobileMockup
+- Phase 디렉토리: phase3-mobile-mockup/
+- 규칙: common/tc-rules.md + phase3-mobile-mockup/tc-rules-override.md

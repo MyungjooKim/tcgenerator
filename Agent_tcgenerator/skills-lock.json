@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "skills": {
+    "backlog-auditor": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "efe4a50112e6ac5440f803f6cb109aa8ca0d321ad92249b7c3628a1416535393"
+    },
+    "detailed-feature-review": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "5827558f626d253f07b7bb2151ae65a27457ff4129c3ef0664ceacfaa67f657c"
+    },
+    "project-check-update": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "a0645d2dd755b180e5969222d096d58fee8cde3b7e383249df6affe045cf24d9"
+    },
+    "project-overview-assessment": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "1f8a08a78df430c085c3f7f4a80d163fb90aa7c777e94875af69430dd955a94e"
+    },
+    "task-manager": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "cc0e96218af075e57d659b17e8d97b1c5b7421026ed589b0dc26cc7d2934adb5"
+    },
+    "test-case-generator": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "077d53039e7922166eb0c6010b2166b884cab7c5fbe10780735d4646ca4a0f58"
+    },
+    "uc-audit-cross-check": {
+      "source": "manhthien2005/PM_REVIEW",
+      "sourceType": "github",
+      "computedHash": "ba4d18a9e1d4b49af0e37c4572d0722a35c445e32cb99507d4bff3ab41415b63"
+    }
+  }
+}
