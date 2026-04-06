@@ -431,24 +431,38 @@ def load_tc_rules() -> str:
 
 # ── 1단계: 문서 파싱 ──────────────────────────────────────────────────────────
 def step_parse(sess: dict, input_type: str, content: str) -> str:
-    push_log(sess, f"[파싱] 입력 유형: {input_type}")
+    """단일 소스 파싱 (하위 호환용)"""
+    return step_parse_sources(sess, [{"type": input_type, "content": content}])
 
-    if input_type == "pdf":
-        pdf_path = SPECS_DIR / content
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF 파일 없음: {pdf_path}")
-        raw_text = extract_pdf_text(pdf_path)
-        push_log(sess, f"[파싱] PDF 텍스트 추출 완료 ({len(raw_text):,}자)")
 
-    elif input_type == "url":
-        raw_text = fetch_url_content(sess, content)
-        push_log(sess, f"[파싱] URL 콘텐츠 추출 완료 ({len(raw_text):,}자)")
+def step_parse_sources(sess: dict, sources: list) -> str:
+    """복수 소스를 각각 파싱한 뒤 하나의 텍스트로 합친다."""
+    parts = []
+    total = len(sources)
+    for i, src in enumerate(sources, 1):
+        src_type = src.get("type", "text")
+        content  = src.get("content", "").strip()
+        push_log(sess, f"[파싱] 소스 {i}/{total} — {src_type}")
 
-    else:  # text
-        raw_text = content
-        push_log(sess, f"[파싱] 텍스트 입력 ({len(raw_text):,}자)")
+        if src_type == "pdf":
+            pdf_path = SPECS_DIR / content
+            if not pdf_path.exists():
+                raise FileNotFoundError(f"PDF 파일 없음: {pdf_path}")
+            text = extract_pdf_text(pdf_path)
+            label = f"📄 PDF: {content}"
+            push_log(sess, f"[파싱] PDF 추출 완료 ({len(text):,}자)")
+        elif src_type == "url":
+            text  = fetch_url_content(sess, content)
+            label = f"🔗 URL: {content}"
+            push_log(sess, f"[파싱] URL 추출 완료 ({len(text):,}자)")
+        else:
+            text  = content
+            label = "✏️ 텍스트 입력"
+            push_log(sess, f"[파싱] 텍스트 입력 ({len(text):,}자)")
 
-    # 파싱 결과 저장
+        parts.append(f"===== 소스 {i}/{total} — {label} =====\n\n{text}")
+
+    raw_text = "\n\n".join(parts)
     parsed_path = sess["workspace"] / "01_parsed.md"
     parsed_path.write_text(f"# 파싱 결과\n\n{raw_text}", encoding="utf-8")
     return raw_text
@@ -1226,11 +1240,11 @@ def extract_section(block: str, section_name: str) -> str:
 
 
 # ── 메인 파이프라인 ────────────────────────────────────────────────────────────
-def run_pipeline(sess: dict, input_type: str, content: str, project_name: str):
+def run_pipeline(sess: dict, sources: list, project_name: str):
     try:
         sess["status"] = "parsing"
         push_stage(sess, 1, "문서 파싱", 5)
-        raw_text = step_parse(sess, input_type, content)
+        raw_text = step_parse_sources(sess, sources)
         check_stop(sess)
 
         sess["status"] = "policy"
@@ -1500,24 +1514,35 @@ def upload():
 @app.route("/start", methods=["POST"])
 def start():
     data = request.get_json(force=True) or {}
-    input_type   = data.get("input_type", "text")
-    content      = data.get("content", "").strip()
     project_name = data.get("project_name", "프로젝트").strip() or "프로젝트"
 
-    if not content:
-        return jsonify({"ok": False, "error": "입력 내용이 없습니다."}), 400
-    if input_type not in ("pdf", "url", "text"):
-        return jsonify({"ok": False, "error": "input_type은 pdf/url/text 중 하나"}), 400
-    if input_type == "pdf" and not (SPECS_DIR / content).exists():
-        return jsonify({"ok": False, "error": f"PDF 파일 없음: {content}"}), 400
+    # 새 형식: sources 배열 / 구버전 호환: input_type + content
+    sources = data.get("sources")
+    if not sources:
+        input_type = data.get("input_type", "text")
+        content    = data.get("content", "").strip()
+        sources    = [{"type": input_type, "content": content}]
+
+    if not sources:
+        return jsonify({"ok": False, "error": "소스가 없습니다."}), 400
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY가 설정되지 않았습니다."}), 500
+
+    for src in sources:
+        t = src.get("type", "text")
+        c = src.get("content", "").strip()
+        if not c:
+            return jsonify({"ok": False, "error": f"{t} 소스의 내용이 비어 있습니다."}), 400
+        if t not in ("pdf", "url", "text"):
+            return jsonify({"ok": False, "error": f"소스 유형 오류: {t}"}), 400
+        if t == "pdf" and not (SPECS_DIR / c).exists():
+            return jsonify({"ok": False, "error": f"PDF 파일 없음: {c}"}), 400
 
     sess = new_session()
     sess["project_name"] = project_name
     t = threading.Thread(
         target=run_pipeline,
-        args=(sess, input_type, content, project_name),
+        args=(sess, sources, project_name),
         daemon=True
     )
     sess["thread"] = t
@@ -2070,6 +2095,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stopped-banner .stopped-msg  { font-size: 14px; font-weight: 600; color: #c53030; }
   .stopped-banner .stopped-sub  { font-size: 12px; color: #888; margin-top: 2px; }
 
+  /* 다중 소스 입력 */
+  .source-add-bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .btn-add-source {
+    padding: 7px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
+    background: var(--white); color: var(--text); border: 1.5px solid var(--border);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .btn-add-source:hover { border-color: var(--blue); color: var(--blue); background: #EBF2FF; }
+  .source-card {
+    border: 1.5px solid var(--border); border-radius: 10px;
+    margin-bottom: 10px; overflow: hidden; background: var(--white);
+  }
+  .source-card-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .source-type-badge {
+    font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 12px;
+  }
+  .source-type-badge.pdf  { background: #FEE2E2; color: #C53030; }
+  .source-type-badge.url  { background: #EBF2FF; color: var(--blue); }
+  .source-type-badge.text { background: #D1FAE5; color: #276749; }
+  .btn-remove-source {
+    background: none; border: none; cursor: pointer; font-size: 14px;
+    color: var(--muted); padding: 2px 8px; border-radius: 4px;
+  }
+  .btn-remove-source:hover { background: #FEE2E2; color: #C53030; }
+  .source-card-body { padding: 12px; }
+  .src-dropzone {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 18px;
+    text-align: center; cursor: pointer; font-size: 13px; color: var(--muted);
+    transition: all 0.15s;
+  }
+  .src-dropzone:hover { border-color: var(--blue); color: var(--blue); }
+  .src-file-name { font-size: 13px; font-weight: 600; color: var(--success); padding: 4px 0; }
+  .source-empty {
+    border: 2px dashed var(--border); border-radius: 10px; padding: 28px 16px;
+    text-align: center; font-size: 13px; color: var(--muted); line-height: 1.8;
+  }
+
   /* 샘플 기획서 배너 */
   .sample-banner {
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
@@ -2316,48 +2381,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <div class="form-group">
-        <label class="form-label">입력 유형</label>
-        <div class="radio-group">
-          <button type="button" class="type-btn active" id="typePdf" onclick="switchInputType('pdf')">
-            📄 PDF 파일
-          </button>
-          <button type="button" class="type-btn" id="typeUrl" onclick="switchInputType('url')">
-            🔗 GitHub URL
-          </button>
-          <button type="button" class="type-btn" id="typeText" onclick="switchInputType('text')">
-            ✏️ 직접 입력
-          </button>
+        <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
+          <span>입력 소스</span>
+          <span style="font-size:11px;color:var(--muted);font-weight:400">여러 소스를 자유롭게 조합하세요</span>
+        </label>
+        <div class="source-add-bar">
+          <button type="button" class="btn-add-source" onclick="addSource('pdf')">📄 PDF 추가</button>
+          <button type="button" class="btn-add-source" onclick="addSource('url')">🔗 GitHub URL 추가</button>
+          <button type="button" class="btn-add-source" onclick="addSource('text')">✏️ 텍스트 추가</button>
         </div>
-      </div>
-
-      <!-- PDF 입력 -->
-      <div id="inputPdf" class="form-group">
-        <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
-          <div class="icon">📤</div>
-          <div>PDF 파일을 드래그하거나 클릭하여 업로드</div>
-          <div class="hint">최대 50MB · PDF만 허용</div>
+        <div id="sourceList"></div>
+        <div id="sourceEmpty" class="source-empty">
+          소스를 추가하세요.<br>
+          <span style="font-size:12px">PDF 기획서 · GitHub mockup URL · 슬랙 변경 내용 등을 자유롭게 조합할 수 있습니다.</span>
         </div>
-        <input type="file" id="fileInput" accept=".pdf">
-        <div id="uploadedFile" class="hidden" style="margin-top:10px; font-size:13px; color:var(--success); font-weight:600;"></div>
-      </div>
-
-      <!-- URL 입력 -->
-      <div id="inputUrl" class="form-group hidden">
-        <label class="form-label">GitHub URL / 웹 페이지 URL</label>
-        <input type="text" id="urlInput" class="form-input"
-               placeholder="https://github.com/user/repo 또는 https://xxx.github.io/...">
-        <div class="input-hint">GitHub 저장소, GitHub Pages, 또는 기획서가 있는 웹페이지 URL을 입력하세요.</div>
-      </div>
-
-      <!-- 텍스트 직접 입력 -->
-      <div id="inputText" class="form-group hidden">
-        <div class="info-box" style="margin-bottom:10px">
-          📝 <strong>아래 텍스트 박스에 기획 내용을 직접 붙여넣거나 입력하세요.</strong><br>
-          기획서, 요구사항 문서, 기능 명세, 화면 설명 등 어떤 형태의 텍스트도 가능합니다.
-        </div>
-        <textarea id="textInput" class="form-input text-input-area"
-                  placeholder="기획서 내용, 기능 명세, 요구사항 등을 자유롭게 붙여넣으세요."></textarea>
-        <div class="input-hint">최소 100자 이상 입력하면 더 정확한 TC가 생성됩니다.</div>
       </div>
 
       <button class="btn btn-primary" id="startBtn" onclick="startPipeline()">
@@ -2609,15 +2646,13 @@ async function loadSampleDoc() {
   try {
     const r = await fetch('/sample-content');
     const data = await r.json();
-    // 직접 입력 모드로 전환
-    switchInputType('text');
-    // textarea 채우기
-    document.getElementById('textInput').value = data.content;
-    // 프로젝트명이 비어 있으면 기본값 입력
+    // 텍스트 소스로 추가
+    const id = ++sourceCounter;
+    sources.push({ id, type: 'text', content: data.content });
+    renderSources();
     const pn = document.getElementById('projectName');
     if (!pn.value.trim()) pn.value = '샘플_쇼핑몰앱';
-    // 안내 메시지
-    showToast('샘플 기획서가 채워졌습니다. 파이프라인을 시작하세요!');
+    showToast('샘플 기획서가 소스로 추가됐습니다. 파이프라인을 시작하세요!');
   } catch(e) {
     alert('샘플 불러오기 실패: ' + e.message);
   }
@@ -2757,78 +2792,103 @@ async function startModify() {
 }
 
 // ── 입력 유형 전환 ──────────────────────────────────────────────────────────────
-let currentInputType = 'pdf';
+// ── 다중 소스 관리 ──────────────────────────────────────────────────────────
+let sources = [];
+let sourceCounter = 0;
 
-function switchInputType(type) {
-  currentInputType = type;
-  // 모든 패널 숨기기
-  ['inputPdf', 'inputUrl', 'inputText'].forEach(id => {
-    document.getElementById(id).classList.add('hidden');
-  });
-  // 선택된 패널 보이기
-  const panelId = 'input' + type.charAt(0).toUpperCase() + type.slice(1);
-  document.getElementById(panelId).classList.remove('hidden');
-  // 탭 버튼 상태 업데이트
-  ['typePdf', 'typeUrl', 'typeText'].forEach(id => {
-    document.getElementById(id).classList.remove('active');
-  });
-  document.getElementById('type' + type.charAt(0).toUpperCase() + type.slice(1)).classList.add('active');
-  // 직접 입력 시 textarea에 포커스
-  if (type === 'text') {
-    setTimeout(() => document.getElementById('textInput').focus(), 50);
-  }
+function addSource(type) {
+  const id = ++sourceCounter;
+  sources.push({ id, type, content: '' });
+  renderSources();
+  setTimeout(() => {
+    if (type === 'pdf') document.getElementById('srcFile_' + id)?.click();
+    else if (type === 'url') document.getElementById('srcUrl_' + id)?.focus();
+    else document.getElementById('srcText_' + id)?.focus();
+  }, 80);
 }
 
-// 드래그앤드롭
-const dropzone = document.getElementById('dropzone');
-const fileInput = document.getElementById('fileInput');
+function removeSource(id) {
+  sources = sources.filter(s => s.id !== id);
+  renderSources();
+}
 
-dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
-dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
-dropzone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropzone.classList.remove('drag-over');
-  const files = e.dataTransfer.files;
-  if (files.length > 0) uploadFile(files[0]);
-});
-fileInput.addEventListener('change', () => {
-  if (fileInput.files.length > 0) uploadFile(fileInput.files[0]);
-});
+function updateSourceContent(id, value) {
+  const s = sources.find(s => s.id === id);
+  if (s) s.content = value;
+}
 
-async function uploadFile(file) {
-  if (!file.name.endsWith('.pdf')) { alert('PDF 파일만 허용됩니다.'); return; }
+async function onSrcFileChange(id, input) {
+  if (!input.files.length) return;
+  const file = input.files[0];
+  if (!file.name.toLowerCase().endsWith('.pdf')) { alert('PDF 파일만 허용됩니다.'); return; }
+  const zone = document.getElementById('srcZone_' + id);
+  if (zone) zone.innerHTML = '⏳ 업로드 중...';
   const fd = new FormData();
   fd.append('file', file);
-  dropzone.innerHTML = '<div class="icon">⏳</div><div>업로드 중...</div>';
   try {
     const resp = await fetch('/upload', { method: 'POST', body: fd });
     const data = await resp.json();
     if (data.ok) {
-      dropzone.innerHTML = `<div class="icon">✅</div><div>${data.filename} 업로드 완료</div>`;
-      dropzone.dataset.filename = data.filename;
+      const s = sources.find(s => s.id === id);
+      if (s) s.content = data.filename;
+      if (zone) zone.innerHTML = '<span class="src-file-name">✅ ' + data.filename + '</span>';
     } else {
-      dropzone.innerHTML = `<div class="icon">❌</div><div>${data.error}</div>`;
+      if (zone) zone.innerHTML = '❌ ' + data.error;
     }
   } catch(e) {
-    dropzone.innerHTML = `<div class="icon">❌</div><div>업로드 실패: ${e.message}</div>`;
+    if (zone) zone.innerHTML = '❌ 업로드 실패';
   }
 }
 
-async function startPipeline() {
-  const inputType = currentInputType;
-  const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
-  let content = '';
-
-  if (inputType === 'pdf') {
-    content = dropzone.dataset.filename || '';
-    if (!content) { alert('PDF 파일을 먼저 업로드해주세요.'); return; }
-  } else if (inputType === 'url') {
-    content = document.getElementById('urlInput').value.trim();
-    if (!content) { alert('URL을 입력해주세요.'); return; }
-  } else {
-    content = document.getElementById('textInput').value.trim();
-    if (!content) { alert('텍스트를 입력해주세요.'); return; }
+function renderSources() {
+  const list  = document.getElementById('sourceList');
+  const empty = document.getElementById('sourceEmpty');
+  if (!list) return;
+  if (sources.length === 0) {
+    list.innerHTML = '';
+    empty && empty.classList.remove('hidden');
+    return;
   }
+  empty && empty.classList.add('hidden');
+  list.innerHTML = sources.map(src => {
+    const badgeClass = src.type;
+    const badges = { pdf: '📄 PDF', url: '🔗 GitHub URL', text: '✏️ 텍스트' };
+    let body = '';
+    if (src.type === 'pdf') {
+      body = src.content
+        ? '<span class="src-file-name">✅ ' + src.content + '</span>'
+        : '<div class="src-dropzone" id="srcZone_' + src.id + '" onclick="document.getElementById(\'srcFile_' + src.id + '\').click()">클릭하여 PDF 파일 선택<br><span style="font-size:11px;color:var(--muted)">최대 50MB · PDF만 허용</span></div>';
+      body += '<input type="file" id="srcFile_' + src.id + '" accept=".pdf" style="display:none" onchange="onSrcFileChange(' + src.id + ', this)">';
+    } else if (src.type === 'url') {
+      body = '<input type="text" id="srcUrl_' + src.id + '" class="form-input" placeholder="https://github.com/user/repo" value="' + src.content + '" oninput="updateSourceContent(' + src.id + ', this.value)">';
+      body += '<div class="input-hint">GitHub 저장소, GitHub Pages, 또는 기획서가 있는 웹페이지 URL</div>';
+    } else {
+      body = '<textarea id="srcText_' + src.id + '" class="form-input text-input-area" placeholder="기획서 내용, 슬랙 메시지 등 자유롭게 붙여넣으세요..." oninput="updateSourceContent(' + src.id + ', this.value)">' + src.content + '</textarea>';
+    }
+    return '<div class="source-card">' +
+      '<div class="source-card-header">' +
+        '<span class="source-type-badge ' + badgeClass + '">' + badges[src.type] + '</span>' +
+        '<button type="button" class="btn-remove-source" onclick="removeSource(' + src.id + ')">✕ 삭제</button>' +
+      '</div>' +
+      '<div class="source-card-body">' + body + '</div>' +
+      '</div>';
+  }).join('');
+}
+
+async function startPipeline() {
+  const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
+
+  if (sources.length === 0) { alert('소스를 하나 이상 추가해주세요.'); return; }
+
+  const typeNames = { pdf: 'PDF', url: 'GitHub URL', text: '텍스트' };
+  for (const s of sources) {
+    if (!s.content.trim()) {
+      alert(typeNames[s.type] + ' 소스의 내용을 입력해주세요.');
+      return;
+    }
+  }
+
+  const payload = sources.map(s => ({ type: s.type, content: s.content }));
 
   document.getElementById('startBtn').disabled = true;
   document.getElementById('card2').classList.remove('hidden');
@@ -2838,7 +2898,7 @@ async function startPipeline() {
     const resp = await fetch('/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input_type: inputType, content, project_name: projectName })
+      body: JSON.stringify({ sources: payload, project_name: projectName })
     });
     const data = await resp.json();
     if (!data.ok) {
