@@ -30,7 +30,7 @@ from flask import Flask, request, jsonify, render_template_string, send_file, Re
 
 # ── 경로 설정 ──────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent.parent   # /tc-ui/
-AGENT_DIR      = BASE_DIR.parent / "Agent_tcgenerator"
+AGENT_DIR      = BASE_DIR.parent / "tc-agent"
 RULES_FILE     = AGENT_DIR / "common" / "tc-rules.md"
 BUILD_EXCEL    = AGENT_DIR / "scripts" / "build_excel.py"
 WORKSPACE_ROOT   = BASE_DIR / "workspace"

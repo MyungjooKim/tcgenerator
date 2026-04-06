@@ -53,8 +53,8 @@ https://code.visualstudio.com/ 에서 설치.
 
 받은 폴더를 원하는 위치에 놓는다.
 
-**Mac 예시 경로**: `/Users/사용자명/Agent_tcgenerator`
-**Windows 예시 경로**: `C:\Users\사용자명\Agent_tcgenerator`
+**Mac 예시 경로**: `/Users/사용자명/tc-agent`
+**Windows 예시 경로**: `C:\Users\사용자명\tc-agent`
 
 다음 항목이 있는지 확인:
 - [ ] `HANDOVER.md`
@@ -83,7 +83,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 **Mac (터미널):**
 ```bash
-cd /Users/사용자명/Agent_tcgenerator
+cd /Users/사용자명/tc-agent
 python3 -m venv .venv
 source .venv/bin/activate
 pip install openpyxl
@@ -91,7 +91,7 @@ pip install openpyxl
 
 **Windows (PowerShell):**
 ```powershell
-cd "C:\Users\사용자명\Agent_tcgenerator"
+cd "C:\Users\사용자명\tc-agent"
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install openpyxl
@@ -110,13 +110,13 @@ python -c "import openpyxl; print('OK')"
 
 **Mac:**
 ```bash
-cd /Users/사용자명/Agent_tcgenerator
+cd /Users/사용자명/tc-agent
 claude
 ```
 
 **Windows (PowerShell):**
 ```powershell
-cd "C:\Users\사용자명\Agent_tcgenerator"
+cd "C:\Users\사용자명\tc-agent"
 claude
 ```
 
@@ -128,13 +128,13 @@ Claude Code 실행 후 본인 경로에 맞게 입력:
 
 **Mac:**
 ```
-이 폴더(/Users/사용자명/Agent_tcgenerator)에서 TC 자동화 파이프라인을 운영 중이야.
+이 폴더(/Users/사용자명/tc-agent)에서 TC 자동화 파이프라인을 운영 중이야.
 HANDOVER.md를 먼저 읽고, 이후 작업 요청에 따라 진행해줘.
 ```
 
 **Windows:**
 ```
-이 폴더(C:\Users\사용자명\Agent_tcgenerator)에서 TC 자동화 파이프라인을 운영 중이야.
+이 폴더(C:\Users\사용자명\tc-agent)에서 TC 자동화 파이프라인을 운영 중이야.
 HANDOVER.md를 먼저 읽고, 이후 작업 요청에 따라 진행해줘.
 ```
 
@@ -146,7 +146,7 @@ HANDOVER.md를 먼저 읽고, 이후 작업 요청에 따라 진행해줘.
 
 **Mac:**
 ```bash
-cd /Users/사용자명/Agent_tcgenerator
+cd /Users/사용자명/tc-agent
 source .venv/bin/activate
 python3 scripts/build_excel.py \
   --phase P3_MobileMockup \
@@ -156,7 +156,7 @@ python3 scripts/build_excel.py \
 
 **Windows (PowerShell):**
 ```powershell
-cd "C:\Users\사용자명\Agent_tcgenerator"
+cd "C:\Users\사용자명\tc-agent"
 .venv\Scripts\Activate.ps1
 python scripts\build_excel.py `
   --phase P3_MobileMockup `
@@ -171,7 +171,7 @@ python scripts\build_excel.py `
 ## Step 8. TC 웹앱 설치 및 실행 (tc.automation)
 
 TC를 **웹 UI**에서 생성하려면 `tc.automation` 폴더를 별도로 설정해야 합니다.
-Git을 클론하면 `Agent_tcgenerator`과 **같은 부모 폴더**에 `tc.automation`이 있어야 합니다.
+Git을 클론하면 `tc-agent`과 **같은 부모 폴더**에 `tc.automation`이 있어야 합니다.
 
 ### 8-1. Anthropic API 키 설정
 

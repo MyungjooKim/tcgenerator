@@ -4,7 +4,7 @@ BDD 형식 테스트 케이스(TC)를 자동 생성하는 도구 모음.
 
 ```
 repo/
-├── Agent_tcgenerator/   Claude Code 기반 TC 파이프라인
+├── tc-agent/   Claude Code 기반 TC 파이프라인
 └── tc-ui/              웹 UI (Flask + Claude AI)
 ```
 
@@ -12,7 +12,7 @@ repo/
 
 ## 처음 설치하는 경우
 
-→ `Agent_tcgenerator/SETUP_CHECKLIST.md` 를 순서대로 따라 하세요.
+→ `tc-agent/SETUP_CHECKLIST.md` 를 순서대로 따라 하세요.
 
 ---
 
@@ -38,7 +38,7 @@ cp tc-ui/config.example.json tc-ui/config.json
 ```bash
 cd /path/to/this/folder
 git init
-git add Agent_tcgenerator tc-ui .gitignore README.md
+git add tc-agent tc-ui .gitignore README.md
 git commit -m "initial commit"
 git remote add origin https://github.com/YOUR_ORG/tc-suite.git
 git push -u origin main
@@ -59,7 +59,7 @@ pip3 install -r tc-ui/requirements.txt          # Mac
 pip  install -r tc-ui\requirements.txt          # Windows
 
 # Agent 파이프라인 패키지 설치
-cd Agent_tcgenerator
+cd tc-agent
 python3 -m venv .venv && source .venv/bin/activate      # Mac
 python  -m venv .venv; .venv\Scripts\Activate.ps1       # Windows
 pip install openpyxl
