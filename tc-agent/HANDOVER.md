@@ -489,29 +489,29 @@ HANDOVER.md를 먼저 읽고, 이후 작업 요청에 따라 진행해줘.
 
 ---
 
-## 11. TC 웹앱 (tc.automation)
+## 11. TC 웹앱 (tc-ui)
 
 Claude Code 없이 **웹 브라우저**에서 TC를 생성할 수 있는 별도 웹앱이 있다.
-Git 저장소에서 `tc-agent`과 **같은 부모 폴더**에 `tc.automation`이 함께 존재한다.
+Git 저장소에서 `tc-agent`과 **같은 부모 폴더**에 `tc-ui`이 함께 존재한다.
 
 ```
 repo/
 ├── tc-agent/   ← 이 폴더 (Claude Code 파이프라인)
-└── tc.automation/              ← 웹 UI (Flask 서버)
+└── tc-ui/              ← 웹 UI (Flask 서버)
 ```
 
 ### 웹앱 실행
 
 **Mac:**
 ```bash
-cd ../tc.automation
+cd ../tc-ui
 python3 scripts/app_v2.py
 # → http://localhost:5001 접속
 ```
 
 **Windows:**
 ```powershell
-cd ..\tc.automation
+cd ..\tc-ui
 python scripts\app_v2.py
 ```
 
@@ -519,9 +519,9 @@ python scripts\app_v2.py
 
 | 파일 | 설명 |
 |------|------|
-| `tc.automation/.env` | Anthropic API 키 설정 (각자 본인 키) |
-| `tc.automation/config.json` | Google Drive 폴더 ID (Drive 업로드 시) |
-| `tc.automation/credentials.json` | Google OAuth 인증 파일 (Drive 업로드 시) |
+| `tc-ui/.env` | Anthropic API 키 설정 (각자 본인 키) |
+| `tc-ui/config.json` | Google Drive 폴더 ID (Drive 업로드 시) |
+| `tc-ui/credentials.json` | Google OAuth 인증 파일 (Drive 업로드 시) |
 
 > ⚠️ `.env`, `config.json`, `credentials.json` 은 모두 Git에서 제외됨.
 > 각자 `cp .env.example .env` / `cp config.example.json config.json` 후 본인 값 입력.
