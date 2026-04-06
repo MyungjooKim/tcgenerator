@@ -9,7 +9,7 @@
 ## 폴더 구조
 
 ```
-tc.automation/
+tc-ui/
 │
 ├── specs/                  # 기능 기획서 PDF (신규 기능 추가 시 여기에 저장)
 │   └── README.md
@@ -95,7 +95,7 @@ TC 자동 생성에 사용합니다. [claude.ai/download](https://claude.ai/down
 ## 빌드 실행 (기존 TC 재생성)
 
 ```bash
-# tc.automation/ 폴더에서 실행
+# tc-ui/ 폴더에서 실행
 python3 scripts/build_tc_v8.py
 ```
 

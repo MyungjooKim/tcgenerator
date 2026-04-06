@@ -29,7 +29,7 @@ if env_file.exists():
 from flask import Flask, request, jsonify, render_template_string, send_file, Response
 
 # ── 경로 설정 ──────────────────────────────────────────────────────────────────
-BASE_DIR       = Path(__file__).parent.parent   # /tc.automation/
+BASE_DIR       = Path(__file__).parent.parent   # /tc-ui/
 AGENT_DIR      = BASE_DIR.parent / "Agent_tcgenerator"
 RULES_FILE     = AGENT_DIR / "common" / "tc-rules.md"
 BUILD_EXCEL    = AGENT_DIR / "scripts" / "build_excel.py"
@@ -2568,7 +2568,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           style="color:#3557A0">Google Cloud Console</a> 접속</li>
       <li><strong>+ 사용자 인증 정보 만들기 → OAuth 클라이언트 ID</strong></li>
       <li>애플리케이션 유형: <strong>데스크톱 앱</strong> 선택 후 만들기</li>
-      <li>JSON 다운로드 → <strong>tc.automation 폴더에 <code>credentials.json</code>으로 저장</strong></li>
+      <li>JSON 다운로드 → <strong>tc-ui 폴더에 <code>credentials.json</code>으로 저장</strong></li>
       <li>저장 후 다시 <strong>Drive에 올리기</strong> 클릭 → 브라우저에서 Google 계정 인증</li>
     </ol>
     <p style="font-size:12px;color:#888;margin-top:10px">
