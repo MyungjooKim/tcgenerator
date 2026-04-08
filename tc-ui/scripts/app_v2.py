@@ -24,7 +24,9 @@ if env_file.exists():
     for line in env_file.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            key, val = k.strip(), v.strip()
+            if not os.environ.get(key):   # 빈 값이면 .env 값으로 채움
+                os.environ[key] = val
 
 from flask import Flask, request, jsonify, render_template_string, send_file, Response
 
