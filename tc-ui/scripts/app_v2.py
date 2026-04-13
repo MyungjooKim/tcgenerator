@@ -2046,7 +2046,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
   header .header-sub { font-size: 13px; opacity: 0.7; margin-left: auto; }
-  .version-badge { font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.6); background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.25); border-radius: 10px; padding: 2px 8px; letter-spacing: 0.3px; white-space: nowrap; }
+  .version-badge { font-size: 11px; font-weight: 600; color: #FF8C00; letter-spacing: 0.3px; display: block; margin-top: 2px; }
 
   /* 진행 스텝 바 */
   .steps-bar {
@@ -2430,9 +2430,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
+    <span class="version-badge">v0.9.1</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
-  <span class="version-badge">v0.9.1</span>
 </header>
 
 <!-- 진행 스텝 바 -->
