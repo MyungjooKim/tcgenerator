@@ -2045,7 +2045,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     box-shadow: 0 2px 8px rgba(0,0,0,0.18);
   }
   header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
-  header span { font-size: 13px; opacity: 0.7; margin-left: auto; }
+  header .header-sub { font-size: 13px; opacity: 0.7; margin-left: auto; }
+  .version-badge { font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.6); background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.25); border-radius: 10px; padding: 2px 8px; letter-spacing: 0.3px; white-space: nowrap; }
 
   /* 진행 스텝 바 */
   .steps-bar {
@@ -2399,7 +2400,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   #toast.error   { background: #e53e3e; color: #fff; }
 
   @media (max-width: 480px) { .action-row { flex-direction: column; } }
-  .version-badge { margin-left: auto; font-size: 11px; font-weight: 600; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 2px 8px; letter-spacing: 0.3px; }
 
   /* GitHub 파일 트리 */
   .btn-preview-tree { margin-top: 8px; padding: 5px 12px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
@@ -2431,7 +2431,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
   </div>
-  <span>Claude AI · PDF / URL / 텍스트 → Excel</span>
+  <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
   <span class="version-badge">v0.9.1</span>
 </header>
 
