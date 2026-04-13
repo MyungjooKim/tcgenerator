@@ -2718,7 +2718,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge">v0.9.1</span>
+    <span class="version-badge">v0.9.2</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
@@ -3196,7 +3196,7 @@ async function createProject() {
 async function deleteProject() {
   const name = document.getElementById('projectSelect').value;
   if (!name) return;
-  if (!confirm('"' + name + '" 프로젝트를 삭제할까요?\n(TC 파일은 삭제되지 않습니다)')) return;
+  if (!confirm('"' + name + '" 프로젝트를 삭제할까요?\\n(TC 파일은 삭제되지 않습니다)')) return;
   try {
     const r = await fetch('/projects/' + encodeURIComponent(name), { method: 'DELETE' });
     const d = await r.json();
