@@ -3083,7 +3083,10 @@ function switchMode(mode) {
   document.getElementById('modeModify').classList.toggle('active', mode === 'modify');
   document.getElementById('panelNew').classList.toggle('hidden', mode !== 'new');
   document.getElementById('panelModify').classList.toggle('hidden', mode !== 'modify');
-  if (mode === 'modify') loadProjects();
+  if (mode === 'modify') {
+    loadProjects();
+    initTcDropzone();
+  }
 }
 
 // 샘플 기획서 불러오기 — 직접 입력 모드로 전환 후 textarea 채우기
@@ -3215,18 +3218,24 @@ function switchImportTab(tab) {
   document.getElementById('panelSheets').classList.toggle('hidden', tab !== 'sheets');
 }
 
-// Excel / md 파일 업로드
-const tcDropzone = document.getElementById('tcDropzone');
-const tcFileInput = document.getElementById('tcFileInput');
-tcDropzone.addEventListener('dragover', e => { e.preventDefault(); tcDropzone.style.borderColor = 'var(--teal)'; });
-tcDropzone.addEventListener('dragleave', () => { tcDropzone.style.borderColor = ''; });
-tcDropzone.addEventListener('drop', e => {
-  e.preventDefault(); tcDropzone.style.borderColor = '';
-  if (e.dataTransfer.files.length > 0) uploadTcFile(e.dataTransfer.files[0]);
-});
-tcFileInput.addEventListener('change', () => {
-  if (tcFileInput.files.length > 0) uploadTcFile(tcFileInput.files[0]);
-});
+// Excel / md 파일 업로드 — 이벤트는 switchMode('modify') 이후 패널 표시 시점에 등록
+function initTcDropzone() {
+  const tcDropzone = document.getElementById('tcDropzone');
+  const tcFileInput = document.getElementById('tcFileInput');
+  if (!tcDropzone || tcDropzone._initialized) return;
+  tcDropzone._initialized = true;
+  tcDropzone.addEventListener('dragover', e => { e.preventDefault(); tcDropzone.style.borderColor = 'var(--teal)'; });
+  tcDropzone.addEventListener('dragleave', () => { tcDropzone.style.borderColor = ''; });
+  tcDropzone.addEventListener('drop', e => {
+    e.preventDefault(); tcDropzone.style.borderColor = '';
+    if (e.dataTransfer.files.length > 0) uploadTcFile(e.dataTransfer.files[0]);
+  });
+  if (tcFileInput) {
+    tcFileInput.addEventListener('change', () => {
+      if (tcFileInput.files.length > 0) uploadTcFile(tcFileInput.files[0]);
+    });
+  }
+}
 
 async function uploadTcFile(file) {
   const ext = file.name.split('.').pop().toLowerCase();
