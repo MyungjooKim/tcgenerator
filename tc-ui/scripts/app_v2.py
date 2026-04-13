@@ -2399,6 +2399,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   #toast.error   { background: #e53e3e; color: #fff; }
 
   @media (max-width: 480px) { .action-row { flex-direction: column; } }
+  .version-badge { margin-left: auto; font-size: 11px; font-weight: 600; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 2px 8px; letter-spacing: 0.3px; }
 
   /* GitHub 파일 트리 */
   .btn-preview-tree { margin-top: 8px; padding: 5px 12px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
@@ -2431,6 +2432,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <h1>🤖 TC 자동화 v2</h1>
   </div>
   <span>Claude AI · PDF / URL / 텍스트 → Excel</span>
+  <span class="version-badge">v0.9.1</span>
 </header>
 
 <!-- 진행 스텝 바 -->
