@@ -2241,7 +2241,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     text-align: center; font-size: 13px; color: var(--muted); line-height: 1.8;
   }
 
-  /* 샘플 기획서 배너 */
+  /* 샘플 기획서 푸터 */
+  .sample-footer { display: flex; align-items: center; gap: 10px; padding: 10px 32px; background: var(--surface); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .sample-footer-label { color: var(--muted); }
+
+  /* 샘플 기획서 배너 (구) */
   .sample-banner {
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
     background: linear-gradient(135deg, #F0FFF4, #EBF2FF);
@@ -2478,24 +2482,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- ── 신규 생성 모드 ── -->
     <div id="panelNew">
 
-      <!-- 샘플 기획서 배너 -->
-      <div class="sample-banner">
-        <div class="sample-banner-left">
-          <span class="sample-icon">🧪</span>
-          <div>
-            <div class="sample-title">시스템 점검용 샘플 기획서</div>
-            <div class="sample-desc">온라인 쇼핑몰 앱 · 5개 도메인 (AUTH / PROD / ORDER / PAY / DELIV)</div>
-          </div>
-        </div>
-        <div class="sample-banner-right">
-          <a href="/sample-download" class="btn-sample-dl" download>
-            ⬇ 다운로드 (PDF)
-          </a>
-          <button type="button" class="btn-sample-fill" onclick="loadSampleDoc()">
-            ✏️ 직접입력으로 채우기
-          </button>
-        </div>
-      </div>
 
       <div class="form-group">
         <label class="form-label">프로젝트명</label>
@@ -2714,6 +2700,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
 </main>
+
+<!-- 시스템 점검용 샘플 기획서 (푸터) -->
+<footer class="sample-footer">
+  <span class="sample-footer-label">🧪 시스템 점검용 샘플:</span>
+  <a href="/sample-download" class="btn-sample-dl" download>⬇ 샘플 PDF</a>
+  <button type="button" class="btn-sample-fill" onclick="loadSampleDoc()">✏️ 직접입력으로 채우기</button>
+</footer>
 
 <!-- Google Drive 연동 안내 모달 -->
 <div class="modal-bg" id="drive-modal">
