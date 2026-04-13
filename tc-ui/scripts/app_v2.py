@@ -454,7 +454,8 @@ def step_parse_sources(sess: dict, sources: list) -> str:
             label = f"📄 PDF: {content}"
             push_log(sess, f"[파싱] PDF 추출 완료 ({len(text):,}자)")
         elif src_type == "url":
-            text  = fetch_url_content(sess, content)
+            selected_files = src.get("selected_files") or None
+            text  = fetch_url_content(sess, content, selected_files=selected_files)
             label = f"🔗 URL: {content}"
             push_log(sess, f"[파싱] URL 추출 완료 ({len(text):,}자)")
         else:
@@ -484,7 +485,7 @@ def extract_pdf_text(pdf_path: Path) -> str:
         raise RuntimeError(f"PDF 파싱 실패: {e}")
 
 
-def fetch_url_content(sess: dict, url: str) -> str:
+def fetch_url_content(sess: dict, url: str, selected_files: list = None) -> str:
     try:
         import requests
     except ImportError:
@@ -493,10 +494,10 @@ def fetch_url_content(sess: dict, url: str) -> str:
     push_log(sess, f"[파싱] URL 접속 중: {url}")
 
     # GitHub 리포지토리 URL 감지
-    gh_match = re.match(r"https?://github\.com/([^/]+)/([^/]+)/?$", url)
+    gh_match = re.match(r"https?://github\.com/([^/]+)/([^/\s]+?)(?:\.git)?/?$", url)
     if gh_match:
         owner, repo = gh_match.group(1), gh_match.group(2)
-        return fetch_github_repo(sess, owner, repo)
+        return fetch_github_repo(sess, owner, repo, selected_files=selected_files)
 
     # github.io 또는 일반 URL
     try:
@@ -513,7 +514,10 @@ def fetch_url_content(sess: dict, url: str) -> str:
         raise RuntimeError(f"URL 접속 실패: {e}")
 
 
-def fetch_github_repo(sess: dict, owner: str, repo: str) -> str:
+def fetch_github_repo(sess: dict, owner: str, repo: str, selected_files: list = None) -> str:
+    """GitHub 리포지토리에서 파일 내용을 가져온다.
+    selected_files: 경로 문자열 리스트. None이면 .md 파일 최대 10개 자동 선택.
+    """
     try:
         import requests
     except ImportError:
@@ -525,39 +529,59 @@ def fetch_github_repo(sess: dict, owner: str, repo: str) -> str:
     if token:
         headers["Authorization"] = f"token {token}"
 
-    # README 가져오기
-    for branch in ["main", "master"]:
-        readme_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/README.md"
-        try:
-            resp = requests.get(readme_url, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                texts.append(f"## README.md\n\n{resp.text}")
-                push_log(sess, f"[파싱] README.md 로드 완료 (branch: {branch})")
-                break
-        except Exception:
-            pass
-
-    # 파일 트리 (GitHub API)
+    # 기본 브랜치 확인
+    branch = "main"
     try:
-        api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"
-        resp = requests.get(api_url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            tree = resp.json().get("tree", [])
-            md_files = [f["path"] for f in tree if f["path"].endswith(".md") and f["path"] != "README.md"][:10]
-            push_log(sess, f"[파싱] GitHub 파일 트리: MD 파일 {len(md_files)}개")
+        r = requests.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            branch = r.json().get("default_branch", "main")
+    except Exception:
+        pass
 
-            for fpath in md_files:
-                for branch in ["main", "master"]:
+    if selected_files:
+        # 사용자가 선택한 파일만 로드
+        push_log(sess, f"[파싱] 선택된 파일 {len(selected_files)}개 로드 중...")
+        for fpath in selected_files:
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{fpath}"
+            try:
+                r = requests.get(raw_url, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    texts.append(f"## {fpath}\n\n{r.text}")
+                    push_log(sess, f"[파싱] ✅ {fpath}")
+                else:
+                    push_log(sess, f"[파싱] ⚠️ {fpath} 로드 실패 (status {r.status_code})")
+            except Exception as e:
+                push_log(sess, f"[파싱] ⚠️ {fpath} 오류: {e}")
+    else:
+        # 선택 없으면 README + .md 최대 10개 자동
+        for br in [branch, "main", "master"]:
+            readme_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/README.md"
+            try:
+                resp = requests.get(readme_url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    texts.append(f"## README.md\n\n{resp.text}")
+                    push_log(sess, f"[파싱] README.md 로드 완료 (branch: {br})")
+                    break
+            except Exception:
+                pass
+
+        try:
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+            resp = requests.get(api_url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                tree = resp.json().get("tree", [])
+                md_files = [f["path"] for f in tree if f["path"].endswith(".md") and f["path"] != "README.md"][:10]
+                push_log(sess, f"[파싱] GitHub 파일 트리: MD 파일 {len(md_files)}개 자동 선택")
+                for fpath in md_files:
                     raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{fpath}"
                     try:
                         r = requests.get(raw_url, headers=headers, timeout=10)
                         if r.status_code == 200:
                             texts.append(f"## {fpath}\n\n{r.text}")
-                            break
                     except Exception:
                         pass
-    except Exception as e:
-        push_log(sess, f"[파싱] GitHub API 오류 (무시): {e}")
+        except Exception as e:
+            push_log(sess, f"[파싱] GitHub API 오류 (무시): {e}")
 
     if not texts:
         raise RuntimeError(f"GitHub 리포지토리에서 콘텐츠를 가져올 수 없습니다: {owner}/{repo}")
@@ -1236,9 +1260,29 @@ def extract_section(block: str, section_name: str) -> str:
         re.DOTALL
     )
     m = pattern.search(block)
-    if m:
-        return m.group(1).strip()
-    return ""
+    if not m:
+        return ""
+    text = m.group(1).strip()
+    # 사전 조건: 불릿(-) 형식이면 번호 개조식으로 변환
+    if section_name == "사전 조건":
+        lines = text.splitlines()
+        # 불릿 라인이 하나라도 있으면 전체를 번호로 변환
+        has_bullet = any(re.match(r"^[-*]\s+", l) for l in lines)
+        if has_bullet:
+            numbered, n = [], 1
+            for l in lines:
+                l = l.strip()
+                if not l:
+                    continue
+                # 이미 번호가 있으면 그대로, 불릿이면 번호 부여
+                if re.match(r"^\d+\.", l):
+                    numbered.append(l)
+                else:
+                    body = re.sub(r"^[-*]\s+", "", l)
+                    numbered.append(f"{n}. {body}")
+                    n += 1
+            text = "\n".join(numbered)
+    return text
 
 
 # ── 메인 파이프라인 ────────────────────────────────────────────────────────────
@@ -1855,7 +1899,12 @@ def upload_to_drive():
     except FileNotFoundError as e:
         return jsonify({"ok": False, "error": str(e), "need_credentials": True})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        err_str = str(e)
+        # OAuth 권한 부족 또는 Drive API 미활성화
+        if any(k in err_str for k in ["insufficient_scope", "accessNotConfigured",
+                                       "forbidden", "403", "Request had insufficient"]):
+            return jsonify({"ok": False, "error": "Google Drive 접근 권한이 없습니다. Drive API가 활성화된 계정인지 확인해주세요.", "need_credentials": True})
+        return jsonify({"ok": False, "error": err_str})
 
 
 @app.route("/download/<sid>/<filename>")
@@ -1891,6 +1940,59 @@ def sample_download():
 def sample_content():
     """샘플 기획서 텍스트 반환 (JS에서 직접 채우기용)"""
     return jsonify({"content": SAMPLE_DOC_CONTENT, "filename": SAMPLE_PDF_FILENAME})
+
+
+@app.route("/github-tree", methods=["POST"])
+def github_tree():
+    """GitHub 리포지토리 파일 트리를 반환 (파일 선택 미리보기용)"""
+    try:
+        import requests as req_lib
+    except ImportError:
+        return jsonify({"ok": False, "error": "requests 패키지가 필요합니다"})
+
+    data = request.get_json(force=True)
+    url = (data.get("url") or "").strip()
+
+    gh_match = re.match(r"https?://github\.com/([^/]+)/([^/\s]+?)(?:\.git)?/?$", url)
+    if not gh_match:
+        return jsonify({"ok": False, "error": "GitHub 리포지토리 URL이 아닙니다"})
+
+    owner, repo = gh_match.group(1), gh_match.group(2)
+    headers = {"User-Agent": "TC-Automation/2.0"}
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    # 기본 브랜치 확인
+    branch = "main"
+    try:
+        r = req_lib.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            branch = r.json().get("default_branch", "main")
+        elif r.status_code == 404:
+            return jsonify({"ok": False, "error": f"리포지토리를 찾을 수 없습니다: {owner}/{repo} (private이면 GITHUB_TOKEN 필요)"})
+        elif r.status_code == 401:
+            return jsonify({"ok": False, "error": "GitHub 인증 실패: GITHUB_TOKEN을 확인해주세요"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"GitHub API 오류: {e}"})
+
+    # 파일 트리 가져오기
+    try:
+        r = req_lib.get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1", headers=headers, timeout=15)
+        if r.status_code != 200:
+            return jsonify({"ok": False, "error": f"파일 트리 로드 실패 (status {r.status_code})"})
+        tree = r.json().get("tree", [])
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"파일 트리 오류: {e}"})
+
+    # 파일 목록 (blob만, 디렉토리 제외)
+    files = [
+        {"path": f["path"], "size": f.get("size", 0)}
+        for f in tree
+        if f["type"] == "blob"
+    ]
+
+    return jsonify({"ok": True, "owner": owner, "repo": repo, "branch": branch, "files": files})
 
 
 @app.route("/shutdown", methods=["POST"])
@@ -2297,6 +2399,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   #toast.error   { background: #e53e3e; color: #fff; }
 
   @media (max-width: 480px) { .action-row { flex-direction: column; } }
+
+  /* GitHub 파일 트리 */
+  .btn-preview-tree { margin-top: 8px; padding: 5px 12px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
+  .btn-preview-tree:hover { background: var(--hover); }
+  .tree-panel { margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; max-height: 360px; overflow-y: auto; font-size: 12px; }
+  .tree-loading, .tree-error { padding: 16px; color: var(--muted); }
+  .tree-error { color: #e53e3e; }
+  .tree-header { padding: 10px 14px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; position: sticky; top: 0; z-index: 1; }
+  .tree-actions button { padding: 3px 8px; font-size: 11px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); cursor: pointer; margin-left: 4px; }
+  .btn-apply-tree { background: var(--surface); font-weight: 600; }
+  .tree-list { padding: 8px 0; }
+  .tree-folder { padding: 4px 14px; }
+  .tree-folder-label { display: block; font-weight: 600; color: var(--text); padding: 3px 0; cursor: pointer; }
+  .tree-file-label { display: block; padding: 2px 0 2px 20px; color: var(--muted); cursor: pointer; }
+  .tree-file-label:hover, .tree-folder-label:hover { color: var(--text); }
+  .file-size { color: var(--muted); font-size: 10px; }
 </style>
 </head>
 <body>
@@ -2578,7 +2696,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- 액션 버튼 행 -->
     <div class="action-row">
-      <button class="btn-dl" onclick="downloadFile()">⬇ Excel 다운로드</button>
       <button class="btn-drive" id="driveBtn" onclick="uploadToDrive()">
         <svg width="16" height="16" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg">
           <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/>
@@ -2794,6 +2911,95 @@ async function startModify() {
 }
 
 // ── 입력 유형 전환 ──────────────────────────────────────────────────────────────
+// ── GitHub 파일 트리 미리보기 ─────────────────────────────────────────────────
+async function previewGithubTree(srcId) {
+  const urlInput = document.getElementById('srcUrl_' + srcId);
+  const panel = document.getElementById('treePanel_' + srcId);
+  const url = urlInput ? urlInput.value.trim() : '';
+  if (!url) { alert('GitHub URL을 먼저 입력해주세요.'); return; }
+
+  panel.classList.remove('hidden');
+  panel.innerHTML = '<div class="tree-loading">⏳ 파일 목록 불러오는 중...</div>';
+
+  try {
+    const resp = await fetch('/github-tree', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      panel.innerHTML = '<div class="tree-error">❌ ' + data.error + '</div>';
+      return;
+    }
+
+    const files = data.files;
+    // 폴더별 그룹핑
+    const groups = {};
+    files.forEach(f => {
+      const parts = f.path.split('/');
+      const folder = parts.length > 1 ? parts[0] : '(루트)';
+      if (!groups[folder]) groups[folder] = [];
+      groups[folder].push(f);
+    });
+
+    let html = '<div class="tree-header">';
+    html += '<strong>' + data.owner + '/' + data.repo + '</strong> (branch: ' + data.branch + ') — 총 ' + files.length + '개 파일';
+    html += '<div class="tree-actions">';
+    html += '<button type="button" onclick="selectAllTree(' + srcId + ', true)">전체 선택</button> ';
+    html += '<button type="button" onclick="selectAllTree(' + srcId + ', false)">전체 해제</button> ';
+    html += '<button type="button" class="btn-apply-tree" onclick="applyTreeSelection(' + srcId + ')">✅ 선택 적용</button>';
+    html += '</div></div>';
+    html += '<div class="tree-list">';
+
+    Object.entries(groups).sort().forEach(([folder, flist]) => {
+      html += '<div class="tree-folder">';
+      html += '<label class="tree-folder-label"><input type="checkbox" class="folder-cb" data-srcid="' + srcId + '" data-folder="' + folder + '" onchange="toggleFolder(this)"> 📁 ' + folder + ' (' + flist.length + ')</label>';
+      flist.forEach(f => {
+        const sizeKb = f.size > 0 ? ' <span class="file-size">(' + Math.ceil(f.size/1024) + 'KB)</span>' : '';
+        const ext = f.path.split('.').pop().toLowerCase();
+        const icon = ext === 'md' ? '📝' : ext === 'pdf' ? '📄' : ext === 'json' ? '{}' : '📄';
+        html += '<label class="tree-file-label"><input type="checkbox" class="file-cb" data-srcid="' + srcId + '" data-folder="' + folder + '" value="' + f.path + '"> ' + icon + ' ' + f.path.split('/').pop() + sizeKb + '</label>';
+      });
+      html += '</div>';
+    });
+
+    html += '</div>';
+    panel.innerHTML = html;
+  } catch(e) {
+    panel.innerHTML = '<div class="tree-error">❌ 오류: ' + e.message + '</div>';
+  }
+}
+
+function toggleFolder(cb) {
+  const srcId = cb.dataset.srcid;
+  const folder = cb.dataset.folder;
+  document.querySelectorAll('.file-cb[data-srcid="' + srcId + '"][data-folder="' + folder + '"]')
+    .forEach(fc => fc.checked = cb.checked);
+}
+
+function selectAllTree(srcId, checked) {
+  document.querySelectorAll('.file-cb[data-srcid="' + srcId + '"], .folder-cb[data-srcid="' + srcId + '"]')
+    .forEach(cb => cb.checked = checked);
+}
+
+function applyTreeSelection(srcId) {
+  const selected = [];
+  document.querySelectorAll('.file-cb[data-srcid="' + srcId + '"]:checked')
+    .forEach(cb => selected.push(cb.value));
+
+  if (selected.length === 0) { alert('최소 1개 파일을 선택해주세요.'); return; }
+
+  const src = sources.find(s => s.id === srcId);
+  if (src) src.selected_files = selected;
+
+  const panel = document.getElementById('treePanel_' + srcId);
+  const applyBtn = panel.querySelector('.btn-apply-tree');
+  if (applyBtn) applyBtn.textContent = '✅ ' + selected.length + '개 파일 선택됨';
+  applyBtn.style.background = 'var(--teal)';
+  applyBtn.style.color = '#fff';
+}
+
 // ── 다중 소스 관리 ──────────────────────────────────────────────────────────
 let sources = [];
 let sourceCounter = 0;
@@ -2864,6 +3070,8 @@ function renderSources() {
     } else if (src.type === 'url') {
       body = '<input type="text" id="srcUrl_' + src.id + '" class="form-input" placeholder="https://github.com/user/repo" value="' + src.content + '" oninput="updateSourceContent(' + src.id + ', this.value)">';
       body += '<div class="input-hint">GitHub 저장소, GitHub Pages, 또는 기획서가 있는 웹페이지 URL</div>';
+      body += '<button type="button" class="btn-preview-tree" onclick="previewGithubTree(' + src.id + ')">🗂 파일 목록 보기</button>';
+      body += '<div id="treePanel_' + src.id + '" class="tree-panel hidden"></div>';
     } else {
       body = '<textarea id="srcText_' + src.id + '" class="form-input text-input-area" placeholder="기획서 내용, 슬랙 메시지 등 자유롭게 붙여넣으세요..." oninput="updateSourceContent(' + src.id + ', this.value)">' + src.content + '</textarea>';
     }
@@ -2890,7 +3098,7 @@ async function startPipeline() {
     }
   }
 
-  const payload = sources.map(s => ({ type: s.type, content: s.content }));
+  const payload = sources.map(s => ({ type: s.type, content: s.content, selected_files: s.selected_files || null }));
 
   document.getElementById('startBtn').disabled = true;
   document.getElementById('card2').classList.remove('hidden');
@@ -3238,18 +3446,25 @@ async function uploadToDrive() {
     const d = await r.json();
     if (d.ok) {
       showToast('✅ Google Drive 업로드 완료!');
+      btn.innerHTML = DRIVE_SVG + ' Drive 업로드 완료';
+      btn.style.borderColor = '#34a853';
       if (d.link) window.open(d.link, '_blank');
+      return;
     } else if (d.need_credentials) {
       openDriveModal();
-      showToast('🔑 credentials.json 설정이 필요합니다', 'error');
+      showToast('🔑 Drive 연동 설정이 필요합니다', 'error');
+      btn.innerHTML = '⚠️ Drive 연동 설정 필요';
+      btn.style.borderColor = '#e53e3e';
+      btn.style.color = '#e53e3e';
     } else {
       showToast('❌ ' + d.error, 'error');
+      btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
     }
   } catch(e) {
     showToast('❌ 오류: ' + e.message, 'error');
+    btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
   }
   btn.disabled = false;
-  btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
 }
 
 function openDriveModal() { document.getElementById('drive-modal').classList.add('open'); }
