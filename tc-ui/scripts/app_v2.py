@@ -21,7 +21,7 @@ from datetime import datetime
 # ── .env 로딩 ──────────────────────────────────────────────────────────────────
 env_file = Path(__file__).parent.parent / ".env"
 if env_file.exists():
-    for line in env_file.read_text().splitlines():
+    for line in env_file.read_text(encoding='utf-8').splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
             key, val = k.strip(), v.strip()
@@ -3271,6 +3271,7 @@ function showToast(msg, type = 'success') {
 
 # ── 진입점 ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     print(f"🚀 TC 자동화 v2 시작: http://localhost:{PORT}")
     print(f"   BASE_DIR   : {BASE_DIR}")
     print(f"   AGENT_DIR  : {AGENT_DIR}")

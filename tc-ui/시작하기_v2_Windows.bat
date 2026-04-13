@@ -1,5 +1,5 @@
 @echo off
-chcp 65001 > /dev/null
+chcp 65001 > NUL
 title TC 자동화 시스템 v2
 cd /d "%~dp0"
 set PORT=5001
@@ -30,7 +30,7 @@ echo.
 echo [TC 자동화 v2 시작] http://localhost:%PORT%
 
 REM 브라우저 오픈 (3초 후)
-timeout /t 3 /nobreak > /dev/null
+timeout /t 3 /nobreak > NUL
 start "" "http://localhost:%PORT%"
 
 REM .env 환경변수 로드
