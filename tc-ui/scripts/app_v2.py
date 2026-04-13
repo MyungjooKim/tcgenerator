@@ -397,6 +397,33 @@ def save_project(project_name: str, tc_file: str, excel_file: str):
     PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+CHECKPOINT_FILE = BASE_DIR / ".bkit" / "state" / "modify_checkpoint.json"
+CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def save_checkpoint(project_name: str, change_desc: str, stage: str, partial: dict = None):
+    """TC 수정 파이프라인 체크포인트 저장"""
+    data = {
+        "project_name": project_name,
+        "change_desc": change_desc,
+        "stage": stage,
+        "partial": partial or {},
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    CHECKPOINT_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_checkpoint() -> dict:
+    if CHECKPOINT_FILE.exists():
+        try:
+            return json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def clear_checkpoint():
+    if CHECKPOINT_FILE.exists():
+        CHECKPOINT_FILE.unlink()
+
+
 def push(sess: dict, etype: str, data: dict):
     sess["events"].put({"type": etype, "data": data})
 
@@ -1375,9 +1402,10 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
 
 
 # ── 수정 파이프라인 ────────────────────────────────────────────────────────────
-def run_modify_pipeline(sess: dict, project_name: str, existing_tc: str, change_desc: str):
+def run_modify_pipeline(sess: dict, project_name: str, existing_tc: str, change_desc: str, resume_stage: str = None):
     try:
         tc_rules = load_tc_rules()
+        save_checkpoint(project_name, change_desc, "analyzing", {"existing_tc": existing_tc[:5000]})
 
         # Step M1: 영향도 분석
         sess["status"] = "analyzing"
@@ -1432,6 +1460,7 @@ TC 형식 규칙:
         impact_path = sess["workspace"] / "impact_analysis.md"
         impact_path.write_text(impact_analysis, encoding="utf-8")
         push_log(sess, f"[영향 분석] 완료 — 결과 {len(impact_analysis):,}자")
+        save_checkpoint(project_name, change_desc, "gate_waiting", {"impact_analysis": impact_analysis, "existing_tc": existing_tc[:5000]})
 
         # Step M2: Human Gate (영향도 검토)
         push_stage(sess, 3, "영향도 검토 대기", 40)
@@ -1512,6 +1541,7 @@ TC 형식 규칙:
 
         sess["result"] = excel_path
         sess["status"] = "done"
+        clear_checkpoint()
         push_stage(sess, 5, "완료", 100)
         push(sess, "done", {
             "filename":  excel_path.name,
@@ -1531,6 +1561,16 @@ TC 형식 규칙:
         import traceback
         push_log(sess, f"[오류] {e}")
         push_log(sess, traceback.format_exc()[:1000])
+        sess["status"] = "error"
+        # 체크포인트가 있으면 복구 옵션 이벤트 발송
+        cp = load_checkpoint()
+        push(sess, "error_recovery", {
+            "error": str(e),
+            "has_checkpoint": bool(cp),
+            "checkpoint_stage": cp.get("stage", ""),
+            "checkpoint_project": cp.get("project_name", ""),
+            "checkpoint_saved_at": cp.get("saved_at", ""),
+        })
         push_error(sess, str(e))
 
 
@@ -1634,22 +1674,207 @@ def list_projects():
     return jsonify(projects)
 
 
+@app.route("/projects", methods=["POST"])
+def create_project():
+    """새 프로젝트 생성 (빈 TC로 등록)"""
+    data = request.get_json(force=True) or {}
+    project_name = data.get("name", "").strip()
+    if not project_name:
+        return jsonify({"ok": False, "error": "프로젝트명을 입력하세요."}), 400
+    projects = load_projects()
+    if any(p["name"] == project_name for p in projects):
+        return jsonify({"ok": False, "error": "이미 존재하는 프로젝트명입니다."}), 400
+    save_project(project_name, "", "")
+    return jsonify({"ok": True, "project_name": project_name})
+
+
+@app.route("/projects/<path:project_name>", methods=["DELETE"])
+def delete_project(project_name):
+    """프로젝트 삭제"""
+    projects = load_projects()
+    projects = [p for p in projects if p["name"] != project_name]
+    PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
+    return jsonify({"ok": True})
+
+
+def excel_to_md(file_path: Path) -> str:
+    """Excel TC 파일을 md 텍스트로 변환 (헤더 행 기준 자동 파싱)"""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise RuntimeError("openpyxl 패키지가 필요합니다: pip install openpyxl")
+    wb = load_workbook(str(file_path), data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise RuntimeError("Excel 파일이 비어 있습니다.")
+
+    # 헤더 행 찾기 (TC ID 또는 ID 컬럼 포함)
+    header_row, header_idx = None, 0
+    for i, row in enumerate(rows):
+        cells = [str(c).strip() if c else "" for c in row]
+        if any(k in " ".join(cells) for k in ["TC ID", "tc_id", "ID", "제목", "Title"]):
+            header_row = cells
+            header_idx = i
+            break
+    if header_row is None:
+        header_row = [str(c) if c else f"col{j}" for j, c in enumerate(rows[0])]
+
+    lines = []
+    for row in rows[header_idx + 1:]:
+        if not any(c for c in row):
+            continue
+        vals = {header_row[j]: (str(row[j]).strip() if row[j] is not None else "") for j in range(min(len(header_row), len(row)))}
+        tc_id    = vals.get("TC ID") or vals.get("ID") or vals.get("tc_id") or ""
+        title    = vals.get("제목") or vals.get("Title") or vals.get("title") or ""
+        major    = vals.get("대분류") or ""
+        middle   = vals.get("중분류") or ""
+        minor    = vals.get("소분류") or ""
+        tc_type  = vals.get("분류") or vals.get("Type") or "Positive"
+        priority = vals.get("우선순위") or vals.get("Priority") or "Medium"
+        platform = vals.get("플랫폼") or vals.get("Platform") or ""
+        screen   = vals.get("연관 화면") or vals.get("화면") or vals.get("Screen") or ""
+        precond  = vals.get("사전 조건") or vals.get("Precondition") or vals.get("Given") or ""
+        steps    = vals.get("테스트 단계") or vals.get("Steps") or vals.get("When") or ""
+        expected = vals.get("예상 결과") or vals.get("Expected") or vals.get("Then") or ""
+        note     = vals.get("비고") or vals.get("Note") or ""
+        is_min   = vals.get("최소TC") or vals.get("최소 TC") or ""
+
+        heading = f"### {'**' + tc_id + '**' if is_min and is_min.upper() == 'Y' else tc_id} — {title}"
+        lines.append(heading)
+        lines.append(f"\n| 항목 | 내용 |\n|------|------|")
+        if major:    lines.append(f"| 대분류 | {major} |")
+        if middle:   lines.append(f"| 중분류 | {middle} |")
+        if minor:    lines.append(f"| 소분류 | {minor} |")
+        lines.append(f"| 분류 | {tc_type} |")
+        lines.append(f"| 우선순위 | {priority} |")
+        if platform: lines.append(f"| 플랫폼 | {platform} |")
+        if screen:   lines.append(f"| 연관 화면 | {screen} |")
+        lines.append(f"\n**사전 조건**\n{precond}")
+        lines.append(f"\n**테스트 단계**\n{steps}")
+        lines.append(f"\n**예상 결과**\n{expected}")
+        if note:     lines.append(f"\n**비고**\n{note}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 @app.route("/upload-tc", methods=["POST"])
 def upload_tc():
+    """TC 파일 업로드 — .md / .xlsx / .xls 지원"""
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "파일 없음"}), 400
     f = request.files["file"]
     if not f.filename:
         return jsonify({"ok": False, "error": "파일명 없음"}), 400
-    if not f.filename.lower().endswith(".md"):
-        return jsonify({"ok": False, "error": ".md 파일만 허용"}), 400
+
+    ext = Path(f.filename).suffix.lower()
+    if ext not in (".md", ".xlsx", ".xls"):
+        return jsonify({"ok": False, "error": ".md / .xlsx / .xls 파일만 허용"}), 400
+
     project_name = request.form.get("project_name", Path(f.filename).stem)
     safe_name = re.sub(r"[^\w\-_]", "_", project_name)[:30]
     today = datetime.now().strftime("%Y%m%d")
-    save_path = TC_FILES_DIR / f"{safe_name}_{today}_upload.md"
-    f.save(str(save_path))
+
+    if ext == ".md":
+        save_path = TC_FILES_DIR / f"{safe_name}_{today}_upload.md"
+        f.save(str(save_path))
+    else:
+        # Excel → 임시 저장 후 md 변환
+        tmp_path = TC_FILES_DIR / f"{safe_name}_{today}_tmp{ext}"
+        f.save(str(tmp_path))
+        try:
+            md_text = excel_to_md(tmp_path)
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            return jsonify({"ok": False, "error": f"Excel 변환 실패: {e}"}), 400
+        tmp_path.unlink(missing_ok=True)
+        save_path = TC_FILES_DIR / f"{safe_name}_{today}_upload.md"
+        save_path.write_text(md_text, encoding="utf-8")
+
     save_project(project_name, str(save_path), "")
     return jsonify({"ok": True, "project_name": project_name, "tc_file": save_path.name})
+
+
+@app.route("/import-sheets", methods=["POST"])
+def import_sheets():
+    """Google Sheets URL에서 TC 데이터를 가져와 md로 변환"""
+    try:
+        import requests as req_lib
+    except ImportError:
+        return jsonify({"ok": False, "error": "requests 패키지가 필요합니다"}), 500
+
+    data = request.get_json(force=True) or {}
+    url = data.get("url", "").strip()
+    project_name = data.get("project_name", "").strip()
+
+    if not url:
+        return jsonify({"ok": False, "error": "URL을 입력하세요."}), 400
+    if not project_name:
+        return jsonify({"ok": False, "error": "프로젝트명을 입력하세요."}), 400
+
+    # Google Sheets ID 추출 및 CSV export URL 생성
+    sheets_match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    if not sheets_match:
+        return jsonify({"ok": False, "error": "Google Sheets URL 형식이 올바르지 않습니다."}), 400
+
+    sheet_id = sheets_match.group(1)
+    # gid(시트 탭 ID) 추출
+    gid_match = re.search(r"[#&?]gid=(\d+)", url)
+    gid = gid_match.group(1) if gid_match else "0"
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+    try:
+        resp = req_lib.get(csv_url, timeout=20)
+        if resp.status_code == 403:
+            return jsonify({"ok": False, "error": "Sheets 접근 권한이 없습니다. '링크가 있는 사용자 공개' 설정 필요"}), 403
+        resp.raise_for_status()
+        csv_text = resp.text
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Sheets 다운로드 실패: {e}"}), 400
+
+    # CSV → md 변환
+    import csv, io
+    reader = csv.reader(io.StringIO(csv_text))
+    rows = list(reader)
+    if not rows:
+        return jsonify({"ok": False, "error": "시트가 비어 있습니다."}), 400
+
+    # 헤더 탐색
+    header_row, header_idx = None, 0
+    for i, row in enumerate(rows):
+        if any(k in " ".join(row) for k in ["TC ID", "ID", "제목", "Title"]):
+            header_row = row
+            header_idx = i
+            break
+    if header_row is None:
+        header_row = rows[0]
+
+    lines = []
+    for row in rows[header_idx + 1:]:
+        if not any(c.strip() for c in row):
+            continue
+        vals = {header_row[j]: row[j].strip() if j < len(row) else "" for j in range(len(header_row))}
+        tc_id    = vals.get("TC ID") or vals.get("ID") or ""
+        title    = vals.get("제목") or vals.get("Title") or ""
+        tc_type  = vals.get("분류") or vals.get("Type") or "Positive"
+        priority = vals.get("우선순위") or vals.get("Priority") or "Medium"
+        precond  = vals.get("사전 조건") or vals.get("Precondition") or ""
+        steps    = vals.get("테스트 단계") or vals.get("Steps") or ""
+        expected = vals.get("예상 결과") or vals.get("Expected") or ""
+        is_min   = vals.get("최소TC") or vals.get("최소 TC") or ""
+        heading  = f"### {'**' + tc_id + '**' if is_min.upper() == 'Y' else tc_id} — {title}"
+        lines += [heading, f"\n| 항목 | 내용 |\n|------|------|",
+                  f"| 분류 | {tc_type} |", f"| 우선순위 | {priority} |",
+                  f"\n**사전 조건**\n{precond}", f"\n**테스트 단계**\n{steps}",
+                  f"\n**예상 결과**\n{expected}", ""]
+
+    md_text = "\n".join(lines)
+    safe_name = re.sub(r"[^\w\-_]", "_", project_name)[:30]
+    today = datetime.now().strftime("%Y%m%d")
+    save_path = TC_FILES_DIR / f"{safe_name}_{today}_sheets.md"
+    save_path.write_text(md_text, encoding="utf-8")
+    save_project(project_name, str(save_path), "")
+    return jsonify({"ok": True, "project_name": project_name, "tc_file": save_path.name, "tc_count": len(lines) // 8})
 
 
 @app.route("/start-modify", methods=["POST"])
@@ -1684,6 +1909,52 @@ def start_modify():
     sess["thread"] = t
     t.start()
     return jsonify({"ok": True, "sid": sess["id"]})
+
+
+@app.route("/checkpoint", methods=["GET"])
+def get_checkpoint():
+    cp = load_checkpoint()
+    return jsonify({"ok": True, "checkpoint": cp})
+
+@app.route("/checkpoint", methods=["DELETE"])
+def del_checkpoint():
+    clear_checkpoint()
+    return jsonify({"ok": True})
+
+@app.route("/restart-modify", methods=["POST"])
+def restart_modify():
+    """체크포인트 기반 재시작 또는 처음부터 재시작"""
+    data = request.get_json(force=True) or {}
+    mode = data.get("mode", "fresh")  # "resume" | "fresh"
+
+    cp = load_checkpoint()
+    if mode == "resume" and not cp:
+        return jsonify({"ok": False, "error": "저장된 체크포인트가 없습니다."}), 400
+
+    project_name = cp.get("project_name") if mode == "resume" else data.get("project_name", "")
+    change_desc  = cp.get("change_desc")  if mode == "resume" else data.get("change_desc", "")
+
+    if not project_name:
+        return jsonify({"ok": False, "error": "프로젝트명이 없습니다."}), 400
+
+    projects = load_projects()
+    proj = next((p for p in projects if p["name"] == project_name), None)
+    if not proj or not proj.get("tc_file") or not Path(proj["tc_file"]).exists():
+        return jsonify({"ok": False, "error": f"'{project_name}' TC 파일을 찾을 수 없습니다."}), 404
+
+    existing_tc = Path(proj["tc_file"]).read_text(encoding="utf-8")
+    sess = new_session()
+    sess["project_name"] = project_name
+    sess["mode"] = "modify"
+    resume_stage = cp.get("stage") if mode == "resume" else None
+    t = threading.Thread(
+        target=run_modify_pipeline,
+        args=(sess, project_name, existing_tc, change_desc, resume_stage),
+        daemon=True
+    )
+    sess["thread"] = t
+    t.start()
+    return jsonify({"ok": True, "sid": sess["id"], "mode": mode})
 
 
 @app.route("/stop/<sid>", methods=["POST"])
@@ -2241,6 +2512,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     text-align: center; font-size: 13px; color: var(--muted); line-height: 1.8;
   }
 
+  /* TC 가져오기 탭 */
+  .tc-import-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .tc-import-tab { flex: 1; padding: 7px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; color: var(--muted); }
+  .tc-import-tab.active { background: var(--navy); color: #fff; border-color: var(--navy); }
+
+  /* 새 프로젝트 생성 */
+  .btn-new-project { font-size: 11px; padding: 3px 10px; border: 1px solid var(--teal); color: var(--teal); background: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+  .btn-new-project:hover { background: var(--teal); color: #fff; }
+  .new-project-form { margin-top: 10px; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+  .btn-delete-project { margin-top: 6px; font-size: 11px; padding: 2px 8px; border: 1px solid #e53e3e; color: #e53e3e; background: none; border-radius: 6px; cursor: pointer; }
+  .btn-delete-project:hover { background: #e53e3e; color: #fff; }
+
   /* 샘플 기획서 푸터 */
   .sample-footer { display: flex; align-items: center; gap: 10px; padding: 10px 32px; background: var(--surface); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   .sample-footer-label { color: var(--muted); }
@@ -2516,26 +2799,53 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <!-- 프로젝트 선택 -->
       <div class="form-group">
-        <label class="form-label">수정할 프로젝트 선택</label>
+        <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
+          <span>수정할 프로젝트 선택</span>
+          <button type="button" class="btn-new-project" onclick="toggleNewProjectForm()">＋ 새 프로젝트</button>
+        </label>
         <select class="project-select" id="projectSelect" onchange="onProjectSelect()">
           <option value="">— 프로젝트를 선택하세요 —</option>
         </select>
         <div class="project-card" id="projectCard">
           <div class="project-card-name" id="projectCardName"></div>
           <div class="project-card-meta" id="projectCardMeta"></div>
+          <button type="button" class="btn-delete-project" id="btnDeleteProject" onclick="deleteProject()" style="display:none">🗑 삭제</button>
+        </div>
+        <!-- 새 프로젝트 생성 폼 -->
+        <div id="newProjectForm" class="new-project-form hidden">
+          <input type="text" id="newProjectName" class="form-input" placeholder="새 프로젝트명 입력 (예: Supercycl iOS v2)">
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button type="button" class="btn btn-primary" style="flex:1" onclick="createProject()">✅ 생성</button>
+            <button type="button" class="btn" style="flex:1" onclick="toggleNewProjectForm()">취소</button>
+          </div>
         </div>
       </div>
 
-      <!-- TC 파일 직접 업로드 (새 프로젝트 또는 외부 파일) -->
+      <!-- TC 파일 가져오기 -->
       <div class="form-group">
         <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
-          <span>또는 TC 파일(.md) 직접 업로드</span>
-          <span style="font-size:11px;color:var(--muted);font-weight:400">신규 프로젝트 등록 또는 외부 TC 파일</span>
+          <span>TC 파일 가져오기</span>
+          <span style="font-size:11px;color:var(--muted);font-weight:400">Excel 업로드 또는 Google Sheets 연동</span>
         </label>
-        <div class="tc-upload-area" id="tcDropzone" onclick="document.getElementById('tcFileInput').click()">
-          📎 .md 파일을 드래그하거나 클릭하여 업로드
+        <!-- 탭 선택 -->
+        <div class="tc-import-tabs">
+          <button type="button" class="tc-import-tab active" id="tabExcel" onclick="switchImportTab('excel')">📊 Excel 업로드</button>
+          <button type="button" class="tc-import-tab" id="tabSheets" onclick="switchImportTab('sheets')">🔗 Google Sheets</button>
         </div>
-        <input type="file" id="tcFileInput" accept=".md" style="display:none">
+        <!-- Excel 업로드 -->
+        <div id="panelExcel">
+          <div class="tc-upload-area" id="tcDropzone" onclick="document.getElementById('tcFileInput').click()">
+            📎 Excel(.xlsx/.xls) 또는 .md 파일을 드래그하거나 클릭하여 업로드
+          </div>
+          <input type="file" id="tcFileInput" accept=".xlsx,.xls,.md" style="display:none">
+        </div>
+        <!-- Google Sheets -->
+        <div id="panelSheets" class="hidden">
+          <input type="text" id="sheetsUrl" class="form-input"
+                 placeholder="https://docs.google.com/spreadsheets/d/...">
+          <div class="input-hint">⚠️ 시트가 <strong>링크가 있는 사용자에게 공개</strong> 설정이어야 합니다.</div>
+          <button type="button" class="btn btn-primary" style="margin-top:8px;width:100%" onclick="importSheets()">🔗 Sheets 가져오기</button>
+        </div>
         <div id="tcUploadStatus" class="hidden" style="margin-top:8px;font-size:13px;color:var(--success);font-weight:600;"></div>
       </div>
 
@@ -2708,6 +3018,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <button type="button" class="btn-sample-fill" onclick="loadSampleDoc()">✏️ 직접입력으로 채우기</button>
 </footer>
 
+<!-- 오류 복구 모달 -->
+<div class="modal-bg" id="recovery-modal">
+  <div class="modal">
+    <h2>⚠️ 파이프라인 오류 발생</h2>
+    <p id="recoveryErrorMsg" style="font-size:13px;color:#e53e3e;margin-bottom:12px"></p>
+    <div id="recoveryCheckpointInfo" class="hidden" style="font-size:12px;color:#555;background:#f7f7f7;padding:10px;border-radius:8px;margin-bottom:14px"></div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="btn btn-primary" id="btnResume" onclick="restartModify('resume')" style="display:none">
+        🔄 이어서 재시작 (체크포인트 복원)
+      </button>
+      <button class="btn btn-primary" onclick="restartModify('fresh')">
+        ▶ 처음부터 재시작
+      </button>
+      <button class="btn" onclick="closeRecoveryModal()">
+        ✕ 종료
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- Google Drive 연동 안내 모달 -->
 <div class="modal-bg" id="drive-modal">
   <div class="modal">
@@ -2799,13 +3129,13 @@ async function loadProjects() {
     projects.forEach(p => {
       const opt = document.createElement('option');
       opt.value = p.name;
-      opt.textContent = p.name + ' (' + p.updated_at + ')';
+      opt.textContent = p.name + ' (' + (p.updated_at || '신규') + ')';
       sel.appendChild(opt);
     });
     if (projects.length === 0) {
       const opt = document.createElement('option');
       opt.value = '';
-      opt.textContent = '저장된 프로젝트 없음 — TC 파일을 직접 업로드하세요';
+      opt.textContent = '저장된 프로젝트 없음 — 새 프로젝트를 만드세요';
       opt.disabled = true;
       sel.appendChild(opt);
     }
@@ -2817,19 +3147,75 @@ async function loadProjects() {
 function onProjectSelect() {
   const name = document.getElementById('projectSelect').value;
   const card = document.getElementById('projectCard');
-  if (!name) { card.classList.remove('visible'); return; }
+  const deleteBtn = document.getElementById('btnDeleteProject');
+  if (!name) { card.classList.remove('visible'); deleteBtn.style.display = 'none'; return; }
   const proj = projects.find(p => p.name === name);
   if (!proj) return;
   document.getElementById('projectCardName').textContent = proj.name;
   document.getElementById('projectCardMeta').textContent =
-    '최근 업데이트: ' + proj.updated_at + (proj.excel_file ? '  |  Excel: ' + proj.excel_file.split('/').pop() : '');
+    '최근 업데이트: ' + (proj.updated_at || '—') + (proj.excel_file ? '  |  Excel: ' + proj.excel_file.split('/').pop() : '');
   card.classList.add('visible');
-  selectedTcFile = null; // 드롭다운 선택 시 업로드 파일 초기화
+  deleteBtn.style.display = 'inline-block';
+  selectedTcFile = null;
   document.getElementById('tcUploadStatus').classList.add('hidden');
   document.getElementById('uploadProjectNameGroup').style.display = 'none';
 }
 
-// TC .md 파일 업로드
+function toggleNewProjectForm() {
+  const form = document.getElementById('newProjectForm');
+  form.classList.toggle('hidden');
+  if (!form.classList.contains('hidden')) document.getElementById('newProjectName').focus();
+}
+
+async function createProject() {
+  const name = document.getElementById('newProjectName').value.trim();
+  if (!name) { alert('프로젝트명을 입력해주세요.'); return; }
+  try {
+    const r = await fetch('/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('❌ ' + d.error); return; }
+    document.getElementById('newProjectName').value = '';
+    document.getElementById('newProjectForm').classList.add('hidden');
+    await loadProjects();
+    // 방금 만든 프로젝트 자동 선택
+    document.getElementById('projectSelect').value = name;
+    onProjectSelect();
+    showToast('✅ 프로젝트 생성 완료: ' + name);
+  } catch(e) {
+    alert('오류: ' + e.message);
+  }
+}
+
+async function deleteProject() {
+  const name = document.getElementById('projectSelect').value;
+  if (!name) return;
+  if (!confirm('"' + name + '" 프로젝트를 삭제할까요?\n(TC 파일은 삭제되지 않습니다)')) return;
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(name), { method: 'DELETE' });
+    const d = await r.json();
+    if (!d.ok) { alert('❌ ' + d.error); return; }
+    await loadProjects();
+    document.getElementById('projectCard').classList.remove('visible');
+    document.getElementById('btnDeleteProject').style.display = 'none';
+    showToast('🗑 프로젝트 삭제 완료');
+  } catch(e) {
+    alert('오류: ' + e.message);
+  }
+}
+
+// TC 가져오기 탭 전환
+function switchImportTab(tab) {
+  document.getElementById('tabExcel').classList.toggle('active', tab === 'excel');
+  document.getElementById('tabSheets').classList.toggle('active', tab === 'sheets');
+  document.getElementById('panelExcel').classList.toggle('hidden', tab !== 'excel');
+  document.getElementById('panelSheets').classList.toggle('hidden', tab !== 'sheets');
+}
+
+// Excel / md 파일 업로드
 const tcDropzone = document.getElementById('tcDropzone');
 const tcFileInput = document.getElementById('tcFileInput');
 tcDropzone.addEventListener('dragover', e => { e.preventDefault(); tcDropzone.style.borderColor = 'var(--teal)'; });
@@ -2843,11 +3229,16 @@ tcFileInput.addEventListener('change', () => {
 });
 
 async function uploadTcFile(file) {
-  if (!file.name.endsWith('.md')) { alert('.md 파일만 업로드 가능합니다.'); return; }
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (!['md', 'xlsx', 'xls'].includes(ext)) {
+    alert('.xlsx / .xls / .md 파일만 업로드 가능합니다.'); return;
+  }
   document.getElementById('uploadProjectNameGroup').style.display = 'block';
-  const projName = document.getElementById('uploadProjectName').value.trim() || file.name.replace('.md', '');
+  const stem = file.name.replace(/\.[^.]+$/, '');
+  const projName = document.getElementById('uploadProjectName').value.trim() ||
+                   document.getElementById('projectSelect').value || stem;
 
-  tcDropzone.textContent = '⏳ 업로드 중...';
+  tcDropzone.textContent = '⏳ 변환 중...';
   const fd = new FormData();
   fd.append('file', file);
   fd.append('project_name', projName);
@@ -2860,15 +3251,52 @@ async function uploadTcFile(file) {
       const status = document.getElementById('tcUploadStatus');
       status.textContent = '✅ ' + file.name + ' 등록됨 (프로젝트: ' + d.project_name + ')';
       status.classList.remove('hidden');
-      // 드롭다운에도 추가
       await loadProjects();
       document.getElementById('projectSelect').value = d.project_name;
       onProjectSelect();
+      showToast('✅ TC 파일 등록 완료');
     } else {
       tcDropzone.textContent = '❌ ' + d.error;
     }
   } catch(e) {
     tcDropzone.textContent = '❌ 업로드 실패: ' + e.message;
+  }
+}
+
+// Google Sheets 가져오기
+async function importSheets() {
+  const url = document.getElementById('sheetsUrl').value.trim();
+  const projName = document.getElementById('uploadProjectName').value.trim() ||
+                   document.getElementById('projectSelect').value;
+  if (!url) { alert('Sheets URL을 입력해주세요.'); return; }
+  if (!projName) {
+    document.getElementById('uploadProjectNameGroup').style.display = 'block';
+    document.getElementById('uploadProjectName').focus();
+    alert('프로젝트명을 입력해주세요.'); return;
+  }
+  document.getElementById('uploadProjectNameGroup').style.display = 'block';
+  const status = document.getElementById('tcUploadStatus');
+  status.textContent = '⏳ Sheets 가져오는 중...';
+  status.classList.remove('hidden');
+  try {
+    const r = await fetch('/import-sheets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, project_name: projName })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      selectedTcFile = d.tc_file;
+      status.textContent = '✅ Sheets 가져오기 완료 (TC ' + (d.tc_count || '?') + '개, 프로젝트: ' + d.project_name + ')';
+      await loadProjects();
+      document.getElementById('projectSelect').value = d.project_name;
+      onProjectSelect();
+      showToast('✅ Google Sheets 연동 완료');
+    } else {
+      status.textContent = '❌ ' + d.error;
+    }
+  } catch(e) {
+    status.textContent = '❌ 오류: ' + e.message;
   }
 }
 
@@ -3215,6 +3643,25 @@ function handleEvent(evt) {
     document.getElementById('startBtn').disabled = false;
     if (eventSource) eventSource.close();
   }
+
+  if (evt.type === 'error_recovery') {
+    setStopButtonsDisabled(true);
+    if (eventSource) eventSource.close();
+    const d = evt.data;
+    document.getElementById('recoveryErrorMsg').textContent = '오류: ' + d.error;
+    const resumeBtn = document.getElementById('btnResume');
+    const cpInfo = document.getElementById('recoveryCheckpointInfo');
+    if (d.has_checkpoint) {
+      resumeBtn.style.display = 'block';
+      cpInfo.classList.remove('hidden');
+      cpInfo.innerHTML = '💾 저장된 체크포인트<br>프로젝트: <strong>' + d.checkpoint_project +
+        '</strong><br>단계: ' + d.checkpoint_stage + '<br>저장 시각: ' + d.checkpoint_saved_at;
+    } else {
+      resumeBtn.style.display = 'none';
+      cpInfo.classList.add('hidden');
+    }
+    document.getElementById('recovery-modal').classList.add('open');
+  }
 }
 
 function updateProgress(label, pct) {
@@ -3465,6 +3912,32 @@ async function uploadToDrive() {
 
 function openDriveModal() { document.getElementById('drive-modal').classList.add('open'); }
 function closeDriveModal() { document.getElementById('drive-modal').classList.remove('open'); }
+function closeRecoveryModal() {
+  document.getElementById('recovery-modal').classList.remove('open');
+  fetch('/checkpoint', { method: 'DELETE' });  // 종료 선택 시 체크포인트 삭제
+}
+
+async function restartModify(mode) {
+  document.getElementById('recovery-modal').classList.remove('open');
+  const projectName = document.getElementById('projectSelect').value;
+  const changeDesc  = document.getElementById('changeDesc')?.value?.trim() || '';
+  document.getElementById('card2').classList.remove('hidden');
+  setStepBar(2);
+  try {
+    const r = await fetch('/restart-modify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, project_name: projectName, change_desc: changeDesc })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('❌ ' + d.error); return; }
+    currentSid = d.sid;
+    showToast(mode === 'resume' ? '🔄 체크포인트에서 재시작합니다.' : '▶ 처음부터 재시작합니다.');
+    connectStream(d.sid);
+  } catch(e) {
+    alert('재시작 오류: ' + e.message);
+  }
+}
 document.getElementById('drive-modal').addEventListener('click', e => {
   if (e.target === e.currentTarget) closeDriveModal();
 });
