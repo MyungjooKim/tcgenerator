@@ -2044,9 +2044,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     padding: 20px 32px; display: flex; align-items: center; gap: 16px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.18);
   }
+  header > div { display: flex; flex-direction: column; gap: 2px; }
   header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
   header .header-sub { font-size: 13px; opacity: 0.7; margin-left: auto; }
-  .version-badge { font-size: 11px; font-weight: 600; color: #FF8C00; letter-spacing: 0.3px; display: block; margin-top: 2px; }
+  .version-badge { font-size: 11px; font-weight: 600; color: #FF8C00; letter-spacing: 0.3px; }
 
   /* 진행 스텝 바 */
   .steps-bar {
