@@ -387,35 +387,29 @@ def _tc_list_columns(config):
 
     fixed = [
         ("TC ID",              14),
-        ("대분류",              10),
+        ("대분류",              13),
         ("중분류",              13),
         ("소분류",              16),
-        ("시나리오 (BDD 요약)", 38),
-        ("우선순위",             9),
-        ("분류",                 9),
-        ("GIVEN  (사전 조건)", 28),
-        ("WHEN  (테스트 단계)", 40),
-        ("THEN  (기대 결과)",   38),
-        ("실제 결과",           20),
+        ("사전조건",            28),
+        ("테스트 스텝",         40),
+        ("기대결과",            38),
+        ("중요도",               9),
+        ("관련 거래소",         10),
     ]
 
-    exchange_cols = [(ex, 9) for ex in exchanges]
-
-    note = [("비고", 22)]
-
-    all_cols = fixed + exchange_cols + note
+    all_cols = fixed
     return all_cols
 
 
-def build_tc_list(ws, tcs, config, include_reason=False):
-    """TC 목록 시트 생성. include_reason=True 이면 '선정 이유' 컬럼 추가 (최소 TC 세트용)"""
-    exchanges = config["exchanges"]
-    testers   = config["testers"]
-    has_ex    = bool(exchanges)
+def _priority_to_kr(priority):
+    """우선순위 영문 → 한글 변환"""
+    mapping = {"High": "높음", "Medium": "보통", "Low": "낮음",
+               "높음": "높음", "보통": "보통", "낮음": "낮음"}
+    return mapping.get(priority, priority or "보통")
 
+def build_tc_list(ws, tcs, config, include_reason=False):
+    """TC 목록 시트 생성"""
     cols = _tc_list_columns(config)
-    if include_reason:
-        cols = cols + [("선정 이유", 28)]
 
     # 컬럼 너비
     for i, (name, w) in enumerate(cols, 1):
@@ -423,42 +417,18 @@ def build_tc_list(ws, tcs, config, include_reason=False):
 
     col_names = [c[0] for c in cols]
 
-    # Row 1: 메인 헤더
+    # Row 1: 헤더
     for i, name in enumerate(col_names, 1):
-        if name in testers:
-            _, tc = testers[name]
-            bg = tc
-        else:
-            bg = C_DARK
-        set_cell(ws, 1, i, name, bold=True, bg=bg, font_color=C_WHITE,
+        set_cell(ws, 1, i, name, bold=True, bg=C_DARK, font_color=C_WHITE,
                  size=10, align_h="center")
     ws.row_dimensions[1].height = 22
 
-    # Row 2: 테스터 배정 서브헤더
-    if has_ex:
-        for i, name in enumerate(col_names, 1):
-            if name in testers:
-                tname, tc = testers[name]
-                set_cell(ws, 2, i, tname, bold=True, bg=tc, font_color=C_WHITE, align_h="center")
-            elif name in ["TC ID", "대분류", "중분류", "소분류", "시나리오 (BDD 요약)"]:
-                ex_start = next((j for j, (n, _) in enumerate(cols, 1) if n == exchanges[0]), None)
-                ex_end   = next((j for j, (n, _) in enumerate(cols, 1) if n == exchanges[-1]), None)
-                if i == next((j for j, (n, _) in enumerate(cols, 1) if n == "GIVEN  (사전 조건)"), 0):
-                    set_cell(ws, 2, i, "← 테스터 배정: 각 거래소 컬럼에 Pass/Fail/N/T 직접 기입 →",
-                             bg="E8E8E8", align_h="center")
-                else:
-                    set_cell(ws, 2, i, "", bg="E8E8E8")
-            else:
-                set_cell(ws, 2, i, "", bg="E8E8E8")
-        data_start = 3
-        ws.row_dimensions[2].height = 16
-    else:
-        data_start = 2
+    data_start = 2
 
     # 데이터 행 (도메인 그룹 헤더 삽입)
     prev_domain = None
     r = data_start
-    row_idx = 0  # 교대 색상용
+    row_idx = 0
 
     for tc in tcs:
         domain = tc["domain"]
@@ -476,62 +446,48 @@ def build_tc_list(ws, tcs, config, include_reason=False):
             ws.merge_cells(f"A{r}:{get_column_letter(len(col_names))}{r}")
             ws.row_dimensions[r].height = 20
             r += 1
-            row_idx = 0  # 그룹 바뀌면 교대 리셋
+            row_idx = 0
 
-        # TC 행 배경 (교대, 최소 TC 세트는 전체 행 bold)
         bg_base = C_ROW_A if row_idx % 2 == 0 else C_ROW_B
 
-        tc_id_text = tc["id"]  # ★ 접두사 제거 — bold 처리로 대체
-        new_suffix  = " [신규]" if tc.get("is_new") else ""
-        scenario    = tc["title"] + new_suffix
-
-        # 대분류 표시: 코드만 추출 (예: "Authentication (AUTH)" → "AUTH")
+        # 대분류 표시
         major_display = tc.get("major", "") or tc["domain"]
-        m_code = re.search(r'\((\w+)\)$', major_display)
-        if m_code:
-            major_display = m_code.group(1)
 
-        # 중분류/소분류: 없으면 도메인 레이블로 폴백
+        # 중분류/소분류
         middle_display = tc.get("middle") or DOMAIN_LABELS.get(tc["domain"], tc["domain"])
         minor_display  = tc.get("minor") or ""
 
+        # 거래소 정보 추출
+        exchange_text = ""
+        note = tc.get("note", "")
+        for ex in ["HL", "Hyperliquid", "BN", "Binance", "OKX", "Bybit", "Bitget", "Gate"]:
+            if ex.lower() in note.lower():
+                exchange_text = ex
+                break
+
         col_data = {
-            "TC ID":              tc_id_text,
-            "대분류":              major_display,
-            "중분류":              middle_display,
-            "소분류":              minor_display,
-            "시나리오 (BDD 요약)": scenario,
-            "우선순위":            tc["priority"],
-            "분류":               tc["category"],
-            "GIVEN  (사전 조건)": tc["given"],
-            "WHEN  (테스트 단계)": tc["when"],
-            "THEN  (기대 결과)":   tc["then"],
-            "실제 결과":           "",
-            "비고":               tc["note"],
-            "선정 이유":           "",  # 최소 TC 세트용 (비워둠)
+            "TC ID":         tc["id"],
+            "대분류":         major_display,
+            "중분류":         middle_display,
+            "소분류":         minor_display,
+            "사전조건":       tc["given"],
+            "테스트 스텝":    tc["when"],
+            "기대결과":       tc["then"],
+            "중요도":         _priority_to_kr(tc["priority"]),
+            "관련 거래소":    exchange_text,
         }
 
         for i, (col_name, _) in enumerate(cols, 1):
-            if col_name in exchanges:
-                na  = tc["exchange_na"].get(col_name, False)
-                val = "N/A" if na else "N/T"
-                cbg = C_GRAY if na else bg_base
-                set_cell(ws, r, i, val, bg=cbg, align_h="center")
+            if col_name == "TC ID":
+                cbg  = bg_base
+                bold = tc["star"]
+            elif col_name == "중요도":
+                cbg  = PRIORITY_COLOR.get(tc["priority"], bg_base)
+                bold = True
             else:
-                # 셀별 개별 색상 — 최소 TC 세트(star)는 전체 행 bold
-                if col_name == "TC ID":
-                    cbg  = bg_base
-                    bold = tc["star"]  # TC ID는 star 여부로 bold
-                elif col_name == "우선순위":
-                    cbg  = PRIORITY_COLOR.get(tc["priority"], bg_base)
-                    bold = True
-                elif col_name == "분류":
-                    cbg  = CATEGORY_COLOR.get(tc["category"], bg_base)
-                    bold = tc["star"]  # 최소 TC 세트면 bold
-                else:
-                    cbg  = bg_base
-                    bold = tc["star"]  # 최소 TC 세트면 전체 행 bold
-                set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg)
+                cbg  = bg_base
+                bold = tc["star"]
+            set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg)
 
         ws.row_dimensions[r].height = 80
         r += 1

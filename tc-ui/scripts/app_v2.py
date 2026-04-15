@@ -1196,10 +1196,11 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
     ws = wb.create_sheet("TC 전체목록")
     ws.freeze_panes = "A3"
 
-    HEADERS = ["TC ID", "제목", "대분류", "중분류", "소분류", "분류",
-               "우선순위", "플랫폼", "연관 화면", "사전 조건", "테스트 단계", "예상 결과", "비고", "최소TC"]
-    COL_W   = [18,       40,     14,     14,     14,     12,
-               12,       20,     20,     50,      50,      50,       20,    8]
+    HEADERS = ["TC ID", "대분류", "중분류", "소분류", "사전조건", "테스트 스텝", "기대결과", "중요도", "관련 거래소"]
+    COL_W   = [18,       14,     14,     16,      50,       50,        50,       10,     12]
+
+    def _priority_kr(p):
+        return {"High": "높음", "Medium": "보통", "Low": "낮음"}.get(p, p or "보통")
 
     for ci, (h, w) in enumerate(zip(HEADERS, COL_W), 1):
         c = ws.cell(1, ci, h)
@@ -1209,35 +1210,23 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
 
     # TC 파싱 및 행 삽입
     tcs = parse_tc_markdown(tc_content)
-    push_log_placeholder = None  # 여기서는 로그 없음
 
-    FILL_POS  = PatternFill("solid", fgColor="EBF5FB")
-    FILL_NEG  = PatternFill("solid", fgColor="FDECEA")
-    FILL_EDGE = PatternFill("solid", fgColor="FEF9E7")
     FILL_MIN  = PatternFill("solid", fgColor="FFF9C4")
+    FILL_NORM = PatternFill("solid", fgColor="FFFFFF")
 
     for ri, tc in enumerate(tcs, 2):
         is_min = tc.get("is_min", False)
-        tc_type = tc.get("type", "Positive")
-        row_fill = FILL_MIN if is_min else (
-            FILL_POS if tc_type == "Positive" else
-            FILL_NEG if tc_type == "Negative" else FILL_EDGE
-        )
+        row_fill = FILL_MIN if is_min else FILL_NORM
         row_data = [
             tc.get("id", ""),
-            tc.get("title", ""),
             tc.get("major", ""),
             tc.get("middle", ""),
             tc.get("minor", ""),
-            tc.get("type", ""),
-            tc.get("priority", ""),
-            tc.get("platform", ""),
-            tc.get("screen", ""),
             tc.get("precondition", ""),
             tc.get("steps", ""),
             tc.get("expected", ""),
-            tc.get("note", ""),
-            "Y" if is_min else "",
+            _priority_kr(tc.get("priority", "")),
+            "",  # 관련 거래소 (마크다운에서 추출 시 채워짐)
         ]
         for ci, val in enumerate(row_data, 1):
             c = ws.cell(ri, ci, val)
@@ -1246,7 +1235,7 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
             c.border = bdr()
             c.font = Font(name="Calibri", size=9,
                           bold=(ci == 1 and is_min), color="1E2761" if is_min else "222222")
-        ws.row_dimensions[ri].height = max(30, min(120, len(str(row_data[10])) // 3 + 20))
+        ws.row_dimensions[ri].height = max(30, min(120, len(str(row_data[4])) // 3 + 20))
 
     # 통계 시트
     stat = wb.create_sheet("통계")
