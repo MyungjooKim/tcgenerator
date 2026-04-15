@@ -223,8 +223,33 @@ def extract_section(block, section_name):
     )
     if not m:
         return ""
-    lines = [l.lstrip("- 0123456789.").strip() for l in m.group(1).strip().split('\n') if l.strip()]
-    return "\n".join(lines)
+    raw_lines = [l for l in m.group(1).strip().split('\n') if l.strip()]
+    # 사전 조건만 번호 개조식, 나머지(테스트 단계/예상 결과/비고)는 불릿만 제거
+    if section_name == "사전 조건":
+        result = []
+        n = 1
+        for l in raw_lines:
+            stripped = l.strip()
+            if re.match(r'^\d+\.', stripped):
+                result.append(stripped)
+                n = int(re.match(r'^(\d+)', stripped).group(1)) + 1
+            elif re.match(r'^[-*]\s+', stripped):
+                body = re.sub(r'^[-*]\s+', '', stripped)
+                result.append(f"{n}. {body}")
+                n += 1
+            else:
+                result.append(f"{n}. {stripped}")
+                n += 1
+        return "\n".join(result)
+    else:
+        # 불릿/번호 제거 → 텍스트만
+        result = []
+        for l in raw_lines:
+            stripped = l.strip()
+            stripped = re.sub(r'^[-*]\s+', '', stripped)
+            stripped = re.sub(r'^\d+\.\s*', '', stripped)
+            result.append(stripped)
+        return "\n".join(result)
 
 def parse_exchange_na(note_text):
     na = {}

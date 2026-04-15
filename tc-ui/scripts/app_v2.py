@@ -380,20 +380,71 @@ def load_projects() -> list:
             return []
     return []
 
-def save_project(project_name: str, tc_file: str, excel_file: str):
+def save_project(project_name: str, tc_file: str = "", excel_file: str = "", **extra):
     projects = load_projects()
-    # 같은 이름의 프로젝트가 있으면 업데이트
     existing = next((p for p in projects if p["name"] == project_name), None)
     entry = {
         "name":       project_name,
-        "tc_file":    tc_file,
-        "excel_file": excel_file,
+        "tc_file":    tc_file or (existing or {}).get("tc_file", ""),
+        "excel_file": excel_file or (existing or {}).get("excel_file", ""),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+    # 기존 필드 보존 (pipeline_state 등)
+    if existing:
+        for k, v in existing.items():
+            if k not in entry:
+                entry[k] = v
+    # extra 필드 병합
+    entry.update(extra)
     if existing:
         projects = [entry if p["name"] == project_name else p for p in projects]
     else:
         projects.insert(0, entry)
+    PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ── 프로젝트별 파이프라인 상태 저장 (이어서 작업용) ─────────────────────────────
+PIPELINE_STATES_DIR = BASE_DIR / "pipeline_states"
+PIPELINE_STATES_DIR.mkdir(exist_ok=True)
+
+def save_pipeline_state(project_name: str, stage: str, data: dict):
+    """파이프라인 중간 상태를 프로젝트별 JSON으로 저장"""
+    safe = re.sub(r"[^\w\-_]", "_", project_name)[:40]
+    state_file = PIPELINE_STATES_DIR / f"{safe}.json"
+    state = {
+        "project_name": project_name,
+        "stage":        stage,
+        "saved_at":     datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "data":         data,
+    }
+    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 프로젝트 레지스트리에도 상태 요약 기록
+    save_project(project_name, pipeline_stage=stage, pipeline_saved_at=state["saved_at"])
+
+def load_pipeline_state(project_name: str) -> dict | None:
+    """저장된 파이프라인 상태 로드"""
+    safe = re.sub(r"[^\w\-_]", "_", project_name)[:40]
+    state_file = PIPELINE_STATES_DIR / f"{safe}.json"
+    if state_file.exists():
+        try:
+            return json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+def clear_pipeline_state(project_name: str):
+    """완료 시 파이프라인 상태 파일 삭제"""
+    safe = re.sub(r"[^\w\-_]", "_", project_name)[:40]
+    state_file = PIPELINE_STATES_DIR / f"{safe}.json"
+    if state_file.exists():
+        state_file.unlink()
+    # 프로젝트 레지스트리에서 상태 필드 제거
+    projects = load_projects()
+    for p in projects:
+        if p["name"] == project_name:
+            p.pop("pipeline_stage", None)
+            p.pop("pipeline_saved_at", None)
+            break
     PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -629,7 +680,7 @@ def html_to_text(html: str) -> str:
 
 
 # ── 2단계: 정책 분석 ──────────────────────────────────────────────────────────
-def step_policy(sess: dict, raw_text: str, project_name: str) -> str:
+def step_policy(sess: dict, raw_text: str, project_name: str, focus_area: str = "") -> str:
     push_log(sess, "[정책] Claude AI로 정책 분석 중...")
     system = """당신은 소프트웨어 QA 전문가입니다.
 주어진 문서에서 테스트 가능한 정책과 비즈니스 규칙을 추출합니다.
@@ -646,6 +697,14 @@ def step_policy(sess: dict, raw_text: str, project_name: str) -> str:
 ## 예외 처리 정책
 (오류 케이스, 엣지 케이스, 유효성 검증 규칙)
 """
+    focus_instruction = ""
+    if focus_area:
+        focus_instruction = f"""
+
+⚠️ 중요: 사용자가 다음 기능에 대한 TC만 생성하려고 합니다. 해당 기능과 관련된 정책/규칙에 집중하세요:
+→ {focus_area}
+
+관련 없는 도메인이나 기능의 정책은 간략하게만 다루고, 위 범위의 정책을 상세하게 분석하세요."""
     user = f"""프로젝트: {project_name}
 
 다음 문서에서 TC 작성에 필요한 모든 정책과 규칙을 추출해주세요:
@@ -654,7 +713,7 @@ def step_policy(sess: dict, raw_text: str, project_name: str) -> str:
 {raw_text[:15000]}
 ---
 
-각 정책은 구체적이고 테스트 가능한 형태로 서술해주세요.
+각 정책은 구체적이고 테스트 가능한 형태로 서술해주세요.{focus_instruction}
 """
     result = call_claude(system, user, max_tokens=4096)
     policy_path = sess["workspace"] / "02_policy.md"
@@ -664,7 +723,7 @@ def step_policy(sess: dict, raw_text: str, project_name: str) -> str:
 
 
 # ── 3단계: 기능 목록 ──────────────────────────────────────────────────────────
-def step_features(sess: dict, policy_text: str, project_name: str) -> str:
+def step_features(sess: dict, policy_text: str, project_name: str, focus_area: str = "") -> str:
     push_log(sess, "[기능] 기능 목록 생성 중...")
     system = """당신은 QA 엔지니어입니다. 정책 분석 결과를 바탕으로 테스트 가능한 기능 목록을 생성합니다.
 
@@ -681,6 +740,14 @@ def step_features(sess: dict, policy_text: str, project_name: str) -> str:
 
 각 도메인의 모든 기능을 빠짐없이 나열하세요.
 """
+    focus_instruction = ""
+    if focus_area:
+        focus_instruction = f"""
+
+⚠️ 중요: 다음 기능 범위에 해당하는 기능을 중심으로 목록을 작성하세요:
+→ {focus_area}
+
+해당 범위의 기능은 세부적으로 나열하고, 범위 밖의 기능은 포함하지 마세요."""
     user = f"""프로젝트: {project_name}
 
 다음 정책 분석을 바탕으로 테스트해야 할 기능 목록을 작성해주세요:
@@ -689,7 +756,7 @@ def step_features(sess: dict, policy_text: str, project_name: str) -> str:
 {policy_text}
 ---
 
-모든 주요 기능을 도메인별로 분류하여 나열하고, 각 기능의 테스트 포인트를 구체적으로 서술하세요.
+모든 주요 기능을 도메인별로 분류하여 나열하고, 각 기능의 테스트 포인트를 구체적으로 서술하세요.{focus_instruction}
 """
     result = call_claude(system, user, max_tokens=4096)
     features_path = sess["workspace"] / "03_features.md"
@@ -699,7 +766,7 @@ def step_features(sess: dict, policy_text: str, project_name: str) -> str:
 
 
 # ── 4단계: 분류표 생성 ────────────────────────────────────────────────────────
-def step_classify(sess: dict, features_text: str, project_name: str) -> str:
+def step_classify(sess: dict, features_text: str, project_name: str, focus_area: str = "") -> str:
     push_log(sess, "[분류] 계층 분류표 생성 중...")
     system = """당신은 TC 분류 전문가입니다. 기능 목록을 바탕으로 대분류/중분류/소분류 계층 분류표를 생성합니다.
 
@@ -723,6 +790,14 @@ def step_classify(sess: dict, features_text: str, project_name: str) -> str:
 - 소분류는 세부 케이스 단위
 - 코드는 의미를 반영하는 영문 대문자
 """
+    focus_instruction = ""
+    if focus_area:
+        focus_instruction = f"""
+
+⚠️ 중요: 다음 범위에 해당하는 기능의 분류표만 생성하세요:
+→ {focus_area}
+
+범위 밖의 기능은 분류표에 포함하지 마세요."""
     user = f"""프로젝트: {project_name}
 
 다음 기능 목록을 대분류/중분류/소분류 계층으로 분류해주세요:
@@ -731,7 +806,7 @@ def step_classify(sess: dict, features_text: str, project_name: str) -> str:
 {features_text}
 ---
 
-분류 결과는 TC ID 생성의 기반이 되므로, 명확하고 일관성 있는 코드를 사용하세요.
+분류 결과는 TC ID 생성의 기반이 되므로, 명확하고 일관성 있는 코드를 사용하세요.{focus_instruction}
 """
     result = call_claude(system, user, max_tokens=4096)
     classify_path = sess["workspace"] / "04_classification_draft.md"
@@ -805,6 +880,23 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
             except Exception as e2:
                 push_log(sess, f"[TC 작성] {domain_code} 실패 (건너뜀): {e2}")
                 continue
+
+        # 잘림 감지: 마지막 TC에 **테스트 단계** 또는 **예상 결과**가 없으면 이어서 생성
+        last_tc_match = list(re.finditer(r"^###\s", tc_draft, re.MULTILINE))
+        if last_tc_match:
+            last_tc_block = tc_draft[last_tc_match[-1].start():]
+            has_steps = "**테스트 단계**" in last_tc_block
+            has_expected = "**예상 결과**" in last_tc_block
+            if not has_steps or not has_expected:
+                push_log(sess, f"[TC 작성] {domain_code} 마지막 TC 불완전 — 이어서 생성 중...")
+                continue_prompt = f"이전 응답이 중간에 잘렸습니다. 아래 TC를 이어서 완성해주세요. **테스트 단계**와 **예상 결과**를 반드시 포함하세요.\\n\\n---\\n{last_tc_block}"
+                try:
+                    continuation = call_claude(system, continue_prompt, max_tokens=4096)
+                    # 잘린 마지막 TC를 교체
+                    tc_draft = tc_draft[:last_tc_match[-1].start()] + continuation
+                    push_log(sess, f"[TC 작성] {domain_code} 보완 완료")
+                except Exception:
+                    push_log(sess, f"[TC 작성] {domain_code} 보완 실패 — 불완전한 TC 포함")
 
         # 도메인별 파일 저장
         draft_path = sess["workspace"] / f"tc_draft_{domain_code}.md"
@@ -1314,26 +1406,56 @@ def extract_section(block: str, section_name: str) -> str:
 
 # ── 메인 파이프라인 ────────────────────────────────────────────────────────────
 def run_pipeline(sess: dict, sources: list, project_name: str):
+    focus_area = sess.get("focus_area", "")
+    # 이어서 작업인지 확인
+    resumed = sess.get("_resumed_state")
     try:
-        sess["status"] = "parsing"
-        push_stage(sess, 1, "문서 파싱", 5)
-        raw_text = step_parse_sources(sess, sources)
-        check_stop(sess)
+        # ── 파싱 ──
+        if resumed and resumed.get("stage") in ("policy", "features", "classifying", "gate_waiting", "tc_writing"):
+            raw_text = resumed["data"].get("raw_text", "")
+            push_log(sess, f"[이어서] 파싱 결과 복원됨 ({len(raw_text):,}자)")
+        else:
+            sess["status"] = "parsing"
+            push_stage(sess, 1, "문서 파싱", 5)
+            raw_text = step_parse_sources(sess, sources)
+            check_stop(sess)
+            save_pipeline_state(project_name, "parsed", {"raw_text": raw_text[:20000], "focus_area": focus_area, "sources_summary": [s.get("type","") for s in sources]})
 
-        sess["status"] = "policy"
-        push_stage(sess, 2, "정책 분석", 15)
-        policy_text = step_policy(sess, raw_text, project_name)
-        check_stop(sess)
+        if focus_area:
+            push_log(sess, f"[포커스] TC 생성 범위: {focus_area}")
 
-        sess["status"] = "features"
-        push_stage(sess, 2, "기능 목록 생성", 25)
-        features_text = step_features(sess, policy_text, project_name)
-        check_stop(sess)
+        # ── 정책 분석 ──
+        if resumed and resumed.get("stage") in ("features", "classifying", "gate_waiting", "tc_writing"):
+            policy_text = resumed["data"].get("policy_text", "")
+            push_log(sess, f"[이어서] 정책 분석 복원됨 ({len(policy_text):,}자)")
+        else:
+            sess["status"] = "policy"
+            push_stage(sess, 2, "정책 분석", 15)
+            policy_text = step_policy(sess, raw_text, project_name, focus_area)
+            check_stop(sess)
+            save_pipeline_state(project_name, "policy", {"raw_text": raw_text[:20000], "policy_text": policy_text, "focus_area": focus_area})
 
-        sess["status"] = "classifying"
-        push_stage(sess, 2, "분류표 생성", 38)
-        classification = step_classify(sess, features_text, project_name)
-        check_stop(sess)
+        # ── 기능 목록 ──
+        if resumed and resumed.get("stage") in ("classifying", "gate_waiting", "tc_writing"):
+            features_text = resumed["data"].get("features_text", "")
+            push_log(sess, f"[이어서] 기능 목록 복원됨 ({len(features_text):,}자)")
+        else:
+            sess["status"] = "features"
+            push_stage(sess, 2, "기능 목록 생성", 25)
+            features_text = step_features(sess, policy_text, project_name, focus_area)
+            check_stop(sess)
+            save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "focus_area": focus_area})
+
+        # ── 분류표 ──
+        if resumed and resumed.get("stage") in ("gate_waiting", "tc_writing"):
+            classification = resumed["data"].get("classification", "")
+            push_log(sess, f"[이어서] 분류표 복원됨 ({len(classification):,}자)")
+        else:
+            sess["status"] = "classifying"
+            push_stage(sess, 2, "분류표 생성", 38)
+            classification = step_classify(sess, features_text, project_name, focus_area)
+            check_stop(sess)
+            save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "classification": classification, "focus_area": focus_area})
 
         # Human Gate
         push_stage(sess, 3, "분류표 검토 대기", 45)
@@ -1366,6 +1488,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         tc_md_path = TC_FILES_DIR / f"{safe_name}_{today}.md"
         tc_md_path.write_text(tc_content, encoding="utf-8")
         save_project(project_name, str(tc_md_path), str(excel_path))
+        clear_pipeline_state(project_name)  # 완료 시 상태 파일 정리
         push_log(sess, f"[저장] TC 파일 저장: {tc_md_path.name}")
 
         sess["result"] = excel_path
@@ -1601,6 +1724,29 @@ def upload():
 def start():
     data = request.get_json(force=True) or {}
     project_name = data.get("project_name", "프로젝트").strip() or "프로젝트"
+    focus_area   = data.get("focus_area", "").strip() or ""
+    resume       = data.get("resume", False)  # 이어서 작업 여부
+
+    # 이어서 작업 모드
+    if resume:
+        state = load_pipeline_state(project_name)
+        if not state:
+            return jsonify({"ok": False, "error": "저장된 작업 상태가 없습니다."}), 400
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY가 설정되지 않았습니다."}), 500
+        sess = new_session()
+        sess["project_name"] = project_name
+        sess["focus_area"] = state["data"].get("focus_area", "")
+        sess["_resumed_state"] = state
+        # 이어서 작업 시 소스는 빈 배열 (이미 파싱 결과가 state에 있음)
+        t = threading.Thread(
+            target=run_pipeline,
+            args=(sess, [], project_name),
+            daemon=True
+        )
+        sess["thread"] = t
+        t.start()
+        return jsonify({"ok": True, "sid": sess["id"], "resumed_stage": state["stage"]})
 
     # 새 형식: sources 배열 / 구버전 호환: input_type + content
     sources = data.get("sources")
@@ -1626,6 +1772,7 @@ def start():
 
     sess = new_session()
     sess["project_name"] = project_name
+    sess["focus_area"] = focus_area
     t = threading.Thread(
         target=run_pipeline,
         args=(sess, sources, project_name),
@@ -1634,6 +1781,21 @@ def start():
     sess["thread"] = t
     t.start()
     return jsonify({"ok": True, "sid": sess["id"]})
+
+
+@app.route("/projects/<name>/state")
+def get_project_state(name):
+    """프로젝트의 저장된 파이프라인 상태 조회"""
+    state = load_pipeline_state(name)
+    if not state:
+        return jsonify({"ok": True, "has_state": False})
+    return jsonify({
+        "ok": True,
+        "has_state": True,
+        "stage": state["stage"],
+        "saved_at": state["saved_at"],
+        "focus_area": state["data"].get("focus_area", ""),
+    })
 
 
 @app.route("/stream/<sid>")
@@ -1985,6 +2147,101 @@ def approve(sid):
     sess["approved"] = content
     sess["gate_event"].set()
     return jsonify({"ok": True})
+
+
+@app.route("/gate-chat/<sid>", methods=["POST"])
+def gate_chat(sid):
+    """Human Gate 채팅 — AI와 대화하며 분류표/영향도 문서를 수정"""
+    import anthropic
+    sess = SESSIONS.get(sid)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션 없음"}), 404
+    if sess.get("status") != "gate_waiting":
+        return jsonify({"ok": False, "error": "Gate 대기 상태가 아닙니다."}), 400
+
+    data = request.get_json(force=True) or {}
+    user_msg = data.get("message", "").strip()
+    current_doc = data.get("current_doc", "").strip()
+    gate_mode = data.get("gate_mode", "new")   # "new" | "modify"
+    history = data.get("history", [])           # [{role, content}, ...]
+
+    if not user_msg:
+        return jsonify({"ok": False, "error": "메시지를 입력해주세요."}), 400
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    if gate_mode == "modify":
+        system_prompt = """당신은 TC(Test Case) 수정 전문가입니다.
+현재 AI가 생성한 '변경 영향도 분석' 문서를 사용자의 요청에 따라 수정합니다.
+
+규칙:
+- 사용자의 수정 요청을 정확히 반영하여 문서를 업데이트하세요.
+- 응답은 반드시 두 부분으로 구성하세요:
+  1. [REPLY] 태그: 수정 내용에 대한 간단한 설명 (1-3문장)
+  2. [DOCUMENT] 태그: 수정된 전체 문서 내용 (마크다운 형식 유지)
+- 수정 요청이 없거나 질문인 경우, [DOCUMENT] 태그에는 기존 문서를 그대로 포함하세요.
+- 문서 형식(마크다운, 헤딩, 목록 등)을 유지하세요."""
+    else:
+        system_prompt = """당신은 TC(Test Case) 분류 전문가입니다.
+현재 AI가 생성한 '분류표' 문서를 사용자의 요청에 따라 수정합니다.
+
+규칙:
+- 사용자의 수정 요청을 정확히 반영하여 분류표를 업데이트하세요.
+- 응답은 반드시 두 부분으로 구성하세요:
+  1. [REPLY] 태그: 수정 내용에 대한 간단한 설명 (1-3문장)
+  2. [DOCUMENT] 태그: 수정된 전체 문서 내용 (마크다운 형식 유지)
+- 수정 요청이 없거나 질문인 경우, [DOCUMENT] 태그에는 기존 문서를 그대로 포함하세요.
+- 분류표 형식(## 대분류, ### 중분류, TC ID 패턴 등)을 유지하세요."""
+
+    # 메시지 구성 — 히스토리 + 현재 문서 컨텍스트 + 사용자 메시지
+    messages = []
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
+
+    # 현재 문서를 컨텍스트로 포함
+    full_user_msg = f"""현재 문서:\n```\n{current_doc}\n```\n\n사용자 요청: {user_msg}"""
+    messages.append({"role": "user", "content": full_user_msg})
+
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages
+        )
+        ai_text = resp.content[0].text
+
+        # [REPLY]와 [DOCUMENT] 파싱
+        reply_text = ""
+        updated_doc = current_doc  # 기본값: 변경 없음
+
+        reply_match = re.search(r'\[REPLY\](.*?)(?=\[DOCUMENT\]|$)', ai_text, re.DOTALL)
+        doc_match   = re.search(r'\[DOCUMENT\](.*?)$', ai_text, re.DOTALL)
+
+        if reply_match:
+            reply_text = reply_match.group(1).strip()
+        if doc_match:
+            updated_doc = doc_match.group(1).strip()
+            # 코드블록 래핑 제거
+            if updated_doc.startswith("```"):
+                lines = updated_doc.split("\n")
+                updated_doc = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+
+        if not reply_text:
+            reply_text = ai_text.strip()
+
+        return jsonify({
+            "ok": True,
+            "reply": reply_text,
+            "updated_doc": updated_doc
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/export-gate", methods=["POST"])
@@ -2369,6 +2626,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   textarea.form-input { resize: vertical; min-height: 120px; }
   .form-group { margin-bottom: 16px; }
 
+  /* 프로젝트 드롭다운 */
+  .project-select-row {
+    display: flex; gap: 8px; align-items: center; margin-bottom: 16px;
+  }
+  .project-select-row label {
+    font-size: 13px; font-weight: 600; color: var(--navy); white-space: nowrap;
+  }
+  .project-dropdown {
+    flex: 1; padding: 8px 12px; border: 1.5px solid var(--border);
+    border-radius: 8px; font-size: 13px; color: var(--text);
+    background: #fff; cursor: pointer; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23666'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 12px center;
+    padding-right: 30px;
+  }
+  .project-dropdown:focus { border-color: var(--blue); outline: none; }
+  .btn-new-project {
+    padding: 7px 14px; background: var(--teal); color: #fff;
+    border: none; border-radius: 8px; font-size: 12px; font-weight: 600;
+    cursor: pointer; white-space: nowrap;
+  }
+  .btn-new-project:hover { background: #026D75; }
+  .project-new-inline {
+    display: none; gap: 8px; align-items: center; margin-bottom: 12px;
+  }
+  .project-new-inline input {
+    flex: 1; padding: 7px 10px; border: 1.5px solid var(--border);
+    border-radius: 8px; font-size: 13px;
+  }
+  .project-new-inline input:focus { border-color: var(--blue); outline: none; }
+  .project-resume-bar {
+    padding: 10px 12px; margin-bottom: 16px;
+    border: 1.5px solid #60A5FA; border-radius: 8px;
+    background: #EFF6FF; display: none; align-items: center; gap: 10px;
+    font-size: 12px; color: #1E40AF;
+  }
+  .project-resume-bar strong { font-weight: 700; }
+  .btn-resume-pipeline {
+    padding: 5px 14px; background: #2563EB; color: #fff; border: none;
+    border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-resume-pipeline:hover { background: #1D4ED8; }
+  .pj-status-tag {
+    font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    font-weight: 600; margin-left: 4px; vertical-align: middle;
+  }
+  .pj-status-tag.in-progress { background: #FEF3C7; color: #92400E; }
+  .pj-status-tag.completed { background: #D1FAE5; color: #065F46; }
+  .pj-status-tag.sample { background: #E5E7EB; color: #6B7280; }
+
   /* 모드 스위처 */
   .mode-switcher {
     display: flex; background: var(--bg); border-radius: 10px;
@@ -2595,14 +2903,85 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .domain-chip.checked .chip-dot { background: var(--teal); }
 
-  /* Gate 텍스트에어리어 */
-  .gate-textarea {
-    width: 100%; min-height: 320px; font-family: 'Consolas', 'Monaco', monospace;
-    font-size: 13px; padding: 14px; border: 1.5px solid var(--border);
-    border-radius: 8px; resize: vertical; background: #FAFAFA; color: var(--text);
-    line-height: 1.7;
+  /* Gate 채팅 UI */
+  .gate-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    min-height: 480px;
   }
-  .gate-textarea:focus { outline: none; border-color: var(--blue); }
+  @media (max-width: 860px) {
+    .gate-layout { grid-template-columns: 1fr; }
+  }
+  .gate-chat-panel {
+    display: flex; flex-direction: column;
+    border: 1.5px solid var(--border); border-radius: 10px; overflow: hidden;
+    background: #fff;
+  }
+  .gate-chat-header {
+    padding: 10px 14px; background: var(--navy); color: #fff;
+    font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px;
+  }
+  .gate-chat-messages {
+    flex: 1; overflow-y: auto; padding: 12px; display: flex;
+    flex-direction: column; gap: 10px; min-height: 320px; max-height: 420px;
+    background: #F8FAFC;
+  }
+  .gate-msg { max-width: 88%; padding: 9px 13px; border-radius: 10px; font-size: 13px; line-height: 1.55; }
+  .gate-msg.assistant {
+    align-self: flex-start; background: #EDF2FF; color: var(--navy);
+    border-bottom-left-radius: 3px;
+  }
+  .gate-msg.user {
+    align-self: flex-end; background: var(--teal); color: #fff;
+    border-bottom-right-radius: 3px;
+  }
+  .gate-msg.system {
+    align-self: center; background: #F0FDF4; color: #166534;
+    font-size: 12px; border: 1px solid #BBF7D0; border-radius: 8px; max-width: 96%;
+  }
+  .gate-chat-input-row {
+    display: flex; gap: 8px; padding: 10px;
+    border-top: 1px solid var(--border); background: #fff;
+  }
+  .gate-chat-input {
+    flex: 1; border: 1.5px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; resize: none; outline: none;
+    font-family: inherit; min-height: 40px; max-height: 100px;
+    line-height: 1.5; color: var(--text);
+  }
+  .gate-chat-input:focus { border-color: var(--blue); }
+  .gate-chat-send {
+    padding: 8px 16px; background: var(--teal); color: #fff;
+    border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+    cursor: pointer; white-space: nowrap; align-self: flex-end;
+  }
+  .gate-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
+  .gate-viewer-panel {
+    display: flex; flex-direction: column;
+    border: 1.5px solid var(--border); border-radius: 10px; overflow: hidden;
+    background: #fff;
+  }
+  .gate-viewer-header {
+    padding: 10px 14px; background: #2D3748; color: #fff;
+    font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px;
+  }
+  .gate-viewer-content {
+    flex: 1; overflow-y: auto; padding: 16px;
+    font-size: 13px; line-height: 1.75; color: var(--text);
+    min-height: 320px; max-height: 420px; background: #fff;
+  }
+  .gate-viewer-content h2 { font-size: 15px; font-weight: 700; color: var(--navy); margin: 14px 0 6px; border-bottom: 1.5px solid #E2E8F0; padding-bottom: 4px; }
+  .gate-viewer-content h3 { font-size: 13px; font-weight: 600; color: var(--blue); margin: 10px 0 4px; }
+  .gate-viewer-content ul, .gate-viewer-content ol { padding-left: 18px; margin: 4px 0; }
+  .gate-viewer-content li { margin: 2px 0; }
+  .gate-viewer-content strong { color: var(--navy); }
+  .gate-viewer-content code { background: #EDF2FF; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .gate-viewer-content blockquote { border-left: 3px solid var(--teal); padding-left: 10px; color: var(--muted); margin: 6px 0; }
+  .gate-doc-updated { animation: flashUpdate 0.6s ease; }
+  @keyframes flashUpdate { 0%,100%{background:#fff} 50%{background:#E0F2FE} }
+  /* 기존 textarea (숨김) */
+  .gate-textarea { display: none; }
 
   /* 완료 카드 */
   .result-box {
@@ -2718,7 +3097,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge">v0.9.2</span>
+    <span class="version-badge">v0.9.4</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
@@ -2751,6 +3130,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Step 1: 입력 카드 -->
   <div class="card" id="card1">
     <div class="card-title">📥 입력 설정 <span class="badge">Step 1</span></div>
+
+    <!-- 프로젝트 선택 -->
+    <div class="project-select-row">
+      <label>📁 프로젝트</label>
+      <select class="project-dropdown" id="projectDropdown" onchange="onProjectDropdownChange()">
+        <option value="">— 프로젝트를 선택하세요 —</option>
+      </select>
+      <button class="btn-new-project" onclick="toggleNewProjectInline()">+ 새 프로젝트</button>
+      <button id="btnDeleteProject" style="display:none;padding:7px 10px;background:none;border:1px solid #E5E7EB;border-radius:8px;font-size:12px;cursor:pointer;color:#DC2626;" onclick="deleteDashProject()">삭제</button>
+    </div>
+    <div class="project-new-inline" id="newProjectInline">
+      <input type="text" id="newDashProjectName" placeholder="새 프로젝트명 입력"
+        onkeydown="if(event.key==='Enter')createDashProject();">
+      <button class="btn-new-project" onclick="createDashProject()">생성</button>
+      <button style="padding:7px 10px;background:none;border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;" onclick="toggleNewProjectInline()">취소</button>
+    </div>
+    <div class="project-resume-bar" id="resumeBar">
+      <span>💾 이전 작업이 있습니다 — <strong id="resumeStage"></strong> 단계까지 완료</span>
+      <span id="resumeSavedAt" style="font-size:11px;opacity:0.7;margin-left:auto;"></span>
+      <button class="btn-resume-pipeline" onclick="resumePipeline()">이어서 작업</button>
+      <button style="padding:5px 10px;background:none;border:1px solid #93C5FD;border-radius:6px;font-size:11px;cursor:pointer;color:#1E40AF;" onclick="discardResume()">처음부터</button>
+    </div>
 
     <!-- 모드 스위처 -->
     <div class="mode-switcher">
@@ -2786,6 +3187,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="sourceEmpty" class="source-empty">
           소스를 추가하세요.<br>
           <span style="font-size:12px">PDF 기획서 · GitHub mockup URL · 슬랙 변경 내용 등을 자유롭게 조합할 수 있습니다.</span>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
+          <span>TC 생성 범위</span>
+          <span style="font-size:11px;color:var(--muted);font-weight:400">선택 — 비우면 전체 TC 생성</span>
+        </label>
+        <textarea id="focusArea" class="form-input" rows="2"
+          style="resize:vertical; min-height:48px; font-size:13px; line-height:1.5;"
+          placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리"></textarea>
+        <div style="font-size:11px; color:var(--muted); margin-top:3px;">
+          입력하면 해당 기능에 집중하여 TC를 생성합니다. 여러 기능은 쉼표 또는 줄바꿈으로 구분하세요.
         </div>
       </div>
 
@@ -2902,15 +3316,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="card hidden" id="card3">
     <div class="card-title" id="gateTitle">🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span></div>
     <div class="info-box" id="gateInfoBox">
-      AI가 생성한 분류표입니다. 내용을 확인하고 필요 시 수정한 후 승인해주세요.<br>
-      분류표는 TC ID(SC-대분류-중분류-NNN) 생성의 기반이 됩니다.
+      AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 결과를 확인한 뒤 승인하세요.
     </div>
 
-    <!-- 분류표 원문 -->
-    <div style="font-size:13px; font-weight:600; color:var(--navy); margin-bottom:6px;">
-      📄 분류표 원문 <span style="font-weight:400; color:var(--muted); font-size:12px;">(필요 시 직접 수정 가능)</span>
+    <!-- 채팅 + Viewer 2-column 레이아웃 -->
+    <div class="gate-layout">
+
+      <!-- 왼쪽: AI 채팅 패널 -->
+      <div class="gate-chat-panel">
+        <div class="gate-chat-header">
+          💬 AI와 대화하여 수정
+        </div>
+        <div class="gate-chat-messages" id="gateChatMessages">
+          <!-- 메시지가 여기에 추가됨 -->
+        </div>
+        <div class="gate-chat-input-row">
+          <textarea class="gate-chat-input" id="gateChatInput"
+            placeholder="수정 요청을 입력하세요. 예) AUTH 도메인 케이스 3번 삭제해줘"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGateChat();}"></textarea>
+          <button class="gate-chat-send" id="gateChatSend" onclick="sendGateChat()">전송</button>
+        </div>
+      </div>
+
+      <!-- 오른쪽: 문서 Viewer -->
+      <div class="gate-viewer-panel">
+        <div class="gate-viewer-header">
+          📄 문서 Viewer <span id="gateViewerBadge" style="margin-left:auto; font-size:11px; opacity:0.8;"></span>
+        </div>
+        <div class="gate-viewer-content" id="gateViewer">
+          <!-- 마크다운 렌더링 결과 -->
+        </div>
+      </div>
     </div>
-    <textarea class="gate-textarea" id="gateContent" style="min-height:220px"></textarea>
+
+    <!-- 숨겨진 원본 데이터 저장용 -->
+    <textarea class="gate-textarea" id="gateContent"></textarea>
 
     <!-- TC 생성 범위 선택 -->
     <div style="margin-top:18px; margin-bottom:8px; font-size:13px; font-weight:600; color:var(--navy);">
@@ -2920,7 +3360,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div id="domainChecklist" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;">
       <!-- JS로 동적 생성 -->
     </div>
-    <div style="display:flex; gap:8px; margin-bottom:16px;">
+    <div style="display:flex; gap:8px; margin-bottom:16px; align-items:center;">
       <button type="button" onclick="selectAllDomains(true)"
         style="font-size:12px; padding:4px 12px; border:1px solid var(--border);
           border-radius:6px; background:none; cursor:pointer; color:var(--text);">
@@ -3075,6 +3515,144 @@ let eventSource = null;
 let currentMode = 'new';          // 'new' | 'modify'
 let projects = [];                // 프로젝트 목록 캐시
 let selectedTcFile = null;        // 업로드된 TC 파일명
+
+// ── 프로젝트 드롭다운 ─────────────────────────────────────────────────────────
+let selectedProject = null;
+let projectResumeState = null;
+
+async function loadDashProjects() {
+  try {
+    const r = await fetch('/projects');
+    const list = await r.json();
+    projects = list;
+    const dd = document.getElementById('projectDropdown');
+    dd.innerHTML = '<option value="">-- 프로젝트를 선택하세요 --</option>';
+    // 샘플(is_sample)은 하단에 배치
+    const normal = list.filter(p => !p.is_sample);
+    const samples = list.filter(p => p.is_sample);
+    const sorted = [...normal, ...samples];
+    sorted.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      let label = p.name + '  [진행 중]';
+      if (p.is_sample) label += '  (샘플)';
+      opt.textContent = label;
+      dd.appendChild(opt);
+    });
+    if (selectedProject) dd.value = selectedProject;
+  } catch(e) {
+    console.error('프로젝트 로드 실패', e);
+  }
+}
+
+async function onProjectDropdownChange() {
+  const name = document.getElementById('projectDropdown').value;
+  document.getElementById('resumeBar').style.display = 'none';
+  document.getElementById('btnDeleteProject').style.display = name ? 'inline-block' : 'none';
+  projectResumeState = null;
+  if (!name) { selectedProject = null; return; }
+  selectedProject = name;
+  document.getElementById('projectName').value = name;
+  // 수정 모드 드롭다운도 연동
+  const sel = document.getElementById('projectSelect');
+  if (sel) {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === name) { sel.selectedIndex = i; break; }
+    }
+  }
+  // 이전 작업 상태 확인
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(name) + '/state');
+    const d = await r.json();
+    if (d.ok && d.has_state) {
+      projectResumeState = d;
+      const stageNames = {parsed:'문서 파싱', policy:'정책 분석', features:'기능 목록', classifying:'분류표 생성', gate_waiting:'분류표 검토 대기', tc_writing:'TC 작성'};
+      document.getElementById('resumeStage').textContent = stageNames[d.stage] || d.stage;
+      document.getElementById('resumeSavedAt').textContent = d.saved_at || '';
+      document.getElementById('resumeBar').style.display = 'flex';
+      if (d.focus_area) document.getElementById('focusArea').value = d.focus_area;
+    }
+  } catch(e) {}
+}
+
+function toggleNewProjectInline() {
+  const row = document.getElementById('newProjectInline');
+  const visible = row.style.display === 'flex';
+  row.style.display = visible ? 'none' : 'flex';
+  if (!visible) document.getElementById('newDashProjectName').focus();
+}
+
+async function resumePipeline() {
+  if (!selectedProject) return;
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('card2').classList.remove('hidden');
+  setStepBar(2);
+  try {
+    const r = await fetch('/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name: selectedProject, resume: true })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert(d.error); document.getElementById('startBtn').disabled = false; return; }
+    currentSid = d.sid;
+    showToast('이전 작업에서 이어서 진행합니다.');
+    connectStream(d.sid);
+  } catch(e) {
+    alert('오류: ' + e.message);
+    document.getElementById('startBtn').disabled = false;
+  }
+}
+
+function discardResume() {
+  document.getElementById('resumeBar').style.display = 'none';
+  projectResumeState = null;
+  showToast('처음부터 새로 시작합니다.');
+}
+
+async function deleteDashProject() {
+  if (!selectedProject) return;
+  if (!confirm(selectedProject + ' 프로젝트를 목록에서 숨길까요?')) return;
+  try {
+    const r = await fetch('/projects/' + encodeURIComponent(selectedProject), { method: 'DELETE' });
+    const d = await r.json();
+    if (!d.ok) { alert(d.error); return; }
+    selectedProject = null;
+    document.getElementById('projectName').value = '';
+    document.getElementById('resumeBar').style.display = 'none';
+    document.getElementById('btnDeleteProject').style.display = 'none';
+    await loadDashProjects();
+    showToast('프로젝트가 목록에서 제거되었습니다.');
+  } catch(e) {
+    alert('오류: ' + e.message);
+  }
+}
+
+async function createDashProject() {
+  const input = document.getElementById('newDashProjectName');
+  const name = input.value.trim();
+  if (!name) { input.focus(); return; }
+  try {
+    const r = await fetch('/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert(d.error); return; }
+    input.value = '';
+    document.getElementById('newProjectInline').style.display = 'none';
+    await loadDashProjects();
+    document.getElementById('projectDropdown').value = name;
+    onProjectDropdownChange();
+    showToast('프로젝트 생성: ' + name);
+  } catch(e) {
+    alert('오류: ' + e.message);
+  }
+}
+
+// 페이지 로드 시 프로젝트 목록 불러오기
+setTimeout(loadDashProjects, 100);
 
 // ── 모드 전환 ──────────────────────────────────────────────────────────────────
 function switchMode(mode) {
@@ -3441,11 +4019,20 @@ function addSource(type) {
   const id = ++sourceCounter;
   sources.push({ id, type, content: '' });
   renderSources();
-  setTimeout(() => {
-    if (type === 'pdf') document.getElementById('srcFile_' + id)?.click();
-    else if (type === 'url') document.getElementById('srcUrl_' + id)?.focus();
-    else document.getElementById('srcText_' + id)?.focus();
-  }, 80);
+  // PDF: setTimeout 내 click()은 user-gesture 컨텍스트가 사라져 무시될 수 있으므로
+  //      dropzone 영역을 표시만 하고, 사용자가 직접 클릭하게 함
+  if (type === 'url') {
+    setTimeout(() => document.getElementById('srcUrl_' + id)?.focus(), 50);
+  } else if (type === 'text') {
+    setTimeout(() => document.getElementById('srcText_' + id)?.focus(), 50);
+  }
+  // PDF는 dropzone이 보이면 클릭 유도 (scroll만)
+  if (type === 'pdf') {
+    setTimeout(() => {
+      const zone = document.getElementById('srcZone_' + id);
+      if (zone) zone.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 50);
+  }
 }
 
 function removeSource(id) {
@@ -3520,6 +4107,7 @@ function renderSources() {
 
 async function startPipeline() {
   const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
+  const focusArea = document.getElementById('focusArea').value.trim();
 
   if (sources.length === 0) { alert('소스를 하나 이상 추가해주세요.'); return; }
 
@@ -3541,7 +4129,7 @@ async function startPipeline() {
     const resp = await fetch('/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sources: payload, project_name: projectName })
+      body: JSON.stringify({ sources: payload, project_name: projectName, focus_area: focusArea || null })
     });
     const data = await resp.json();
     if (!data.ok) {
@@ -3601,9 +4189,9 @@ function handleEvent(evt) {
       ? '📋 영향도 검토 <span class="badge">Step 3 · Human Gate</span>'
       : '🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span>';
     document.getElementById('gateInfoBox').innerHTML = isModify
-      ? 'AI가 분석한 변경 영향도입니다. 삭제/수정/추가 항목을 확인하고 범위를 지정한 후 승인하세요.'
-      : 'AI가 생성한 분류표입니다. 내용을 확인하고 TC 생성 범위를 지정한 후 승인해주세요.';
-    document.getElementById('gateContent').value = evt.data.content;
+      ? 'AI가 분석한 변경 영향도입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.'
+      : 'AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.';
+    initGateChat(evt.data.content);
     renderDomainChecklist(evt.data.content);
     document.getElementById('card3').classList.remove('hidden');
     setStepBar(3);
@@ -3786,6 +4374,148 @@ async function exportGateExcel() {
   } catch(e) {
     showToast('❌ 오류: ' + e.message, 'error');
   }
+}
+
+// ── Human Gate 채팅 ──────────────────────────────────────────────────────────
+let gateChatHistory = [];  // [{role, content}, ...]
+
+function initGateChat(docContent) {
+  // 문서 저장
+  document.getElementById('gateContent').value = docContent;
+  // Viewer 렌더링
+  renderGateViewer(docContent);
+  // 채팅 초기화
+  gateChatHistory = [];
+  const msgs = document.getElementById('gateChatMessages');
+  msgs.innerHTML = '';
+  addGateChatMsg('assistant',
+    'AI가 문서를 준비했습니다. 수정이 필요한 부분을 채팅으로 알려주세요. ' +
+    '예) "AUTH 도메인의 비밀번호 변경 케이스 삭제해줘" / "PROD 도메인 이름을 상품관리로 바꿔줘"');
+  document.getElementById('gateChatInput').focus();
+}
+
+function mdToHtml(md) {
+  // 라인 단위 마크다운 → HTML (Python 문자열 호환 — 백슬래시 최소화)
+  const lines = md.split('\\n');
+  let out = [];
+  let inList = false;
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i]
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // 헤딩
+    if (line.startsWith('#### ')) {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<h4 style="font-size:13px;font-weight:600;margin:8px 0 3px;">' + line.slice(5) + '</h4>');
+    } else if (line.startsWith('### ')) {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<h3>' + line.slice(4) + '</h3>');
+    } else if (line.startsWith('## ')) {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<h2>' + line.slice(3) + '</h2>');
+    } else if (line.startsWith('# ')) {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<h2 style="font-size:16px;">' + line.slice(2) + '</h2>');
+    } else if (line.startsWith('> ')) {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<blockquote>' + line.slice(2) + '</blockquote>');
+    } else if (line.match(/^[-*] /) || line.match(/^\d+\. /)) {
+      if (!inList) { out.push('<ul>'); inList = true; }
+      const txt = line.replace(/^[-*] /, '').replace(/^\d+\. /, '');
+      out.push('<li>' + txt + '</li>');
+    } else if (line.trim() === '') {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<br>');
+    } else {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push('<p style="margin:3px 0;">' + line + '</p>');
+    }
+  }
+  if (inList) out.push('</ul>');
+  // 인라인: **bold**, `code`
+  let html = out.join('');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  return html;
+}
+
+function renderGateViewer(mdText) {
+  const viewer = document.getElementById('gateViewer');
+  viewer.innerHTML = mdToHtml(mdText);
+  viewer.classList.add('gate-doc-updated');
+  setTimeout(() => viewer.classList.remove('gate-doc-updated'), 700);
+  // 버전 배지 업데이트
+  const badge = document.getElementById('gateViewerBadge');
+  if (badge) {
+    badge.textContent = '최근 업데이트: ' + new Date().toLocaleTimeString();
+  }
+}
+
+function addGateChatMsg(role, text) {
+  const msgs = document.getElementById('gateChatMessages');
+  const div = document.createElement('div');
+  div.className = 'gate-msg ' + role;
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+async function sendGateChat() {
+  const input = document.getElementById('gateChatInput');
+  const sendBtn = document.getElementById('gateChatSend');
+  const msg = input.value.trim();
+  if (!msg || !currentSid) return;
+
+  input.value = '';
+  sendBtn.disabled = true;
+  addGateChatMsg('user', msg);
+
+  // 로딩 메시지
+  const loadingDiv = document.createElement('div');
+  loadingDiv.className = 'gate-msg assistant';
+  loadingDiv.textContent = '⏳ 분석 중...';
+  loadingDiv.id = 'gateLoadingMsg';
+  document.getElementById('gateChatMessages').appendChild(loadingDiv);
+  document.getElementById('gateChatMessages').scrollTop = 999999;
+
+  const currentDoc = document.getElementById('gateContent').value;
+
+  try {
+    const r = await fetch('/gate-chat/' + currentSid, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: msg,
+        current_doc: currentDoc,
+        gate_mode: window._gateMode || 'new',
+        history: gateChatHistory.slice(-6)  // 최근 6턴만 전송
+      })
+    });
+    const d = await r.json();
+
+    // 로딩 제거
+    document.getElementById('gateLoadingMsg')?.remove();
+
+    if (d.ok) {
+      addGateChatMsg('assistant', d.reply);
+      // 문서 업데이트
+      document.getElementById('gateContent').value = d.updated_doc;
+      renderGateViewer(d.updated_doc);
+      renderDomainChecklist(d.updated_doc);
+      // 히스토리 추가 (컨텍스트 유지용 — 축약 버전)
+      gateChatHistory.push({ role: 'user', content: '요청: ' + msg });
+      gateChatHistory.push({ role: 'assistant', content: d.reply });
+      // 변경 알림
+      addGateChatMsg('system', '✅ 문서가 업데이트되었습니다. 우측 Viewer에서 확인하세요.');
+    } else {
+      document.getElementById('gateLoadingMsg')?.remove();
+      addGateChatMsg('system', '❌ 오류: ' + d.error);
+    }
+  } catch(e) {
+    document.getElementById('gateLoadingMsg')?.remove();
+    addGateChatMsg('system', '❌ 네트워크 오류: ' + e.message);
+  }
+  sendBtn.disabled = false;
+  input.focus();
 }
 
 async function approveGate() {
