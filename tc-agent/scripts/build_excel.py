@@ -277,7 +277,7 @@ def build_cover(ws, tcs, config, date_str, version):
     ws.column_dimensions["C"].width = 52
 
     total = len(tcs)
-    star  = sum(1 for t in tcs if t["star"])
+    smoke_count = sum(1 for t in tcs if t.get("smoke"))
 
     # 메인 타이틀
     set_cell(ws, 2, 2, f"{config['name']}  |  테스트 케이스 명세서",
@@ -320,7 +320,7 @@ def build_cover(ws, tcs, config, date_str, version):
 
     stats = [
         ("총 TC 수",      f"{total}개"),
-        ("★ 최소 TC 세트", f"{star}개  ({star*100//total if total else 0}%)"),
+        ("🔥 Smoke Test", f"{smoke_count}개  ({smoke_count*100//total if total else 0}%)"),
         ("High 우선순위",  f"{high}개  ({high*100//total if total else 0}%)"),
         ("Positive",      f"{pos}개"),
         ("Negative",      f"{neg}개"),
@@ -386,15 +386,17 @@ def _tc_list_columns(config):
     # → build_tc_list 호출 시 tcs를 전달받아 판단
 
     fixed = [
+        ("Smoke Test",          8),
         ("TC ID",              14),
+        ("우선순위",             9),
+        ("분류",                10),
+        ("거래소",              10),
         ("대분류",              13),
         ("중분류",              13),
         ("소분류",              16),
-        ("사전조건",            28),
-        ("테스트 스텝",         40),
-        ("기대결과",            38),
-        ("중요도",               9),
-        ("관련 거래소",         10),
+        ("사전 조건",           28),
+        ("스텝",               40),
+        ("기대 결과",           38),
     ]
 
     all_cols = fixed
@@ -446,8 +448,62 @@ def _calc_col_widths(col_names, all_row_data, min_widths=None, max_width=60):
     return [min(w, max_width) for w in widths]
 
 
+def _mark_smoke(tcs):
+    """Smoke Test 대상 마킹 — 커버리지와 효율 균형을 맞춘 선별.
+
+    선별 기준 (목표: 전체의 20~30%):
+      1. 중분류별 대표 Positive 1개: High+Positive 우선, 없으면 Medium+Positive
+      2. 중분류별 대표 Negative 1개: High+Negative만 (서비스 차단급)
+      3. 대분류별 최소 1개 보장
+    """
+    from collections import defaultdict
+
+    # 중분류별 그룹핑 (domain + middle)
+    mid_groups = defaultdict(list)
+    for tc in tcs:
+        key = (tc["domain"], tc.get("middle", ""))
+        mid_groups[key].append(tc)
+
+    for key, group in mid_groups.items():
+        # 1. 대표 Positive 1개: High > Medium > Low 순
+        pos_picked = False
+        for pri_target in [("high", "높음"), ("medium", "보통"), ("low", "낮음")]:
+            if pos_picked:
+                break
+            for tc in group:
+                pri = tc.get("priority", "").lower()
+                cat = tc.get("category", "").lower()
+                if pri in pri_target and cat == "positive":
+                    tc["smoke"] = True
+                    pos_picked = True
+                    break
+
+        # 2. 대표 Negative 1개: High만
+        neg_picked = False
+        for tc in group:
+            if neg_picked:
+                break
+            pri = tc.get("priority", "").lower()
+            cat = tc.get("category", "").lower()
+            if pri in ("high", "높음") and cat == "negative":
+                tc["smoke"] = True
+                neg_picked = True
+
+    # 3. 대분류별 최소 1개 보장
+    domain_has = {}
+    for tc in tcs:
+        if tc.get("smoke"):
+            domain_has[tc["domain"]] = True
+    for tc in tcs:
+        d = tc["domain"]
+        if d not in domain_has:
+            tc["smoke"] = True
+            domain_has[d] = True
+
+
 def build_tc_list(ws, tcs, config, include_reason=False):
     """TC 목록 시트 생성"""
+    _mark_smoke(tcs)
     cols = _tc_list_columns(config)
     col_names = [c[0] for c in cols]
 
@@ -501,38 +557,47 @@ def build_tc_list(ws, tcs, config, include_reason=False):
                 break
 
         col_data = {
+            "Smoke Test":    "Y" if tc.get("smoke") else "",
             "TC ID":         tc["id"],
+            "우선순위":       _priority_to_kr(tc["priority"]),
+            "분류":          tc.get("category", ""),
+            "거래소":         exchange_text,
             "대분류":         major_display,
             "중분류":         middle_display,
             "소분류":         minor_display,
-            "사전조건":       tc["given"],
-            "테스트 스텝":    tc["when"],
-            "기대결과":       tc["then"],
-            "중요도":         _priority_to_kr(tc["priority"]),
-            "관련 거래소":    exchange_text,
+            "사전 조건":      tc["given"],
+            "스텝":          tc["when"],
+            "기대 결과":      tc["then"],
         }
 
         row_values = [col_data.get(name, "") for name in col_names]
         all_row_data.append(row_values)
 
         for i, (col_name, _) in enumerate(cols, 1):
-            if col_name == "TC ID":
+            if col_name == "Smoke Test":
+                cbg  = "E8F5E9" if tc.get("smoke") else bg_base
+                bold = bool(tc.get("smoke"))
+            elif col_name == "TC ID":
                 cbg  = bg_base
                 bold = tc["star"]
-            elif col_name == "중요도":
+            elif col_name == "우선순위":
                 cbg  = PRIORITY_COLOR.get(tc["priority"], bg_base)
                 bold = True
+            elif col_name == "분류":
+                cbg  = CATEGORY_COLOR.get(tc.get("category", ""), bg_base)
+                bold = tc["star"]
             else:
                 cbg  = bg_base
                 bold = tc["star"]
-            set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg)
+            align = "center" if col_name in ("Smoke Test", "우선순위", "분류", "거래소") else "left"
+            set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg, align_h=align)
 
         ws.row_dimensions[r].height = 80
         r += 1
         row_idx += 1
 
-    # 컬럼 너비 자동 조정 (첫 줄 길이 기반)
-    min_widths = {"TC ID": 18, "중요도": 9, "관련 거래소": 10}
+    # 컬럼 너비 자동 조정 (75퍼센타일 기준)
+    min_widths = {"Smoke Test": 8, "TC ID": 18, "우선순위": 9, "분류": 10, "거래소": 10}
     widths = _calc_col_widths(col_names, all_row_data, min_widths=min_widths, max_width=55)
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -547,7 +612,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
 
 def build_stats(ws, tcs, version):
     total  = len(tcs)
-    star   = sum(1 for t in tcs if t["star"])
+    smoke  = sum(1 for t in tcs if t.get("smoke"))
 
     ws.column_dimensions["A"].width = 3
     ws.column_dimensions["B"].width = 28
@@ -569,7 +634,7 @@ def build_stats(ws, tcs, version):
 
     # 타이틀
     set_cell(ws, 2, 2,
-             f"TC 통계  (v{version}  ·  전체 {total}개  ·  최소 세트 {star}개)",
+             f"TC 통계  (v{version}  ·  전체 {total}개  ·  Smoke {smoke}개)",
              bold=True, bg=C_DARK, font_color=C_WHITE, size=12)
     ws.merge_cells("B2:D2")
     ws.row_dimensions[2].height = 26
@@ -579,7 +644,7 @@ def build_stats(ws, tcs, version):
     # ─ 전체 요약
     sec_header(4, "─ 전체 요약 ─")
     stat_row(5,  "전체 TC 수",    total,  total, alt=True)
-    stat_row(6,  "★ 최소 TC 세트", star,  total, alt=False)
+    stat_row(6,  "🔥 Smoke Test", smoke,  total, alt=False)
 
     # ─ 도메인별
     ws.row_dimensions[7].height = 8
@@ -654,11 +719,11 @@ def build_stats(ws, tcs, version):
         row += 1
 
 
-# ── 최소 TC 세트 시트 ──────────────────────────────────────────────
+# ── Smoke Test 시트 ─────────────────────────────────────────────────
 
-def build_minimal(ws, tcs, config):
-    star_tcs = [t for t in tcs if t["star"]]
-    build_tc_list(ws, star_tcs, config, include_reason=True)
+def build_smoke(ws, tcs, config):
+    smoke_tcs = [t for t in tcs if t.get("smoke")]
+    build_tc_list(ws, smoke_tcs, config)
 
 
 # ── 메인 ───────────────────────────────────────────────────────────
@@ -690,19 +755,19 @@ def main():
     ws_cover = wb.active;                ws_cover.title = "📋 표지"
     ws_list  = wb.create_sheet("🧪 TC 전체목록")
     ws_stats = wb.create_sheet("📊 TC 통계")
-    ws_min   = wb.create_sheet("🎯 최소 TC 세트")
+    ws_smoke = wb.create_sheet("🔥 Smoke Test")
 
     build_cover(ws_cover, tcs, config, date_str, version)
     build_tc_list(ws_list, tcs, config)
     build_stats(ws_stats, tcs, version)
-    build_minimal(ws_min, tcs, config)
+    build_smoke(ws_smoke, tcs, config)
 
     wb.save(out_path)
 
-    star  = sum(1 for t in tcs if t["star"])
-    high  = sum(1 for t in tcs if t["priority"] == "High")
+    smoke_n = sum(1 for t in tcs if t.get("smoke"))
+    high    = sum(1 for t in tcs if t["priority"] == "High")
     print(f"\n✅ Excel 저장 완료: {out_path}")
-    print(f"   총 TC: {len(tcs)}개 | High: {high}개 | ★ 최소 TC 세트: {star}개")
+    print(f"   총 TC: {len(tcs)}개 | High: {high}개 | 🔥 Smoke Test: {smoke_n}개")
     print(f"   Phase: {config['code']} | 버전: v{version}")
     print(f"   거래소 컬럼: {config['exchanges'] if config['exchanges'] else '없음 (단일 거래소)'}")
 

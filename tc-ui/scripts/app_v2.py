@@ -1196,8 +1196,8 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
     ws = wb.create_sheet("TC 전체목록")
     ws.freeze_panes = "A3"
 
-    HEADERS = ["TC ID", "대분류", "중분류", "소분류", "사전조건", "테스트 스텝", "기대결과", "중요도", "관련 거래소"]
-    COL_W   = [18,       14,     14,     16,      50,       50,        50,       10,     12]
+    HEADERS = ["Smoke Test", "TC ID", "우선순위", "분류", "거래소", "대분류", "중분류", "소분류", "사전 조건", "스텝", "기대 결과"]
+    COL_W   = [8,           18,     10,       10,     10,      14,     14,     16,      50,       50,     50]
 
     def _priority_kr(p):
         return {"High": "높음", "Medium": "보통", "Low": "낮음"}.get(p, p or "보통")
@@ -1211,6 +1211,30 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
     # TC 파싱 및 행 삽입
     tcs = parse_tc_markdown(tc_content)
 
+    # Smoke 마킹: 중분류별 대표 Positive 1개 + High Negative 1개 + 대분류별 최소 1개
+    from collections import defaultdict
+    mid_groups = defaultdict(list)
+    for tc in tcs:
+        mid_groups[(tc.get("major",""), tc.get("middle",""))].append(tc)
+    for key, group in mid_groups.items():
+        pos_done = False
+        for pri_t in [("high","높음"),("medium","보통"),("low","낮음")]:
+            if pos_done: break
+            for tc in group:
+                if tc.get("priority","").lower() in pri_t and tc.get("type","").lower() == "positive":
+                    tc["_smoke"] = True; pos_done = True; break
+        neg_done = False
+        for tc in group:
+            if neg_done: break
+            if tc.get("priority","").lower() in ("high","높음") and tc.get("type","").lower() == "negative":
+                tc["_smoke"] = True; neg_done = True
+    domain_has = {}
+    for tc in tcs:
+        if tc.get("_smoke"): domain_has[tc.get("major","")] = True
+    for tc in tcs:
+        d = tc.get("major","")
+        if d not in domain_has: tc["_smoke"] = True; domain_has[d] = True
+
     FILL_MIN  = PatternFill("solid", fgColor="FFF9C4")
     FILL_NORM = PatternFill("solid", fgColor="FFFFFF")
 
@@ -1218,24 +1242,26 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
         is_min = tc.get("is_min", False)
         row_fill = FILL_MIN if is_min else FILL_NORM
         row_data = [
+            "Y" if tc.get("_smoke") else "",
             tc.get("id", ""),
+            _priority_kr(tc.get("priority", "")),
+            tc.get("type", ""),
+            "",  # 거래소
             tc.get("major", ""),
             tc.get("middle", ""),
             tc.get("minor", ""),
             tc.get("precondition", ""),
             tc.get("steps", ""),
             tc.get("expected", ""),
-            _priority_kr(tc.get("priority", "")),
-            "",  # 관련 거래소 (마크다운에서 추출 시 채워짐)
         ]
         for ci, val in enumerate(row_data, 1):
             c = ws.cell(ri, ci, val)
             c.fill = row_fill
-            c.alignment = left_align()
+            c.alignment = left_align() if ci >= 9 else center()
             c.border = bdr()
             c.font = Font(name="Calibri", size=9,
-                          bold=(ci == 1 and is_min), color="1E2761" if is_min else "222222")
-        ws.row_dimensions[ri].height = max(30, min(120, len(str(row_data[4])) // 3 + 20))
+                          bold=(ci == 2 and is_min), color="1E2761" if is_min else "222222")
+        ws.row_dimensions[ri].height = max(30, min(120, len(str(row_data[8])) // 3 + 20))
 
     # 통계 시트
     stat = wb.create_sheet("통계")
