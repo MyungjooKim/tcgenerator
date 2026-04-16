@@ -407,17 +407,51 @@ def _priority_to_kr(priority):
                "높음": "높음", "보통": "보통", "낮음": "낮음"}
     return mapping.get(priority, priority or "보통")
 
+def _calc_col_widths(col_names, all_row_data, min_widths=None, max_width=60):
+    """각 컬럼의 75 퍼센타일 기반 최적 너비 계산.
+    멀티라인 셀은 모든 줄 중 가장 긴 줄 기준."""
+    col_lengths = [[] for _ in col_names]
+
+    # 헤더 길이
+    header_widths = []
+    for i, name in enumerate(col_names):
+        hw = sum(2 if ord(c) > 127 else 1 for c in name) + 2
+        header_widths.append(hw)
+
+    # 각 셀의 가장 긴 줄 길이 수집
+    for row_data in all_row_data:
+        for i, val in enumerate(row_data):
+            if not val:
+                col_lengths[i].append(0)
+                continue
+            lines = str(val).split('\n')
+            max_line_w = max(
+                sum(2 if ord(c) > 127 else 1 for c in line) + 2
+                for line in lines if line.strip()
+            ) if lines else 0
+            col_lengths[i].append(max_line_w)
+
+    # 75 퍼센타일 계산
+    widths = []
+    for i, lengths in enumerate(col_lengths):
+        min_w = (min_widths or {}).get(col_names[i], 8)
+        if not lengths:
+            widths.append(max(header_widths[i], min_w))
+            continue
+        sorted_l = sorted(lengths)
+        p75_idx = int(len(sorted_l) * 0.75)
+        p75 = sorted_l[min(p75_idx, len(sorted_l) - 1)]
+        widths.append(max(p75, header_widths[i], min_w))
+
+    return [min(w, max_width) for w in widths]
+
+
 def build_tc_list(ws, tcs, config, include_reason=False):
     """TC 목록 시트 생성"""
     cols = _tc_list_columns(config)
-
-    # 컬럼 너비
-    for i, (name, w) in enumerate(cols, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
     col_names = [c[0] for c in cols]
 
-    # Row 1: 헤더
+    # Row 1: 헤더 (너비는 데이터 수집 후 설정)
     for i, name in enumerate(col_names, 1):
         set_cell(ws, 1, i, name, bold=True, bg=C_DARK, font_color=C_WHITE,
                  size=10, align_h="center")
@@ -429,6 +463,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
     prev_domain = None
     r = data_start
     row_idx = 0
+    all_row_data = []  # 너비 계산용
 
     for tc in tcs:
         domain = tc["domain"]
@@ -477,6 +512,9 @@ def build_tc_list(ws, tcs, config, include_reason=False):
             "관련 거래소":    exchange_text,
         }
 
+        row_values = [col_data.get(name, "") for name in col_names]
+        all_row_data.append(row_values)
+
         for i, (col_name, _) in enumerate(cols, 1):
             if col_name == "TC ID":
                 cbg  = bg_base
@@ -492,6 +530,12 @@ def build_tc_list(ws, tcs, config, include_reason=False):
         ws.row_dimensions[r].height = 80
         r += 1
         row_idx += 1
+
+    # 컬럼 너비 자동 조정 (첫 줄 길이 기반)
+    min_widths = {"TC ID": 18, "중요도": 9, "관련 거래소": 10}
+    widths = _calc_col_widths(col_names, all_row_data, min_widths=min_widths, max_width=55)
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
     # 필터 & 틀 고정
     last_col = get_column_letter(len(col_names))
