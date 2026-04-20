@@ -145,9 +145,13 @@ def parse_tc_markdown(filepath):
         if not block.strip().startswith('###'):
             continue
 
-        tc = {}
+        first_line = block.split('\n')[0].strip()
 
-        first_line = block.split('\n')[0]
+        # 카테고리 구분 헤더 스킵 (### 카테고리 1: ..., ### 카테고리 2: ... 등)
+        if re.match(r'###\s*카테고리\s*\d', first_line):
+            continue
+
+        tc = {}
 
         # 최소 TC: ### **SC-XXX-YYY-001** — 제목
         bold_header = re.match(r'###\s+\*\*(.+?)\*\*\s*—\s*(.+?)\s*$', first_line)
@@ -386,10 +390,9 @@ def _tc_list_columns(config):
     # → build_tc_list 호출 시 tcs를 전달받아 판단
 
     fixed = [
-        ("Smoke Test",          8),
+        ("Smoke",          8),
         ("TC ID",              14),
         ("우선순위",             9),
-        ("분류",                10),
         ("거래소",              10),
         ("대분류",              13),
         ("중분류",              13),
@@ -521,11 +524,15 @@ def build_tc_list(ws, tcs, config, include_reason=False):
     row_idx = 0
     all_row_data = []  # 너비 계산용
 
+    # 도메인이 2개 이상일 때만 그룹 헤더 표시
+    unique_domains = set(tc["domain"] for tc in tcs)
+    show_domain_headers = len(unique_domains) > 1
+
     for tc in tcs:
         domain = tc["domain"]
 
-        # 도메인 변경 시 그룹 헤더 행 삽입
-        if domain != prev_domain:
+        # 도메인 변경 시 그룹 헤더 행 삽입 (도메인 2개 이상일 때만)
+        if show_domain_headers and domain != prev_domain:
             prev_domain = domain
             color  = DOMAIN_COLORS.get(domain, "636363")
             label  = DOMAIN_LABELS.get(domain, domain)
@@ -557,10 +564,9 @@ def build_tc_list(ws, tcs, config, include_reason=False):
                 break
 
         col_data = {
-            "Smoke Test":    "Y" if tc.get("smoke") else "",
+            "Smoke":    "Y" if tc.get("smoke") else "",
             "TC ID":         tc["id"],
             "우선순위":       _priority_to_kr(tc["priority"]),
-            "분류":          tc.get("category", ""),
             "거래소":         exchange_text,
             "대분류":         major_display,
             "중분류":         middle_display,
@@ -574,7 +580,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
         all_row_data.append(row_values)
 
         for i, (col_name, _) in enumerate(cols, 1):
-            if col_name == "Smoke Test":
+            if col_name == "Smoke":
                 cbg  = "E8F5E9" if tc.get("smoke") else bg_base
                 bold = bool(tc.get("smoke"))
             elif col_name == "TC ID":
@@ -583,13 +589,10 @@ def build_tc_list(ws, tcs, config, include_reason=False):
             elif col_name == "우선순위":
                 cbg  = PRIORITY_COLOR.get(tc["priority"], bg_base)
                 bold = True
-            elif col_name == "분류":
-                cbg  = CATEGORY_COLOR.get(tc.get("category", ""), bg_base)
-                bold = tc["star"]
             else:
                 cbg  = bg_base
                 bold = tc["star"]
-            align = "center" if col_name in ("Smoke Test", "우선순위", "분류", "거래소") else "left"
+            align = "center" if col_name in ("Smoke", "우선순위", "거래소") else "left"
             set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg, align_h=align)
 
         ws.row_dimensions[r].height = 80
@@ -597,7 +600,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
         row_idx += 1
 
     # 컬럼 너비 자동 조정 (75퍼센타일 기준)
-    min_widths = {"Smoke Test": 8, "TC ID": 18, "우선순위": 9, "분류": 10, "거래소": 10}
+    min_widths = {"Smoke": 8, "TC ID": 18, "우선순위": 9, "거래소": 10}
     widths = _calc_col_widths(col_names, all_row_data, min_widths=min_widths, max_width=55)
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
