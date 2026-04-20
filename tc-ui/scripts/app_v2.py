@@ -3359,7 +3359,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge">v0.9.4</span>
+    <span class="version-badge">v0.9.5</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
