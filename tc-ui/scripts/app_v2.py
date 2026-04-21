@@ -853,6 +853,9 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 - 중분류는 주요 기능 단위
 - 소분류는 세부 케이스 단위
 - 코드는 의미를 반영하는 영문 대문자
+- ⛔ TC ID를 생성하지 마세요. TC ID는 이후 단계에서 검토자가 결정합니다.
+- ⛔ TC ID 생성 규칙, TC ID 예시표, 기능-TC 매핑표를 포함하지 마세요.
+- 분류표에는 대분류/중분류/소분류 구조만 출력하세요.
 """
     focus_instruction = ""
     if focus_area:
@@ -929,6 +932,14 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
 
     if not domains:
         raise RuntimeError("선택된 도메인이 없습니다. 범위를 다시 확인하세요.")
+
+    # SuiteCode 매핑 (Human Gate에서 검토자가 입력한 코드)
+    suite_codes = sess.get("suite_codes", [])
+    for i, domain in enumerate(domains):
+        if i < len(suite_codes) and suite_codes[i]:
+            domain["suite_code"] = suite_codes[i]
+    if suite_codes:
+        push_log(sess, f"[TC 작성] SuiteCode 매핑: {', '.join(d.get('suite_code', '?') for d in domains)}")
 
     push_log(sess, f"[TC 작성] 생성 대상 도메인 {len(domains)}개: {', '.join(d['code'] for d in domains)}")
 
@@ -1151,9 +1162,15 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
     domain_section = extract_domain_section(classification, domain["code"])
     project_code = _detect_project_code(project_name)
 
+    suite_code = domain.get("suite_code", "")
+    if suite_code:
+        tc_id_instruction = f"⚠️ TC ID: `{project_code}-{suite_code}-NNN` (예: {project_code}-{suite_code}-001, {project_code}-{suite_code}-002). 이 SuiteCode를 반드시 사용하세요."
+    else:
+        tc_id_instruction = f"⚠️ TC ID의 ProjectCode: `{project_code}` (예: {project_code}-XXXX-001). `TC-`로 시작하면 안 됩니다."
+
     return f"""프로젝트: {project_name}
 도메인: {domain['name']} ({domain['code']})
-⚠️ TC ID의 ProjectCode: `{project_code}` (예: {project_code}-XXXX-001). `TC-`로 시작하면 안 됩니다.
+{tc_id_instruction}
 
 ## 이 도메인의 분류 구조
 {domain_section}
@@ -2405,6 +2422,9 @@ def approve(sid):
     # 선택된 도메인 코드 저장 (None이면 전체 생성)
     selected = data.get("selected_domains")  # list of codes or null
     sess["selected_domains"] = selected if selected else None
+    # SuiteCode 저장 (검토자가 Human Gate에서 입력)
+    suite_codes = data.get("suite_codes")  # list of codes
+    sess["suite_codes"] = suite_codes if suite_codes else []
     sess["approved"] = content
     sess["gate_event"].set()
     return jsonify({"ok": True})
@@ -3814,26 +3834,64 @@ async function loadDashProjects() {
 
 async function onProjectDropdownChange() {
   const name = document.getElementById('projectDropdown').value;
+  projectResumeState = null;
+
+  // ── UI 전체 초기화 ──
+  // SSE 연결 종료
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  currentSid = null;
+  currentFilename = null;
+  stopCountdown();
+  // 카드 숨김 (card2~card5)
+  ['card2','card3','card4','card5'].forEach(function(id) {
+    var card = document.getElementById(id);
+    if (card) card.classList.add('hidden');
+  });
+  // 중단/오류 배너 제거
+  document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
+  // 버튼 상태 복원
+  document.getElementById('startBtn').disabled = false;
+  var startModifyBtn = document.getElementById('startModifyBtn');
+  if (startModifyBtn) startModifyBtn.disabled = false;
+  setStepBar(1);
+  // 상단 card2 내부 요소 복원 (TC 단계에서 숨겼던 것들)
+  var logBox = document.getElementById('logBox');
+  if (logBox) { logBox.style.display = ''; logBox.innerHTML = ''; }
+  var stopBtn2 = document.getElementById('stopBtn2');
+  if (stopBtn2) stopBtn2.style.display = '';
+  var progressWrap = document.getElementById('progressBar');
+  if (progressWrap && progressWrap.parentElement) progressWrap.parentElement.style.display = '';
+  var substeps = document.querySelector('#card2 .substeps');
+  if (substeps) substeps.style.display = '';
+  document.getElementById('stageLabel').textContent = '시작 중...';
+  // 소스/포커스 초기화
+  sources = [];
+  sourceCounter = 0;
+  renderSources();
+  document.getElementById('focusArea').value = '';
+  // 이어서 작업 바 / 삭제 버튼
   document.getElementById('resumeBar').style.display = 'none';
   document.getElementById('btnDeleteProject').style.display = name ? 'inline-block' : 'none';
-  projectResumeState = null;
-  if (!name) { selectedProject = null; return; }
+
+  if (!name) { selectedProject = null; document.getElementById('projectName').value = ''; return; }
   selectedProject = name;
   document.getElementById('projectName').value = name;
   // 수정 모드 드롭다운도 연동
-  const sel = document.getElementById('projectSelect');
+  var sel = document.getElementById('projectSelect');
   if (sel) {
-    for (let i = 0; i < sel.options.length; i++) {
+    for (var i = 0; i < sel.options.length; i++) {
       if (sel.options[i].value === name) { sel.selectedIndex = i; break; }
     }
   }
+
+  // ── 해당 프로젝트 데이터 로드 ──
   // 이전 작업 상태 확인
   try {
-    const r = await fetch('/projects/' + encodeURIComponent(name) + '/state');
-    const d = await r.json();
+    var r = await fetch('/projects/' + encodeURIComponent(name) + '/state');
+    var d = await r.json();
     if (d.ok && d.has_state) {
       projectResumeState = d;
-      const stageNames = {parsed:'문서 파싱', policy:'정책 분석', features:'기능 목록', classifying:'분류표 생성', gate_waiting:'분류표 검토 대기', tc_writing:'TC 작성'};
+      var stageNames = {parsed:'문서 파싱', policy:'정책 분석', features:'기능 목록', classifying:'분류표 생성', gate_waiting:'분류표 검토 대기', tc_writing:'TC 작성'};
       document.getElementById('resumeStage').textContent = stageNames[d.stage] || d.stage;
       document.getElementById('resumeSavedAt').textContent = d.saved_at || '';
       document.getElementById('resumeBar').style.display = 'flex';
@@ -3842,13 +3900,13 @@ async function onProjectDropdownChange() {
   } catch(e) {}
   // 이전 소스 복원
   try {
-    const r2 = await fetch('/projects/' + encodeURIComponent(name) + '/sources');
-    const d2 = await r2.json();
+    var r2 = await fetch('/projects/' + encodeURIComponent(name) + '/sources');
+    var d2 = await r2.json();
     if (d2.ok && d2.has_sources && d2.sources.length > 0) {
       sources = [];
       sourceCounter = 0;
-      d2.sources.forEach(s => {
-        const id = ++sourceCounter;
+      d2.sources.forEach(function(s) {
+        var id = ++sourceCounter;
         sources.push({ id: id, type: s.type, content: s.content || '', selected_files: s.selected_files || null });
       });
       renderSources();
@@ -3902,6 +3960,7 @@ async function resumePipeline() {
   document.getElementById('startBtn').disabled = true;
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
+  document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
   try {
     const r = await fetch('/start', {
       method: 'POST',
@@ -4465,6 +4524,7 @@ async function startPipeline() {
   document.getElementById('startBtn').disabled = true;
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
+  document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   try {
     const resp = await fetch('/start', {
@@ -4863,33 +4923,49 @@ function extractCategorySummary(mdText) {
   return suites;
 }
 
+function updateTcIdPreview(input) {
+  var code = input.value.trim().toUpperCase();
+  var pcode = input.dataset.pcode || 'SC';
+  var idx = input.dataset.domain;
+  var preview = document.getElementById('tcIdPreview_' + idx);
+  if (preview) {
+    preview.textContent = code ? pcode + '-' + code + '-001' : '-';
+  }
+}
+
 function renderGateViewer(mdText) {
   var viewer = document.getElementById('gateViewer');
   // 분류 요약 카드
   var cats = extractCategorySummary(mdText);
   var summaryHtml = '';
   if (cats.length > 0) {
+    var _pcode = (document.getElementById('projectName').value || '').toLowerCase().indexOf('mobile') >= 0 ? 'SM' : 'SC';
     summaryHtml = '<div style="background:#F0F9FF;border:1.5px solid #93C5FD;border-radius:10px;padding:14px 16px;margin-bottom:16px;">';
-    summaryHtml += '<div style="font-size:14px;font-weight:700;color:#1E3A5F;margin-bottom:10px;">TC 분류 요약 — 검토 후 승인해주세요</div>';
+    summaryHtml += '<div style="font-size:14px;font-weight:700;color:#1E3A5F;margin-bottom:4px;">TC 분류 요약</div>';
+    summaryHtml += '<div style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code>, <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-002</code> ...</div>';
     summaryHtml += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-    summaryHtml += '<tr style="background:#DBEAFE;"><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">Spreadsheet 시트명</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">소분류</th></tr>';
+    summaryHtml += '<tr style="background:#DBEAFE;"><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">시트명</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">SuiteCode</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">TC ID 미리보기</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">소분류</th></tr>';
     for (var ci = 0; ci < cats.length; ci++) {
       var c = cats[ci];
       var majorClean = c.major.replace(/대분류[:\s]*/g, '').replace(/\(.*?\)/g, '').trim();
       var firstMid = c.middles.length > 0 ? c.middles[0].replace(/중분류[:\s]*/g, '').replace(/\(.*?\)/g, '').trim() : '';
       var sheetName = firstMid ? majorClean + '-' + firstMid : majorClean;
+      var autoCode = majorClean.replace(/[^A-Za-z]/g, '').toUpperCase().substring(0, 4);
+      if (firstMid) autoCode += '-' + firstMid.replace(/[^A-Za-z]/g, '').toUpperCase().substring(0, 4);
       var midText = c.middles.length > 0 ? c.middles.join(', ') : '-';
       var minText = c.minors.length > 0 ? c.minors.join(', ') : '-';
       var bg = ci % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
+      var previewId = _pcode + '-' + autoCode + '-001';
       summaryHtml += '<tr style="background:' + bg + ';">';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:600;">' + sheetName + '</td>';
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;"><input type="text" class="suite-code-input" data-domain="' + ci + '" data-pcode="' + _pcode + '" value="' + autoCode + '" placeholder="예: GNBF" oninput="updateTcIdPreview(this)" style="width:80px;padding:4px 6px;border:1.5px solid #93C5FD;border-radius:4px;font-size:12px;font-weight:700;text-transform:uppercase;font-family:monospace;"></td>';
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-family:monospace;font-size:11px;color:#1D4ED8;" id="tcIdPreview_' + ci + '">' + previewId + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + majorClean + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + midText + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#666;">' + minText + '</td>';
       summaryHtml += '</tr>';
     }
     summaryHtml += '</table>';
-    summaryHtml += '<div style="margin-top:8px;font-size:11px;color:#6B7280;">위 분류가 올바른지 확인하세요. 수정이 필요하면 채팅으로 요청하세요.</div>';
     summaryHtml += '</div>';
   }
   viewer.innerHTML = summaryHtml + mdToHtml(mdText);
@@ -4982,6 +5058,7 @@ async function regenerateClassification() {
     document.getElementById('card3').classList.add('hidden');
     document.getElementById('card2').classList.remove('hidden');
     setStepBar(2);
+    document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
     document.getElementById('stageLabel').textContent = '분류표 재생성 중...';
     const r = await fetch('/regenerate-classification', {
       method: 'POST',
@@ -5003,6 +5080,24 @@ async function approveGate() {
   const content = document.getElementById('gateContent').value.trim();
   if (!content) { alert('내용이 비어있습니다.'); return; }
 
+  // SuiteCode 수집
+  var suiteCodeInputs = document.querySelectorAll('.suite-code-input');
+  var suiteCodes = {};
+  var hasEmpty = false;
+  suiteCodeInputs.forEach(function(input) {
+    var code = input.value.trim().toUpperCase();
+    if (!code) hasEmpty = true;
+    suiteCodes[input.dataset.domain] = code;
+  });
+  if (suiteCodeInputs.length > 0 && hasEmpty) {
+    alert('모든 도메인의 SuiteCode를 입력해주세요.'); return;
+  }
+  // SuiteCode 목록 (순서대로)
+  var suiteCodeList = [];
+  for (var i = 0; i < suiteCodeInputs.length; i++) {
+    suiteCodeList.push(suiteCodeInputs[i].value.trim().toUpperCase());
+  }
+
   // 선택된 도메인 수집
   const selectedDomains = getSelectedDomains();
   const allCount = document.querySelectorAll('#domainChecklist input[type=checkbox]').length;
@@ -5016,9 +5111,10 @@ async function approveGate() {
   approveBtn.disabled = true;
   approveBtn.textContent = '⏳ 처리 중...';
 
+  var codeMsg = suiteCodeList.length > 0 ? ' (SuiteCode: ' + suiteCodeList.join(', ') + ')' : '';
   const scopeMsg = selectedDomains
-    ? selCount + '개 도메인 범위로 TC를 생성합니다. 계속할까요?'
-    : '전체 도메인(' + allCount + '개)으로 TC를 생성합니다. 계속할까요?';
+    ? selCount + '개 도메인 범위로 TC를 생성합니다.' + codeMsg + ' 계속할까요?'
+    : '전체 도메인(' + allCount + '개)으로 TC를 생성합니다.' + codeMsg + ' 계속할까요?';
   if (!confirm(scopeMsg)) {
     approveBtn.disabled = false;
     approveBtn.textContent = '✅ 승인 및 TC 생성 시작';
@@ -5029,7 +5125,7 @@ async function approveGate() {
     const resp = await fetch('/approve/' + currentSid, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, selected_domains: selectedDomains })
+      body: JSON.stringify({ content, selected_domains: selectedDomains, suite_codes: suiteCodeList })
     });
     const data = await resp.json();
     if (data.ok) {
@@ -5142,6 +5238,7 @@ async function restartModify(mode) {
   const changeDesc  = document.getElementById('changeDesc')?.value?.trim() || '';
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
+  document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
   try {
     const r = await fetch('/restart-modify', {
       method: 'POST',
