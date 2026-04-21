@@ -838,21 +838,18 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 
 # TC 분류표 — {프로젝트명}
 
-## 대분류: {대분류명} ({대분류코드})
-- 대분류코드: 영문 대문자 4~6자 (예: AUTH, TRAD, FUND)
+## 대분류: {대분류명}
 
-### 중분류: {중분류명} ({중분류코드})
-- 중분류코드: 영문 대문자 4~6자 (예: LOGN, ORDR, BLNC)
+### 중분류: {중분류명}
 
 #### 소분류
-- {소분류명}: {설명}
 - {소분류명}: {설명}
 
 규칙:
 - 대분류는 도메인 단위
 - 중분류는 주요 기능 단위
 - 소분류는 세부 케이스 단위
-- 코드는 의미를 반영하는 영문 대문자
+- ⛔ 대분류/중분류/소분류 이름에 괄호 코드를 붙이지 마세요. 예: "FOOTER (FOOT)" ❌ → "Footer" ✅
 - ⛔ TC ID를 생성하지 마세요. TC ID는 이후 단계에서 검토자가 결정합니다.
 - ⛔ TC ID 생성 규칙, TC ID 예시표, 기능-TC 매핑표를 포함하지 마세요.
 - 분류표에는 대분류/중분류/소분류 구조만 출력하세요.
@@ -946,57 +943,89 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
     all_tc_parts = []
     total_tc = 0
 
+    # 중분류 목록 추출 (분류표에서)
+    def extract_middles_from_classification(classification_text: str, domain_code: str) -> list[str]:
+        domain_section = extract_domain_section(classification_text, domain_code)
+        middles = []
+        for line in domain_section.splitlines():
+            line = line.strip()
+            if line.startswith("### "):
+                mid_name = re.sub(r"^###\s+", "", line).strip()
+                mid_name = re.sub(r"^중분류[:\s]*", "", mid_name).strip()
+                mid_name = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", mid_name).strip()
+                if mid_name:
+                    middles.append(mid_name)
+        return middles
+
     for i, domain in enumerate(domains):
         domain_code = domain["code"]
         domain_name = domain["name"]
-        push_log(sess, f"[TC 작성] [{i+1}/{len(domains)}] {domain_code} — {domain_name} 작성 중...")
-        push(sess, "stage", {
-            "stage": 4,
-            "label": f"TC 작성: {domain_code} ({i+1}/{len(domains)})",
-            "pct":   55 + int(25 * (i / max(len(domains), 1)))
-        })
 
-        system = build_tc_system_prompt(tc_rules, approved_classification, project_policies, fewshot)
-        user = build_tc_user_prompt(domain, features_text, policy_text, project_name, approved_classification)
+        # 중분류별 분할 호출
+        middles = extract_middles_from_classification(approved_classification, domain_code)
+        if not middles:
+            middles = ["전체"]  # 중분류 추출 실패 시 전체로 1회 호출
 
-        try:
-            tc_draft = call_claude(system, user, max_tokens=8192)
-        except Exception as e:
-            push_log(sess, f"[TC 작성] {domain_code} 오류: {e}, 재시도...")
-            time.sleep(2)
+        push_log(sess, f"[TC 작성] [{i+1}/{len(domains)}] {domain_code} — {domain_name} ({len(middles)}개 중분류)")
+
+        domain_tc_parts = []
+        for mi, middle in enumerate(middles):
+            label = f"{domain_code}/{middle}" if middle != "전체" else domain_code
+            push_log(sess, f"[TC 작성] [{i+1}/{len(domains)}] {label} 작성 중...")
+            push(sess, "stage", {
+                "stage": 4,
+                "label": f"TC 작성: {label} ({mi+1}/{len(middles)})",
+                "pct": 55 + int(25 * ((i * len(middles) + mi) / max(len(domains) * len(middles), 1)))
+            })
+
+            system = build_tc_system_prompt(tc_rules, approved_classification, project_policies, fewshot)
+
+            # 중분류 단위 프롬프트 — 해당 중분류에 집중
+            if middle != "전체":
+                domain_with_middle = dict(domain)
+                domain_with_middle["_focus_middle"] = middle
+                user = build_tc_user_prompt(domain_with_middle, features_text, policy_text, project_name, approved_classification)
+            else:
+                user = build_tc_user_prompt(domain, features_text, policy_text, project_name, approved_classification)
+
             try:
-                tc_draft = call_claude(system, user, max_tokens=8192)
-            except Exception as e2:
-                push_log(sess, f"[TC 작성] {domain_code} 실패 (건너뜀): {e2}")
-                continue
-
-        # 잘림 감지: 마지막 TC에 **테스트 단계** 또는 **예상 결과**가 없으면 이어서 생성
-        last_tc_match = list(re.finditer(r"^###\s", tc_draft, re.MULTILINE))
-        if last_tc_match:
-            last_tc_block = tc_draft[last_tc_match[-1].start():]
-            has_steps = "**테스트 단계**" in last_tc_block
-            has_expected = "**예상 결과**" in last_tc_block
-            if not has_steps or not has_expected:
-                push_log(sess, f"[TC 작성] {domain_code} 마지막 TC 불완전 — 이어서 생성 중...")
-                continue_prompt = f"이전 응답이 중간에 잘렸습니다. 아래 TC를 이어서 완성해주세요. **테스트 단계**와 **예상 결과**를 반드시 포함하세요.\\n\\n---\\n{last_tc_block}"
+                tc_draft = call_claude(system, user, max_tokens=16000)
+            except Exception as e:
+                push_log(sess, f"[TC 작성] {label} 오류: {e}, 재시도...")
+                time.sleep(2)
                 try:
-                    continuation = call_claude(system, continue_prompt, max_tokens=4096)
-                    # 잘린 마지막 TC를 교체
-                    tc_draft = tc_draft[:last_tc_match[-1].start()] + continuation
-                    push_log(sess, f"[TC 작성] {domain_code} 보완 완료")
-                except Exception:
-                    push_log(sess, f"[TC 작성] {domain_code} 보완 실패 — 불완전한 TC 포함")
+                    tc_draft = call_claude(system, user, max_tokens=16000)
+                except Exception as e2:
+                    push_log(sess, f"[TC 작성] {label} 실패 (건너뜀): {e2}")
+                    continue
 
-        # 도메인별 파일 저장
+            # 잘림 감지
+            last_tc_match = list(re.finditer(r"^###\s", tc_draft, re.MULTILINE))
+            if last_tc_match:
+                last_tc_block = tc_draft[last_tc_match[-1].start():]
+                if "**테스트 단계**" not in last_tc_block or "**예상 결과**" not in last_tc_block:
+                    push_log(sess, f"[TC 작성] {label} 마지막 TC 불완전 — 이어서 생성 중...")
+                    try:
+                        continuation = call_claude(system, f"이전 응답이 잘렸습니다. 아래 TC를 완성하세요.\\n\\n---\\n{last_tc_block}", max_tokens=4096)
+                        tc_draft = tc_draft[:last_tc_match[-1].start()] + continuation
+                    except Exception:
+                        pass
+
+            tc_count = len(re.findall(r"^###\s", tc_draft, re.MULTILINE))
+            # 카테고리 헤더 제외
+            tc_count -= len(re.findall(r"^###\s*카테고리\s*\d", tc_draft, re.MULTILINE))
+            push_log(sess, f"[TC 작성] {label} 완료 — TC {tc_count}개")
+            domain_tc_parts.append(tc_draft)
+            total_tc += tc_count
+            check_stop(sess)
+
+        # 도메인별 병합 저장
+        merged = "\n\n---\n\n".join(domain_tc_parts)
         draft_path = sess["workspace"] / f"tc_draft_{domain_code}.md"
-        draft_path.write_text(tc_draft, encoding="utf-8")
-
-        # TC 수 카운트
-        tc_count = len(re.findall(r"^###\s", tc_draft, re.MULTILINE))
-        total_tc += tc_count
-        all_tc_parts.append(tc_draft)
-        push_log(sess, f"[TC 작성] {domain_code} 완료 — TC {tc_count}개")
-        check_stop(sess)  # 도메인 완료 후 중단 체크
+        draft_path.write_text(merged, encoding="utf-8")
+        all_tc_parts.append(merged)
+        push_log(sess, f"[TC 작성] {domain_code} 전체 완료 — TC {total_tc}개 (누적)")
+        check_stop(sess)
 
     if not all_tc_parts:
         raise RuntimeError("TC 작성 결과가 없습니다.")
@@ -1007,26 +1036,25 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
 
 def extract_domains(classification: str) -> list[dict]:
     domains = []
-    # "## 대분류: {이름} ({코드})" 패턴 추출
-    pattern = re.compile(
-        r"##\s+대분류[:\s]+([^\(\n]+?)\s*[\(\（]([A-Z]{2,8})[\)\）]",
-        re.MULTILINE
-    )
-    for m in pattern.finditer(classification):
-        domains.append({"name": m.group(1).strip(), "code": m.group(2).strip()})
-
-    # 패턴이 없으면 섹션 헤딩 기반 폴백
-    if not domains:
-        for line in classification.splitlines():
-            line = line.strip()
-            if line.startswith("## "):
-                text = line[3:].strip()
-                # 코드 추출 시도
-                cm = re.search(r"[\(\（]([A-Z]{2,8})[\)\）]", text)
-                if cm:
-                    code = cm.group(1)
-                    name = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", text).strip()
-                    domains.append({"name": name, "code": code})
+    for line in classification.splitlines():
+        line = line.strip()
+        if not line.startswith("## "):
+            continue
+        text = line[3:].strip()
+        # "대분류:" 접두사 제거
+        text = re.sub(r"^대분류[:\s]*", "", text).strip()
+        if not text or text.startswith("#"):
+            continue
+        # 괄호 코드 있으면 추출, 없으면 이름을 코드로 사용
+        cm = re.search(r"[\(\（]([A-Z]{2,8})[\)\）]", text)
+        if cm:
+            code = cm.group(1)
+            name = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", text).strip()
+        else:
+            name = text
+            # 이름에서 코드 자동 생성 (영문 대문자 약어)
+            code = re.sub(r"[^A-Za-z]", "", name).upper()[:6] or "FUNC"
+        domains.append({"name": name, "code": code})
 
     # 최소 1개 보장
     if not domains:
@@ -1124,7 +1152,7 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 
 | 항목 | 내용 |
 |------|------|
-| 대분류 | {{대분류명}} ({{대분류코드}}) |
+| 대분류 | {{대분류명}} |
 | 중분류 | {{중분류명}} |
 | 소분류 | {{소분류명}} |
 | 분류 | Positive/Negative/Edge |
@@ -1164,16 +1192,25 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
     domain_section = extract_domain_section(classification, domain["code"])
     project_code = _detect_project_code(project_name)
 
-    suite_code = domain.get("suite_code", "")
+    suite_code = domain.get("suite_code", "").strip().strip("-")  # trailing 하이픈 제거
     if suite_code:
-        tc_id_instruction = f"⚠️ TC ID: `{project_code}-{suite_code}-NNN` (예: {project_code}-{suite_code}-001, {project_code}-{suite_code}-002). 이 SuiteCode를 반드시 사용하세요."
+        example_id = f"{project_code}-{suite_code}-001"
+        tc_id_instruction = f"⚠️ TC ID 형식: `{example_id}`, `{project_code}-{suite_code}-002`, ... 하이픈은 정확히 이 위치에만. `{project_code}-{suite_code}--001` 처럼 하이픈이 연속되면 안 됩니다."
     else:
         tc_id_instruction = f"⚠️ TC ID의 ProjectCode: `{project_code}` (예: {project_code}-XXXX-001). `TC-`로 시작하면 안 됩니다."
+
+    focus_middle = domain.get("_focus_middle", "")
+    middle_instruction = ""
+    if focus_middle:
+        middle_instruction = f"""
+⚠️ 이 호출에서는 중분류 "{focus_middle}"에 해당하는 TC만 상세하게 작성하세요.
+다른 중분류의 TC는 작성하지 마세요. "{focus_middle}" 중분류의 모든 소분류에 대해 빠짐없이 작성하세요.
+"""
 
     return f"""프로젝트: {project_name}
 도메인: {domain['name']} ({domain['code']})
 {tc_id_instruction}
-
+{middle_instruction}
 ## 이 도메인의 분류 구조
 {domain_section}
 
@@ -1183,17 +1220,18 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 ## 관련 정책
 {policy_text[:3000]}
 
-위 도메인({domain['name']})에 속하는 TC를 아래 4가지 카테고리 순서로 작성해주세요.
+위 도메인({domain['name']}){' 중 "' + focus_middle + '" 중분류' if focus_middle else ''}에 속하는 TC를 아래 4가지 카테고리 순서로 상세하게 작성해주세요.
 해당 카테고리에 만들 TC가 없으면 skip합니다.
 
-1. UI/UX 체크: 화면 표시, 초기 상태, 레이아웃 (Positive, Medium~High) — 전체의 약 20%
-2. 주요 기능: 핵심 정상 흐름 (Positive, High) — bold 처리 — 전체의 약 35%
-3. 예외 기능: 잘못된 입력, 권한 오류, 잔고 부족, 중복 요청 등 (Negative, High~Medium) — High는 bold — 전체의 약 25%
-4. 에러 처리 및 비기능: 네트워크 오류, 타임아웃, 빈 응답, 성능 (Edge, Medium~Low) — 전체의 약 20%
+1. UI/UX 체크: 화면 표시, 초기 상태, 레이아웃 (Positive, Medium~High) — 약 20%
+2. 주요 기능: 핵심 정상 흐름 (Positive, High) — bold 처리 — 약 35%
+3. 예외 기능: 잘못된 입력, 권한 오류, 잔고 부족, 중복 요청 등 (Negative, High~Medium) — High는 bold — 약 25%
+4. 에러 처리 및 비기능: 네트워크 오류, 타임아웃, 빈 응답, 성능 (Edge, Medium~Low) — 약 20%
 
 ⚠️ 카테고리 3(예외)과 4(에러)를 반드시 포함하세요. Positive만으로 구성하지 마세요.
+⚠️ 이미 다른 TC에서 검증되는 내용은 중복 작성하지 마세요.
+⚠️ 중분류당 TC는 5~15개가 적정합니다. 유의미한 TC만 작성하고 양을 채우기 위한 TC는 만들지 마세요.
 - 사전 조건은 반드시 번호 개조식으로 작성
-- 각 소분류별로 적절한 수의 TC 작성 (무의미한 TC 양산 금지)
 """
 
 
@@ -3639,6 +3677,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- 숨겨진 원본 데이터 저장용 -->
     <textarea class="gate-textarea" id="gateContent"></textarea>
 
+    <!-- SuiteCode 입력 테이블 (Viewer 밖 — 독립 영역) -->
+    <div id="suiteCodeSection" style="display:none; margin-top:14px; margin-bottom:14px;"></div>
+
     <!-- TC 생성 범위 선택 -->
     <div style="margin-top:18px; margin-bottom:8px; font-size:13px; font-weight:600; color:var(--navy);">
       📌 TC 생성 범위 선택
@@ -3721,6 +3762,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="tc-stat-num" id="statMin">—</div>
         <div class="tc-stat-label">최소 TC (≈35%)</div>
       </div>
+    </div>
+
+    <!-- 추가 작업 -->
+    <div style="display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap;">
+      <button onclick="startNextIteration()" style="padding:10px 20px;background:#2563EB;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;">
+        🔄 추가 TC 생성 (소스/범위 수정 후 재시작)
+      </button>
+      <button onclick="startNextIteration(true)" style="padding:10px 16px;background:#fff;color:#1D4ED8;border:1.5px solid #93C5FD;border-radius:8px;font-size:13px;cursor:pointer;">
+        📝 범위만 변경하여 재시작
+      </button>
     </div>
 
     <!-- 액션 버튼 행 -->
@@ -3872,6 +3923,9 @@ async function onProjectDropdownChange() {
   sourceCounter = 0;
   renderSources();
   document.getElementById('focusArea').value = '';
+  // SuiteCode 섹션 리셋
+  var suiteSection = document.getElementById('suiteCodeSection');
+  if (suiteSection) { suiteSection.innerHTML = ''; suiteSection.style.display = 'none'; }
   // 이어서 작업 바 / 삭제 버튼
   document.getElementById('resumeBar').style.display = 'none';
   document.getElementById('btnDeleteProject').style.display = name ? 'inline-block' : 'none';
@@ -3956,6 +4010,40 @@ function restartFromScratch() {
   document.getElementById('startBtn').disabled = false;
   setStepBar(1);
   showToast('소스를 확인하고 파이프라인을 다시 시작하세요.');
+}
+
+function startNextIteration(focusOnly) {
+  // 완료/진행 카드 숨김
+  ['card2','card3','card4','card5'].forEach(function(id) {
+    document.getElementById(id).classList.add('hidden');
+  });
+  document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
+  // 상단 card2 요소 복원
+  var logBox = document.getElementById('logBox');
+  if (logBox) { logBox.style.display = ''; logBox.innerHTML = ''; }
+  var stopBtn2 = document.getElementById('stopBtn2');
+  if (stopBtn2) stopBtn2.style.display = '';
+  var progressWrap = document.getElementById('progressBar');
+  if (progressWrap && progressWrap.parentElement) progressWrap.parentElement.style.display = '';
+  var substeps = document.querySelector('#card2 .substeps');
+  if (substeps) substeps.style.display = '';
+  // SuiteCode 리셋
+  var suiteSection = document.getElementById('suiteCodeSection');
+  if (suiteSection) { suiteSection.innerHTML = ''; suiteSection.style.display = 'none'; }
+  // 버튼 활성화
+  document.getElementById('startBtn').disabled = false;
+  setStepBar(1);
+  stopCountdown();
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  // 범위만 변경 모드: 포커스 입력란으로 스크롤
+  if (focusOnly) {
+    document.getElementById('focusArea').focus();
+    document.getElementById('focusArea').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    showToast('TC 생성 범위를 수정하고 파이프라인을 시작하세요.');
+  } else {
+    document.getElementById('card1').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    showToast('소스와 범위를 수정하고 파이프라인을 시작하세요.');
+  }
 }
 
 async function resumePipeline() {
@@ -4843,6 +4931,13 @@ let gateChatHistory = [];  // [{role, content}, ...]
 function initGateChat(docContent) {
   // 문서 저장
   document.getElementById('gateContent').value = docContent;
+  // 승인 버튼 상태 리셋
+  var approveBtn = document.querySelector('#card3 .btn-success');
+  if (approveBtn) { approveBtn.disabled = false; approveBtn.textContent = '✅ 승인 및 TC 생성 시작'; }
+  setStopButtonsDisabled(false);
+  // SuiteCode 섹션 초기화 (새 분류표마다 리셋)
+  var suiteSection = document.getElementById('suiteCodeSection');
+  if (suiteSection) { suiteSection.innerHTML = ''; suiteSection.style.display = 'none'; }
   // Viewer 렌더링
   renderGateViewer(docContent);
   // 채팅 초기화
@@ -4971,7 +5066,13 @@ function renderGateViewer(mdText) {
     summaryHtml += '</table>';
     summaryHtml += '</div>';
   }
-  viewer.innerHTML = summaryHtml + mdToHtml(mdText);
+  // SuiteCode 테이블은 Viewer 밖 독립 영역에 렌더링 (문서 업데이트해도 유지)
+  var suiteSection = document.getElementById('suiteCodeSection');
+  if (suiteSection && summaryHtml && !suiteSection.innerHTML) {
+    suiteSection.innerHTML = summaryHtml;
+    suiteSection.style.display = 'block';
+  }
+  viewer.innerHTML = mdToHtml(mdText);
   viewer.classList.add('gate-doc-updated');
   setTimeout(() => viewer.classList.remove('gate-doc-updated'), 700);
   var badge = document.getElementById('gateViewerBadge');
@@ -5098,7 +5199,7 @@ async function approveGate() {
   // SuiteCode 목록 (순서대로)
   var suiteCodeList = [];
   for (var i = 0; i < suiteCodeInputs.length; i++) {
-    suiteCodeList.push(suiteCodeInputs[i].value.trim().toUpperCase());
+    suiteCodeList.push(suiteCodeInputs[i].value.trim().toUpperCase().replace(/^-+|-+$/g, ''));
   }
 
   // 선택된 도메인 수집
