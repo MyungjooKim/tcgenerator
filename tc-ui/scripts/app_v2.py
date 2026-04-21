@@ -1063,30 +1063,32 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 ## 분류표
 {classification[:3000]}
 
-## TC 생성 카테고리 (4가지 — 순서대로 작성)
+## TC 생성 카테고리 (4가지 — 순서대로 작성, 비율 준수)
 
 각 도메인(중분류)에 대해 아래 4가지 카테고리 순서로 TC를 작성하세요.
 해당 카테고리에 만들 TC가 없으면 skip 합니다.
+⚠️ 카테고리 3(예외)과 4(에러)를 반드시 포함하세요. Positive만으로 구성하지 마세요.
 
-### 카테고리 1: UI/UX 체크 (분류: Positive, 우선순위: Medium~High)
+### 카테고리 1: UI/UX 체크 (분류: Positive, 우선순위: Medium~High) — 약 20%
 - 화면 레이아웃, 요소 배치, 텍스트 표시가 올바른지 확인
 - 초기 진입 시 기본 상태 (기본값, placeholder, 비활성 버튼 등)
 - 반응형 / 해상도별 레이아웃 깨짐 여부
 - 로딩 상태, 빈 데이터 표시, 툴팁/안내 문구
 
-### 카테고리 2: 주요 기능 (분류: Positive, 우선순위: High)
+### 카테고리 2: 주요 기능 (분류: Positive, 우선순위: High) — 약 35%
 - 핵심 비즈니스 흐름 (Happy Path)
 - 사용자가 가장 자주 수행하는 동작
 - 데이터 입력 → 처리 → 결과 확인의 정상 흐름
 - CRUD 동작, 상태 전환, 네비게이션
 
-### 카테고리 3: 예외 기능 — 비즈니스 위험 중심 (분류: Negative, 우선순위: High~Medium)
+### 카테고리 3: 예외 기능 — 비즈니스 위험 중심 (분류: Negative, 우선순위: High~Medium) — 약 25%
 - 잘못된 입력, 경계값, 허용 범위 초과
 - 권한 없는 접근, 인증 만료 상태에서의 동작
 - 동시 접근, 중복 요청 (더블 클릭 등)
 - 데이터 정합성 위험 (잔고 부족, 수량 초과 등)
+- 미연동 상태에서의 기능 접근
 
-### 카테고리 4: 에러 처리 및 비기능 (분류: Edge, 우선순위: Medium~Low)
+### 카테고리 4: 에러 처리 및 비기능 (분류: Edge, 우선순위: Medium~Low) — 약 20%
 - 네트워크 오류, 서버 타임아웃 시 에러 메시지 표시
 - 빈 응답, 잘못된 응답 형식에 대한 방어
 - 성능 관련 (로딩 시간, 대량 데이터 표시)
@@ -1184,11 +1186,12 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 위 도메인({domain['name']})에 속하는 TC를 아래 4가지 카테고리 순서로 작성해주세요.
 해당 카테고리에 만들 TC가 없으면 skip합니다.
 
-1. UI/UX 체크: 화면 표시, 초기 상태, 레이아웃 (Positive, Medium~High)
-2. 주요 기능: 핵심 정상 흐름 (Positive, High) — bold 처리
-3. 예외 기능: 비즈니스 위험 시나리오 (Negative, High~Medium) — High는 bold 처리
-4. 에러 처리 및 비기능: 네트워크 오류, 방어 로직, 성능 (Edge, Medium~Low)
+1. UI/UX 체크: 화면 표시, 초기 상태, 레이아웃 (Positive, Medium~High) — 전체의 약 20%
+2. 주요 기능: 핵심 정상 흐름 (Positive, High) — bold 처리 — 전체의 약 35%
+3. 예외 기능: 잘못된 입력, 권한 오류, 잔고 부족, 중복 요청 등 (Negative, High~Medium) — High는 bold — 전체의 약 25%
+4. 에러 처리 및 비기능: 네트워크 오류, 타임아웃, 빈 응답, 성능 (Edge, Medium~Low) — 전체의 약 20%
 
+⚠️ 카테고리 3(예외)과 4(에러)를 반드시 포함하세요. Positive만으로 구성하지 마세요.
 - 사전 조건은 반드시 번호 개조식으로 작성
 - 각 소분류별로 적절한 수의 TC 작성 (무의미한 TC 양산 금지)
 """
