@@ -2510,6 +2510,351 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
     return fpath
 
 
+def parse_tc_excel(path: Path) -> list[dict]:
+    """우리가 생성한 Excel 포맷의 TC를 파싱하여 딕셔너리 리스트로 변환.
+    대분류별 시트(📑 prefix)를 순회하며 TC ID가 있는 행을 수집.
+    헤더 컬럼명으로 매핑 (컬럼 순서 변경에 강건).
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise RuntimeError("openpyxl 패키지가 필요합니다")
+
+    wb = load_workbook(path, data_only=True)
+    tcs = []
+    seen_ids = set()
+
+    # 한글 → 내부 키 매핑
+    KEY_MAP = {
+        "TC ID": "id",
+        "Smoke": "smoke",
+        "우선순위": "priority",
+        "거래소": "exchange",
+        "대분류": "major",
+        "중분류": "middle",
+        "소분류": "minor",
+        "화면 코드": "screen_code",
+        "사전 조건": "precondition",
+        "스텝": "steps",
+        "기대 결과": "expected",
+        "연관 화면": "screen",
+        "상태": "status",
+        "수정 사유": "change_reason",
+    }
+
+    for sheet_name in wb.sheetnames:
+        # 공통 시트는 제외 (📑로 시작하는 대분류 시트만 순회)
+        if not sheet_name.startswith("📑"):
+            continue
+        ws = wb[sheet_name]
+        if ws.max_row < 2:
+            continue
+        # 헤더 읽기 (1행)
+        header_row = [c.value for c in ws[1]]
+        col_idx = {}
+        for i, h in enumerate(header_row):
+            if not h:
+                continue
+            h_str = str(h).strip()
+            key = KEY_MAP.get(h_str)
+            if key:
+                col_idx[key] = i
+
+        if "id" not in col_idx:
+            continue
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            raw_id = row[col_idx["id"]] if col_idx["id"] < len(row) else None
+            if not raw_id or not re.match(r"^[A-Z]{2,}-[A-Z0-9]+-\d+", str(raw_id).strip()):
+                continue
+            tid = str(raw_id).strip()
+            if tid in seen_ids:
+                continue
+            seen_ids.add(tid)
+
+            tc = {"id": tid, "title": ""}
+            for key, idx in col_idx.items():
+                if idx < len(row) and row[idx] is not None:
+                    tc[key] = str(row[idx]).strip()
+
+            # smoke은 "Y" 여부를 bool로
+            tc["is_min"] = (tc.get("smoke", "").upper() == "Y")
+            # 우선순위 한글 → 영문 역변환 (Medium 기본)
+            pri_map = {"높음": "High", "보통": "Medium", "낮음": "Low"}
+            if tc.get("priority") in pri_map:
+                tc["priority"] = pri_map[tc["priority"]]
+            tc.setdefault("major", "")
+            tc.setdefault("middle", "")
+            tc.setdefault("minor", "")
+            tc.setdefault("priority", "Medium")
+            tc.setdefault("screen", tc.get("screen_code", ""))
+            tcs.append(tc)
+    return tcs
+
+
+def _extract_spec_sections(md_text: str) -> dict[str, dict]:
+    """기획서 MD를 화면(SCR/SCREEN/PAGE) 단위로 분할하여
+    {code: {"name": ..., "body": ..., "raw_header": ...}} 딕셔너리 반환.
+
+    매칭 패턴 (우선순위):
+      1. `### SCR-001: Splash` (또는 `SCREEN-001`, `PAGE-001`)
+      2. `### SCR-001` (이름 없음)
+      3. 인벤토리 표 행 `| SCR-001 | Splash | 설명 |` — 이것은 헤더가 아니지만
+         화면 코드가 없는 헤더 아래에서 소속 화면을 식별할 때 보조로 사용
+
+    헤더가 없으면 빈 dict 반환 (상위 레벨에서 fallback 처리).
+    """
+    sections = {}
+    if not md_text:
+        return sections
+
+    lines = md_text.splitlines()
+    current_code = None
+    current_name = ""
+    current_header = ""
+    buffer = []
+
+    # `### CODE: Name` 또는 `### CODE` 형식
+    header_pat = re.compile(
+        r"^(#{2,4})\s+((?:SCR|SCREEN|PAGE)-[A-Z0-9]+[A-Z]?)\s*[:\-]?\s*(.*?)\s*$"
+    )
+
+    def flush():
+        if current_code:
+            sections[current_code] = {
+                "name": current_name,
+                "body": "\n".join(buffer).strip(),
+                "raw_header": current_header,
+            }
+
+    for line in lines:
+        m = header_pat.match(line)
+        if m:
+            flush()
+            current_code = m.group(2).strip()
+            current_name = m.group(3).strip() or ""
+            current_header = line
+            buffer = []
+        elif current_code is not None:
+            buffer.append(line)
+    flush()
+    return sections
+
+
+def _normalize_body(body: str) -> str:
+    """비교용 정규화 — 공백/빈 줄 정리, 가독성 변경(줄바꿈 등)에 둔감하게."""
+    if not body:
+        return ""
+    # 연속 공백 하나로, 줄 끝 공백 제거, 빈 줄 제거
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in body.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def diff_specs(old_md: str, new_md: str) -> dict:
+    """두 기획서 MD를 화면 코드 단위로 비교하여 변경사항 리포트 생성.
+
+    반환 구조:
+    {
+        "added":   [{"code": "SCR-020", "name": "...", "body": "..."}],
+        "removed": [{"code": "SCR-008", "name": "...", "body": "..."}],
+        "modified":[{"code": "SCR-001", "name": "...",
+                     "old_body": "...", "new_body": "...",
+                     "diff_summary": "(옵션)"}],
+        "unchanged_codes": ["SCR-002", ...],
+        "has_spec_codes": True/False,  # 화면 코드 체계 사용 여부
+    }
+    """
+    old_sections = _extract_spec_sections(old_md)
+    new_sections = _extract_spec_sections(new_md)
+    has_codes = bool(old_sections or new_sections)
+
+    result = {
+        "added": [],
+        "removed": [],
+        "modified": [],
+        "unchanged_codes": [],
+        "has_spec_codes": has_codes,
+    }
+
+    if not has_codes:
+        # 화면 코드 체계 없음 — fallback은 상위에서 처리 (예: 전체 raw diff)
+        return result
+
+    old_codes = set(old_sections.keys())
+    new_codes = set(new_sections.keys())
+
+    for code in sorted(new_codes - old_codes):
+        s = new_sections[code]
+        result["added"].append({
+            "code": code, "name": s["name"], "body": s["body"][:2000]
+        })
+
+    for code in sorted(old_codes - new_codes):
+        s = old_sections[code]
+        result["removed"].append({
+            "code": code, "name": s["name"], "body": s["body"][:2000]
+        })
+
+    for code in sorted(old_codes & new_codes):
+        old_raw = old_sections[code]["body"]
+        new_raw = new_sections[code]["body"]
+        old_body = _normalize_body(old_raw)
+        new_body = _normalize_body(new_raw)
+        if old_body != new_body:
+            # 라인 단위 diff — 변경된 라인만 시각적으로 표시 가능하게 함
+            line_diff = _compute_line_diff(old_raw, new_raw)
+            result["modified"].append({
+                "code": code,
+                "name": new_sections[code]["name"] or old_sections[code]["name"],
+                "old_body": old_raw[:4000],
+                "new_body": new_raw[:4000],
+                "line_diff": line_diff,
+            })
+        else:
+            result["unchanged_codes"].append(code)
+
+    return result
+
+
+def _compute_line_diff(old_text: str, new_text: str,
+                       max_lines: int = 400) -> list[dict]:
+    """difflib 기반 라인 단위 diff 계산.
+    반환: [{"tag": "equal"|"insert"|"delete"|"replace",
+            "old_lines": [...], "new_lines": [...]}] 형태의 블록 리스트.
+    너무 크면 max_lines에서 잘라낸다.
+    """
+    import difflib
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    # 공백만 다른 경우 노이즈 줄이기 — 동일하게 취급할지 여부는 difflib에 맡김
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    blocks = []
+    total_lines = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        olines = old_lines[i1:i2]
+        nlines = new_lines[j1:j2]
+        # equal 블록이 너무 길면 앞뒤 2줄만 남겨 컨텍스트 제공
+        if tag == "equal" and (i2 - i1) > 4:
+            olines = old_lines[i1:i1+2] + ["... (중략)"] + old_lines[i2-2:i2]
+            nlines = new_lines[j1:j1+2] + ["... (중략)"] + new_lines[j2-2:j2]
+        blocks.append({"tag": tag, "old_lines": olines, "new_lines": nlines})
+        total_lines += max(len(olines), len(nlines))
+        if total_lines >= max_lines:
+            blocks.append({"tag": "truncated", "old_lines": [], "new_lines": []})
+            break
+    return blocks
+
+
+def group_tcs_by_scr(tcs: list[dict]) -> dict[str, list[dict]]:
+    """TC 리스트를 화면 코드(SCR-xxx) 기준으로 그룹핑.
+    화면 코드가 없거나 여러 개인 경우:
+      - 여러 개면 각 코드에 중복 등록
+      - 없으면 "(화면 코드 없음)" 그룹으로
+    """
+    groups = defaultdict(list) if False else {}  # noqa
+    from collections import defaultdict as _dd
+    groups = _dd(list)
+    for tc in tcs:
+        screen_field = tc.get("screen_code") or tc.get("screen") or ""
+        codes = re.findall(r"(?:SCR|SCREEN|PAGE)-[A-Za-z0-9]+", screen_field)
+        if not codes:
+            groups["(화면 코드 없음)"].append(tc)
+            continue
+        for c in dict.fromkeys(codes):  # 중복 제거 · 순서 유지
+            groups[c].append(tc)
+    return dict(groups)
+
+
+def next_tc_id(existing_tcs: list[dict], project_code: str, suite_code: str) -> int:
+    """주어진 프로젝트/스위트 코드의 기존 TC 번호 중 최대값 + 1 반환."""
+    max_seq = 0
+    pat = re.compile(rf"^{re.escape(project_code)}-{re.escape(suite_code)}-(\d+)$")
+    for tc in existing_tcs:
+        m = pat.match(tc.get("id", ""))
+        if m:
+            seq = int(m.group(1))
+            if seq > max_seq:
+                max_seq = seq
+    return max_seq + 1
+
+
+def build_diff_report(old_md: str, new_md: str,
+                       existing_tcs: list[dict]) -> dict:
+    """기획서 diff + 기존 TC 매핑을 결합한 리포트 생성.
+
+    반환 구조 (프론트엔드에 바로 사용 가능):
+    {
+      "has_spec_codes": bool,
+      "added":   [{"code", "name", "body", "estimated_tc_count"}],
+      "modified":[{"code", "name", "old_body", "new_body",
+                   "affected_tc_ids": [...], "affected_count"}],
+      "removed": [{"code", "name", "affected_tc_ids": [...]}],
+      "summary": {"added_n", "modified_n", "removed_n", "unchanged_n"}
+    }
+    """
+    base = diff_specs(old_md, new_md)
+    tc_groups = group_tcs_by_scr(existing_tcs)
+
+    report = {
+        "has_spec_codes": base["has_spec_codes"],
+        "added": [],
+        "modified": [],
+        "removed": [],
+        "summary": {},
+    }
+
+    for a in base["added"]:
+        report["added"].append({
+            "code": a["code"],
+            "name": a["name"],
+            "body": a["body"],
+            "estimated_tc_count": 8,  # 경험적 기본값 (5~15 중 중앙)
+        })
+
+    for m in base["modified"]:
+        affected = tc_groups.get(m["code"], [])
+        report["modified"].append({
+            "code": m["code"],
+            "name": m["name"],
+            "old_body": m["old_body"],
+            "new_body": m["new_body"],
+            "line_diff": m.get("line_diff", []),
+            "affected_tc_ids": [t.get("id", "") for t in affected if t.get("id")],
+            "affected_count": len(affected),
+        })
+
+    for r in base["removed"]:
+        affected = tc_groups.get(r["code"], [])
+        report["removed"].append({
+            "code": r["code"],
+            "name": r["name"],
+            "affected_tc_ids": [t.get("id", "") for t in affected if t.get("id")],
+            "affected_count": len(affected),
+        })
+
+    report["summary"] = {
+        "added_n":     len(report["added"]),
+        "modified_n":  len(report["modified"]),
+        "removed_n":   len(report["removed"]),
+        "unchanged_n": len(base["unchanged_codes"]),
+    }
+    return report
+
+
+def load_existing_tcs(file_path: str | Path) -> list[dict]:
+    """기존 TC 파일(MD 또는 Excel)을 자동 판별하여 파싱."""
+    p = Path(file_path)
+    if not p.exists():
+        raise RuntimeError(f"파일 없음: {file_path}")
+    suf = p.suffix.lower()
+    if suf in (".md", ".markdown", ".txt"):
+        content = p.read_text(encoding="utf-8")
+        return parse_tc_markdown(content)
+    if suf in (".xlsx", ".xls"):
+        return parse_tc_excel(p)
+    raise RuntimeError(f"지원하지 않는 파일 형식: {suf} (.md, .xlsx만 지원)")
+
+
 def parse_tc_markdown(content: str) -> list[dict]:
     """TC Markdown을 파싱하여 딕셔너리 리스트로 변환"""
     tcs = []
@@ -3369,6 +3714,434 @@ def import_sheets():
     save_path.write_text(md_text, encoding="utf-8")
     save_project(project_name, str(save_path), "")
     return jsonify({"ok": True, "project_name": project_name, "tc_file": save_path.name, "tc_count": len(lines) // 8})
+
+
+@app.route("/upload-existing-tc", methods=["POST"])
+def upload_existing_tc():
+    """기존 TC 파일(MD/Excel)을 업로드하여 specs 또는 tc_files에 저장.
+    반환: 저장 경로 + 감지된 TC 개수.
+    """
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "파일 없음"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"ok": False, "error": "파일명 없음"}), 400
+    ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+    if ext not in ("md", "markdown", "xlsx", "xls"):
+        return jsonify({"ok": False, "error": ".md / .xlsx 파일만 허용"}), 400
+    # 업로드 저장 — tc_files 디렉토리 (Excel 포함)
+    save_path = TC_FILES_DIR / f.filename
+    f.save(str(save_path))
+    try:
+        tcs = load_existing_tcs(save_path)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"TC 파일 파싱 실패: {e}"}), 400
+    return jsonify({
+        "ok": True,
+        "filename": f.filename,
+        "tc_count": len(tcs),
+        "tc_ids_sample": [t["id"] for t in tcs[:5]],
+    })
+
+
+def _tc_to_markdown_block(tc: dict) -> str:
+    """파싱된 TC dict를 markdown TC 블록 형식으로 직렬화 (build_excel가 파싱 가능한 포맷).
+    이미 raw_text가 있으면 그걸 사용 (업데이트 전 원본 보존용)."""
+    if tc.get("raw_block"):
+        return tc["raw_block"]
+    tid = tc.get("id", "")
+    title = tc.get("title", "") or tid
+    bold = "**" if tc.get("is_min") else ""
+    header = f"### {bold}{tid}{bold} — {title}"
+    table = [
+        f"| 대분류 | {tc.get('major', '')} |",
+        f"| 중분류 | {tc.get('middle', '')} |",
+        f"| 소분류 | {tc.get('minor', '')} |",
+        f"| 분류 | {tc.get('type', 'Positive')} |",
+        f"| 우선순위 | {tc.get('priority', 'Medium')} |",
+    ]
+    if tc.get("screen") or tc.get("screen_code"):
+        table.append(f"| 연관 화면 | {tc.get('screen') or tc.get('screen_code')} |")
+    sections = [
+        f"**사전 조건**\n{tc.get('precondition', '')}",
+        f"**테스트 단계**\n{tc.get('steps', '')}",
+        f"**예상 결과**\n{tc.get('expected', '')}",
+    ]
+    if tc.get("note"):
+        sections.append(f"**비고**\n{tc['note']}")
+    return "\n".join([header, "", "| 항목 | 내용 |", "|------|------|", *table, "", *sections])
+
+
+def _save_tc_history_snapshot(project_name: str, existing_tcs: list[dict]) -> Path:
+    """업데이트 실행 직전의 TC 상태를 tc_history/에 스냅샷 저장."""
+    history_dir = BASE_DIR / "tc_history" / (re.sub(r"[^\w\-_]", "_", project_name or "unnamed")[:30])
+    history_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snap_path = history_dir / f"snapshot_{ts}.md"
+    parts = [f"# TC 스냅샷 — {project_name or '(unnamed)'}\n\n생성: {datetime.now().isoformat()}\n\n---\n"]
+    for tc in existing_tcs:
+        parts.append(_tc_to_markdown_block(tc))
+        parts.append("\n")
+    snap_path.write_text("\n\n".join(parts), encoding="utf-8")
+    return snap_path
+
+
+def _update_tc_for_modified_scr(tc: dict, new_section: str,
+                                  tc_rules: str) -> tuple[dict, str]:
+    """수정된 SCR에 대해 기존 TC 하나를 새 사양 기반으로 재작성.
+    반환: (업데이트된 TC dict, AI가 서술한 수정 사유)
+    """
+    system = """당신은 시니어 QA 엔지니어입니다. 기존 TC를 새 기획서 섹션 기반으로 **업데이트**합니다.
+
+규칙:
+- TC ID는 **절대 변경하지 마세요** — 그대로 유지
+- 사전 조건 / 테스트 단계 / 예상 결과를 새 사양에 맞게 재작성
+- 기존 대분류/중분류/소분류 유지 (사양에서 변경된 경우만 수정)
+- 이미 존재하는 Given/When/Then 구조와 어투를 따르세요
+- 수정 사유를 한 문장(50자 이내)으로 요약하여 마지막에 `수정 사유: ...` 형식으로 포함
+"""
+    user = f"""기존 TC (업데이트 대상):
+---
+{_tc_to_markdown_block(tc)[:3000]}
+---
+
+새 기획서 섹션 (이 TC가 커버하는 화면의 변경된 내용):
+---
+{new_section[:4000]}
+---
+
+위 기존 TC를 새 기획서에 맞게 업데이트해주세요. TC ID는 그대로 유지.
+출력 형식: 기존 TC와 동일한 markdown 블록 + 마지막에 `수정 사유: ...` 한 줄 추가.
+"""
+    try:
+        result = call_claude(system, user, max_tokens=3000)
+    except Exception as e:
+        return tc, f"AI 오류로 원본 유지: {e}"
+
+    # 수정 사유 추출
+    reason = ""
+    m = re.search(r"수정\s*사유\s*[:：]\s*(.+)", result)
+    if m:
+        reason = m.group(1).strip().split("\n")[0][:200]
+        result = re.sub(r"수정\s*사유\s*[:：].*$", "", result, flags=re.MULTILINE).rstrip()
+
+    # 결과 파싱하여 새 TC dict 생성
+    try:
+        parsed = parse_tc_markdown(result)
+        if parsed:
+            updated = parsed[0]
+            updated["id"] = tc["id"]  # ID 강제 유지
+            updated["status"] = "🔄 수정됨"
+            updated["change_reason"] = reason
+            updated["raw_block"] = result.strip()
+            # 기존에 있던 필드 중 새 파싱에 없는 것 보존 (screen_code 등)
+            for k, v in tc.items():
+                if k not in updated and v:
+                    updated[k] = v
+            return updated, reason
+    except Exception as e:
+        return tc, f"파싱 실패로 원본 유지: {e}"
+    return tc, reason
+
+
+@app.route("/analyze-diff", methods=["POST"])
+def analyze_diff():
+    """기획서 변경 기반 TC 수정 — 1단계: 두 기획서 + 기존 TC 파일 분석.
+
+    입력 JSON:
+      {
+        "project_name": (optional) — 저장된 프로젝트 이름. 로그/저장용.
+        "old_spec_path":  (필수) SPECS_DIR 내 파일명
+        "new_spec_path":  (필수) SPECS_DIR 내 파일명
+        "existing_tc_path": (선택) TC_FILES_DIR 내 파일명. 없으면 "diff만 분석".
+      }
+
+    반환: build_diff_report() 결과 + 추가 메타.
+    """
+    data = request.get_json(force=True) or {}
+    project_name = (data.get("project_name") or "").strip()
+    old_path_name = (data.get("old_spec_path") or "").strip()
+    new_path_name = (data.get("new_spec_path") or "").strip()
+    tc_path_name = (data.get("existing_tc_path") or "").strip()
+
+    if not new_path_name:
+        return jsonify({"ok": False, "error": "새 기획서가 필요합니다."}), 400
+    if not old_path_name:
+        return jsonify({"ok": False, "error": "이전 기획서가 필요합니다."}), 400
+
+    old_path = SPECS_DIR / old_path_name
+    new_path = SPECS_DIR / new_path_name
+    if not old_path.exists():
+        return jsonify({"ok": False, "error": f"이전 기획서 파일 없음: {old_path_name}"}), 400
+    if not new_path.exists():
+        return jsonify({"ok": False, "error": f"새 기획서 파일 없음: {new_path_name}"}), 400
+
+    try:
+        old_md = old_path.read_text(encoding="utf-8")
+        new_md = new_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"기획서 읽기 실패: {e}"}), 400
+
+    # 기존 TC 로드 (선택)
+    existing_tcs = []
+    tc_load_error = None
+    if tc_path_name:
+        tc_path = TC_FILES_DIR / tc_path_name
+        if not tc_path.exists():
+            # SPECS_DIR도 확인 (업로드 경로가 달랐을 경우 대비)
+            alt = SPECS_DIR / tc_path_name
+            if alt.exists():
+                tc_path = alt
+            else:
+                return jsonify({"ok": False, "error": f"기존 TC 파일 없음: {tc_path_name}"}), 400
+        try:
+            existing_tcs = load_existing_tcs(tc_path)
+        except Exception as e:
+            tc_load_error = str(e)
+
+    # 리포트 생성
+    report = build_diff_report(old_md, new_md, existing_tcs)
+
+    # 변경 없음 확인
+    summary = report["summary"]
+    no_changes = (summary["added_n"] == 0 and summary["modified_n"] == 0
+                  and summary["removed_n"] == 0)
+
+    # 세션 생성 (이후 /update-tc 호출 시 재사용)
+    sess = new_session()
+    sess["project_name"] = project_name
+    sess["_diff_context"] = {
+        "old_md": old_md,
+        "new_md": new_md,
+        "existing_tcs": existing_tcs,
+        "report": report,
+        "old_spec_name": old_path_name,
+        "new_spec_name": new_path_name,
+        "tc_path_name": tc_path_name,
+    }
+
+    return jsonify({
+        "ok": True,
+        "sid": sess["id"],
+        "report": report,
+        "no_changes": no_changes,
+        "existing_tc_count": len(existing_tcs),
+        "tc_load_error": tc_load_error,
+        "has_spec_codes": report.get("has_spec_codes", False),
+    })
+
+
+@app.route("/update-tc", methods=["POST"])
+def update_tc():
+    """analyze-diff로 생성된 리포트 승인 후 실제 TC 갱신 실행.
+
+    입력 JSON:
+      {
+        "sid": (필수) — analyze-diff에서 받은 세션 ID
+        "approved": {
+          "added":   ["SCR-020", "SCR-021"],      # 승인된 신규 SCR 코드 목록
+          "modified":["SCR-001"],                 # 승인된 수정 SCR 코드 목록
+          "removed": ["SCR-008"],                 # 승인된 삭제 SCR 코드 목록 (Deprecated 처리)
+        }
+      }
+
+    흐름:
+      1. 스냅샷 저장 (tc_history/)
+      2. 승인된 신규 SCR → 신규 TC 생성 (새 파이프라인 트리거)
+      3. 승인된 수정 SCR → 기존 TC 재작성 (ID 유지)
+      4. 승인된 삭제 SCR → 해당 TC에 status=Deprecated
+      5. 영향 없는 TC → 상태 빈 값 (유지)
+      6. 결과 TC 리스트 → Excel 빌드
+    """
+    data = request.get_json(force=True) or {}
+    sid = (data.get("sid") or "").strip()
+    approved = data.get("approved") or {}
+
+    sess = SESSIONS.get(sid)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션 없음 — /analyze-diff를 먼저 호출하세요."}), 404
+    ctx = sess.get("_diff_context")
+    if not ctx:
+        return jsonify({"ok": False, "error": "diff 컨텍스트 없음"}), 400
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+
+    approved_added    = set(approved.get("added") or [])
+    approved_modified = set(approved.get("modified") or [])
+    approved_removed  = set(approved.get("removed") or [])
+
+    # 백엔드 가드 — 승인 항목이 하나도 없으면 빈 Excel 생성 방지
+    if not (approved_added or approved_modified or approved_removed):
+        return jsonify({
+            "ok": False,
+            "error": "승인된 변경사항이 없습니다. 최소 1개 이상의 항목을 체크한 뒤 승인하세요."
+        }), 400
+
+    def worker():
+        try:
+            existing_tcs = list(ctx["existing_tcs"])  # copy
+            project_name = sess.get("project_name", "")
+
+            # 1. 스냅샷
+            push_log(sess, "[갱신] TC 스냅샷 저장 중...")
+            snap = _save_tc_history_snapshot(project_name, existing_tcs)
+            push_log(sess, f"[갱신] 스냅샷 저장됨: {snap.name}")
+            push_stage(sess, 2, "기존 TC 스냅샷 저장 완료", 10)
+
+            # 2. 새 기획서의 SCR별 섹션 추출 (TC 재작성용 근거)
+            new_sections = _extract_spec_sections(ctx["new_md"])
+            report = ctx["report"]
+
+            # 공통: tc_rules / fewshot 로드
+            tc_rules = load_tc_rules()
+            fewshot = load_fewshot_examples()
+            project_policies = load_project_policies(project_name)
+            project_code = _detect_project_code(project_name)
+
+            # 3. 수정된 SCR별 TC 재작성
+            tc_by_scr = group_tcs_by_scr(existing_tcs)
+            modified_count = 0
+            total_modified_tcs = sum(
+                len(tc_by_scr.get(code, []))
+                for code in approved_modified
+            )
+            done_mod_tcs = 0
+            for code in approved_modified:
+                affected = tc_by_scr.get(code, [])
+                new_section = new_sections.get(code, {}).get("body", "")
+                if not new_section:
+                    push_log(sess, f"[갱신] ⚠️ {code} 새 섹션 없음 — 건너뜀")
+                    continue
+                for tc in affected:
+                    push_log(sess, f"[갱신] 수정 ({code}) → {tc.get('id')}")
+                    updated_tc, reason = _update_tc_for_modified_scr(tc, new_section, tc_rules)
+                    # existing_tcs에서 ID로 찾아 교체
+                    for i, t in enumerate(existing_tcs):
+                        if t.get("id") == updated_tc.get("id"):
+                            existing_tcs[i] = updated_tc
+                            break
+                    modified_count += 1
+                    done_mod_tcs += 1
+                    pct = 10 + int(40 * done_mod_tcs / max(total_modified_tcs, 1))
+                    push_stage(sess, 2, f"수정 TC 재작성 {done_mod_tcs}/{total_modified_tcs}", pct, eta_sec=(total_modified_tcs - done_mod_tcs) * 30)
+
+            # 4. 삭제된 SCR → Deprecated 태그
+            deprecated_count = 0
+            for code in approved_removed:
+                affected = tc_by_scr.get(code, [])
+                for tc in affected:
+                    for i, t in enumerate(existing_tcs):
+                        if t.get("id") == tc.get("id"):
+                            existing_tcs[i]["status"] = "🗑️ Deprecated"
+                            existing_tcs[i]["change_reason"] = f"{code} 삭제로 폐기"
+                            deprecated_count += 1
+                            break
+            push_log(sess, f"[갱신] Deprecated 처리 {deprecated_count}건")
+
+            # 5. 신규 SCR → 신규 TC 생성
+            added_tc_count = 0
+            if approved_added:
+                push_stage(sess, 3, f"신규 SCR {len(approved_added)}개 TC 생성 중", 55, eta_sec=len(approved_added) * 40)
+                # 분류표 임시 생성 — 각 신규 SCR을 별도 중분류로
+                temp_classification_parts = [f"# TC 분류표 — 신규 추가"]
+                for code in approved_added:
+                    new_s = new_sections.get(code, {})
+                    name = new_s.get("name") or code
+                    temp_classification_parts.append(f"\n## 대분류: 신규 화면\n\n### 중분류: {name}\n\n#### 소분류\n- 화면 진입/표시/동작: {code} 기본 TC")
+                temp_classification = "\n".join(temp_classification_parts)
+
+                # 각 신규 SCR마다 단일 호출로 TC 생성
+                for idx, code in enumerate(approved_added):
+                    new_s = new_sections.get(code, {})
+                    name = new_s.get("name") or code
+                    body = new_s.get("body", "")
+                    # build_tc_user_prompt 사용을 위한 domain 객체 구성
+                    domain = {"name": "신규 화면", "code": "NEWSCR",
+                              "suite_code": re.sub(r"[^A-Za-z]", "", name).upper()[:6] or "NEW",
+                              "_focus_middle": name}
+                    # 연관 화면 코드 hint 주입을 위해 body에 code 포함
+                    prompt_context = f"{code}: {name}\n\n{body}"
+                    starting_seq = next_tc_id(existing_tcs, project_code, domain["suite_code"])
+                    user_prompt = build_tc_user_prompt(
+                        domain, prompt_context, prompt_context, project_name,
+                        temp_classification, starting_seq=starting_seq,
+                    )
+                    system_prompt = build_tc_system_prompt(
+                        tc_rules, temp_classification, project_policies, fewshot
+                    )
+                    push_log(sess, f"[갱신] 신규 ({code}) TC 생성 중...")
+                    try:
+                        tc_md = call_claude(system_prompt, user_prompt, max_tokens=8000)
+                    except Exception as e:
+                        push_log(sess, f"[갱신] {code} 생성 실패: {e}")
+                        continue
+                    # TC ID 재번호
+                    tc_md, _ = renumber_tc_ids(tc_md, project_code, domain["suite_code"], starting_seq)
+                    new_tcs = parse_tc_markdown(tc_md)
+                    for nt in new_tcs:
+                        nt["status"] = "🆕 신규"
+                        nt["change_reason"] = f"{code} 추가로 신규 생성"
+                        nt["screen_code"] = code
+                        nt["screen"] = code
+                        existing_tcs.append(nt)
+                        added_tc_count += 1
+
+            # 6. 결과 마크다운 생성 → Excel 빌드
+            push_stage(sess, 4, "tc_final.md 저장 중", 85, eta_sec=5)
+            final_md = "\n\n---\n\n".join(_tc_to_markdown_block(t) for t in existing_tcs)
+            workspace = sess["workspace"]
+            tc_final_path = workspace / "tc_final.md"
+            tc_final_path.write_text(final_md, encoding="utf-8")
+
+            # Excel 빌드 (build_excel.py는 기존 것 사용 — 변경 이력 정보는 TC 메타의 status/change_reason 필드)
+            push_stage(sess, 5, "Excel 빌드 중", 92, eta_sec=60)
+            excel_path = step_build_excel(sess, final_md, project_name,
+                                           total_tc=len(existing_tcs),
+                                           min_tc=max(1, round(len(existing_tcs) * 0.35)))
+
+            # tc_files에 저장
+            today = datetime.now().strftime("%Y%m%d")
+            safe_name = re.sub(r"[^\w\-_]", "_", project_name or "Updated")[:30]
+            tc_md_path = TC_FILES_DIR / f"{safe_name}_{today}.md"
+            tc_md_path.write_text(final_md, encoding="utf-8")
+            save_project(project_name, str(tc_md_path), str(excel_path))
+
+            # 변경 이력 요약 저장
+            change_log_path = workspace / "change_log.md"
+            change_log_path.write_text(
+                f"# 변경 이력\n\n"
+                f"- 수정된 TC: {modified_count}건\n"
+                f"- Deprecated TC: {deprecated_count}건\n"
+                f"- 신규 TC: {added_tc_count}건\n"
+                f"- 스냅샷: {snap}\n",
+                encoding="utf-8"
+            )
+
+            sess["result"] = excel_path
+            sess["status"] = "done"
+            push_stage(sess, 5, "완료", 100)
+            push(sess, "done", {
+                "filename": excel_path.name,
+                "size": excel_path.stat().st_size,
+                "sid": sess["id"],
+                "total_tc": len(existing_tcs),
+                "smoke_tc": sess.get("smoke_tc"),
+                "min_tc": max(1, round(len(existing_tcs) * 0.35)),
+                "update_summary": {
+                    "modified": modified_count,
+                    "deprecated": deprecated_count,
+                    "added": added_tc_count,
+                },
+            })
+            push_log(sess, f"[완료] 업데이트 반영 — 수정 {modified_count} / 추가 {added_tc_count} / Deprecated {deprecated_count}")
+        except Exception as e:
+            push_log(sess, f"[오류] {e}")
+            push_error(sess, str(e))
+
+    t = threading.Thread(target=worker, daemon=True)
+    sess["thread"] = t
+    t.start()
+    return jsonify({"ok": True, "sid": sess["id"]})
 
 
 @app.route("/start-modify", methods=["POST"])
@@ -4709,83 +5482,71 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </button>
     </div>
 
-    <!-- ── 수정 모드 ── -->
+    <!-- ── 수정 모드 (기획서 diff 기반 TC 갱신) ── -->
     <div id="panelModify" class="hidden">
 
-      <!-- 프로젝트 선택 -->
+      <div class="info-box" style="margin-bottom:12px;background:#EEF2FF;border-color:#C7D2FE;">
+        📝 <strong>기획서 변경 기반 TC 갱신</strong><br>
+        <span style="font-size:12px;color:#4B5563;">이전 기획서와 새 기획서를 비교해 신규/수정/삭제된 화면을 자동 탐지합니다. 기존 TC는 ID를 유지한 채 업데이트됩니다.</span>
+      </div>
+
+      <!-- 프로젝트 선택 (선택) -->
       <div class="form-group">
         <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
-          <span>수정할 프로젝트 선택</span>
-          <button type="button" class="btn-new-project" onclick="toggleNewProjectForm()">＋ 새 프로젝트</button>
+          <span>프로젝트 선택 <span style="font-size:11px;color:var(--muted);font-weight:400">(선택 — 기록용)</span></span>
         </label>
-        <select class="project-select" id="projectSelect" onchange="onProjectSelect()">
-          <option value="">— 프로젝트를 선택하세요 —</option>
+        <select class="project-select" id="modifyProjectSelect">
+          <option value="">— 단발성 작업 (프로젝트 없음) —</option>
         </select>
-        <div class="project-card" id="projectCard">
-          <div class="project-card-name" id="projectCardName"></div>
-          <div class="project-card-meta" id="projectCardMeta"></div>
-          <button type="button" class="btn-delete-project" id="btnDeleteProject" onclick="deleteProject()" style="display:none">🗑 삭제</button>
-        </div>
-        <!-- 새 프로젝트 생성 폼 -->
-        <div id="newProjectForm" class="new-project-form hidden">
-          <input type="text" id="newProjectName" class="form-input" placeholder="새 프로젝트명 입력 (예: Supercycl iOS v2)">
-          <div style="display:flex;gap:8px;margin-top:8px">
-            <button type="button" class="btn btn-primary" style="flex:1" onclick="createProject()">✅ 생성</button>
-            <button type="button" class="btn" style="flex:1" onclick="toggleNewProjectForm()">취소</button>
-          </div>
-        </div>
       </div>
 
-      <!-- TC 파일 가져오기 -->
+      <!-- Slot 1: 이전 기획서 -->
       <div class="form-group">
-        <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
-          <span>TC 파일 가져오기</span>
-          <span style="font-size:11px;color:var(--muted);font-weight:400">Excel 업로드 또는 Google Sheets 연동</span>
-        </label>
-        <!-- 탭 선택 -->
-        <div class="tc-import-tabs">
-          <button type="button" class="tc-import-tab active" id="tabExcel" onclick="switchImportTab('excel')">📊 Excel 업로드</button>
-          <button type="button" class="tc-import-tab" id="tabSheets" onclick="switchImportTab('sheets')">🔗 Google Sheets</button>
+        <label class="form-label">📄 이전 기획서 <span style="color:#DC2626;">*</span></label>
+        <div class="src-dropzone" id="oldSpecDropzone" onclick="document.getElementById('oldSpecInput').click()"
+             style="border:2px dashed var(--border); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFAFA;">
+          📎 .md / .txt 파일 드래그 또는 클릭
         </div>
-        <!-- Excel 업로드 -->
-        <div id="panelExcel">
-          <div class="tc-upload-area" id="tcDropzone" onclick="document.getElementById('tcFileInput').click()">
-            📎 Excel(.xlsx/.xls) 또는 .md 파일을 드래그하거나 클릭하여 업로드
-          </div>
-          <input type="file" id="tcFileInput" accept=".xlsx,.xls,.md" style="display:none">
-        </div>
-        <!-- Google Sheets -->
-        <div id="panelSheets" class="hidden">
-          <input type="text" id="sheetsUrl" class="form-input"
-                 placeholder="https://docs.google.com/spreadsheets/d/...">
-          <div class="input-hint">⚠️ 시트가 <strong>링크가 있는 사용자에게 공개</strong> 설정이어야 합니다.</div>
-          <button type="button" class="btn btn-primary" style="margin-top:8px;width:100%" onclick="importSheets()">🔗 Sheets 가져오기</button>
-        </div>
-        <div id="tcUploadStatus" class="hidden" style="margin-top:8px;font-size:13px;color:var(--success);font-weight:600;"></div>
+        <input type="file" id="oldSpecInput" accept=".md,.markdown,.txt" style="display:none" onchange="handleDiffFileUpload(event, 'old')">
+        <div id="oldSpecStatus" style="font-size:12px; color:var(--success); margin-top:6px; display:none;"></div>
       </div>
 
-      <!-- 프로젝트명 (업로드 시) -->
-      <div class="form-group" id="uploadProjectNameGroup" style="display:none">
-        <label class="form-label">업로드 파일의 프로젝트명</label>
-        <input type="text" id="uploadProjectName" class="form-input"
-               placeholder="예: Supercycl 모바일 v2">
-        <div class="input-hint">저장 후 다음번에 드롭다운에서 선택할 수 있습니다.</div>
-      </div>
-
-      <!-- 변경사항 입력 -->
+      <!-- Slot 2: 새 기획서 -->
       <div class="form-group">
-        <label class="form-label">변경사항 설명</label>
-        <div class="info-box" style="margin-bottom:8px">
-          ✏️ <strong>무엇이 변경되었는지 구체적으로 작성하세요.</strong><br>
-          기능 추가/삭제/변경, 정책 변경, 화면 수정 등 모든 변경사항을 포함할수록 정확합니다.
+        <label class="form-label">📄 새 기획서 <span style="color:#DC2626;">*</span></label>
+        <div class="src-dropzone" id="newSpecDropzone" onclick="document.getElementById('newSpecInput').click()"
+             style="border:2px dashed var(--border); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFAFA;">
+          📎 .md / .txt 파일 드래그 또는 클릭
         </div>
-        <textarea id="changeDesc" class="form-input text-input-area"
-                  placeholder="예: 출금 한도가 1일 500만원에서 1000만원으로 변경됨. OTP 인증 단계가 추가됨. 단, 10만원 미만 소액 출금은 OTP 생략 가능."></textarea>
+        <input type="file" id="newSpecInput" accept=".md,.markdown,.txt" style="display:none" onchange="handleDiffFileUpload(event, 'new')">
+        <div id="newSpecStatus" style="font-size:12px; color:var(--success); margin-top:6px; display:none;"></div>
       </div>
 
-      <button class="btn btn-primary" id="startModifyBtn" onclick="startModify()">
-        ✏️ TC 수정 시작
+      <!-- Slot 3: 기존 TC -->
+      <div class="form-group">
+        <label class="form-label">📑 기존 TC 파일 <span style="font-size:11px;color:var(--muted);font-weight:400">(선택 — 없으면 신규 생성 흐름)</span></label>
+        <div class="src-dropzone" id="existingTcDropzone" onclick="document.getElementById('existingTcInput').click()"
+             style="border:2px dashed var(--border); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFAFA;">
+          📎 .xlsx / .md 파일 드래그 또는 클릭
+        </div>
+        <input type="file" id="existingTcInput" accept=".xlsx,.xls,.md,.markdown" style="display:none" onchange="handleDiffFileUpload(event, 'tc')">
+        <div id="existingTcStatus" style="font-size:12px; color:var(--success); margin-top:6px; display:none;"></div>
+      </div>
+
+      <button class="btn btn-primary" id="startDiffBtn" onclick="startDiffAnalyze()">
+        🔍 변경사항 분석
       </button>
+
+      <!-- 변경사항 리포트 영역 (분석 후 노출) -->
+      <div id="diffReportArea" class="hidden" style="margin-top:16px; padding:14px; background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px;">
+        <div style="font-size:14px; font-weight:700; color:#1E3A5F; margin-bottom:10px;">📊 변경사항 분석 결과</div>
+        <div id="diffReportSummary" style="font-size:13px; color:#4B5563; margin-bottom:10px;"></div>
+        <div id="diffReportSections"></div>
+        <div style="display:flex; gap:10px; margin-top:14px;">
+          <button class="btn btn-primary" style="flex:1" onclick="approveAndUpdate()">✅ 승인 후 TC 갱신 시작</button>
+          <button class="btn" style="flex:0 0 auto" onclick="cancelDiff()">취소</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -5444,12 +6205,19 @@ async function loadProjects() {
     const r = await fetch('/projects');
     projects = await r.json();
     const sel = document.getElementById('projectSelect');
+    const selMod = document.getElementById('modifyProjectSelect');
     sel.innerHTML = '<option value="">— 프로젝트를 선택하세요 —</option>';
+    if (selMod) selMod.innerHTML = '<option value="">— 단발성 작업 (프로젝트 없음) —</option>';
     projects.forEach(p => {
+      const label = p.name + ' (' + (p.updated_at || '신규') + ')';
       const opt = document.createElement('option');
-      opt.value = p.name;
-      opt.textContent = p.name + ' (' + (p.updated_at || '신규') + ')';
+      opt.value = p.name; opt.textContent = label;
       sel.appendChild(opt);
+      if (selMod) {
+        const opt2 = document.createElement('option');
+        opt2.value = p.name; opt2.textContent = label;
+        selMod.appendChild(opt2);
+      }
     });
     if (projects.length === 0) {
       const opt = document.createElement('option');
@@ -5625,7 +6393,393 @@ async function importSheets() {
   }
 }
 
-// TC 수정 시작
+// ── 기획서 diff 기반 TC 갱신 ─────────────────────────────────
+let _diffSid = null;
+let _diffReport = null;
+let _diffFiles = { old: null, new: null, tc: null };  // {old_spec_path, new_spec_path, existing_tc_path}
+
+async function handleDiffFileUpload(evt, slot) {
+  const file = evt.target.files[0];
+  if (!file) return;
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  const statusEl = document.getElementById(slot === 'old' ? 'oldSpecStatus' :
+                                            slot === 'new' ? 'newSpecStatus' : 'existingTcStatus');
+  const dropzone = document.getElementById(slot === 'old' ? 'oldSpecDropzone' :
+                                            slot === 'new' ? 'newSpecDropzone' : 'existingTcDropzone');
+
+  // 업로드: MD/TXT는 /upload-md, TC(xlsx/md)는 /upload-existing-tc
+  const fd = new FormData();
+  fd.append('file', file);
+  let endpoint, savedKind;
+  if (slot === 'tc') {
+    endpoint = '/upload-existing-tc';
+    savedKind = 'tc';
+  } else {
+    endpoint = '/upload-md';
+    savedKind = 'spec';
+  }
+  statusEl.style.display = 'block';
+  statusEl.style.color = '#2563EB';
+  statusEl.textContent = '⏳ 업로드 중...';
+  try {
+    const r = await fetch(endpoint, { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!d.ok) {
+      statusEl.style.color = '#DC2626';
+      statusEl.textContent = '❌ ' + (d.error || '업로드 실패');
+      return;
+    }
+    _diffFiles[slot] = d.filename;
+    statusEl.style.color = 'var(--success)';
+    let msg = '✓ ' + d.filename;
+    if (d.tc_count !== undefined) msg += ` (TC ${d.tc_count}개 감지)`;
+    statusEl.textContent = msg;
+    dropzone.style.borderColor = 'var(--success)';
+    dropzone.style.background = '#F0FDF4';
+  } catch(e) {
+    statusEl.style.color = '#DC2626';
+    statusEl.textContent = '❌ 네트워크 오류: ' + e.message;
+  }
+}
+
+async function startDiffAnalyze() {
+  if (!_diffFiles.old || !_diffFiles.new) {
+    alert('이전 기획서와 새 기획서를 모두 업로드하세요.');
+    return;
+  }
+  const projectName = document.getElementById('modifyProjectSelect').value || '';
+  const btn = document.getElementById('startDiffBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 분석 중...';
+  try {
+    const r = await fetch('/analyze-diff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_name: projectName,
+        old_spec_path: _diffFiles.old,
+        new_spec_path: _diffFiles.new,
+        existing_tc_path: _diffFiles.tc || '',
+      })
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      alert('분석 오류: ' + d.error);
+      btn.disabled = false; btn.textContent = '🔍 변경사항 분석';
+      return;
+    }
+    _diffSid = d.sid;
+    _diffReport = d.report;
+    if (d.no_changes) {
+      renderDiffReport(d.report, { noChanges: true, existingCount: d.existing_tc_count });
+    } else {
+      renderDiffReport(d.report, { noChanges: false, existingCount: d.existing_tc_count });
+    }
+    btn.disabled = false; btn.textContent = '🔍 변경사항 분석';
+  } catch(e) {
+    alert('네트워크 오류: ' + e.message);
+    btn.disabled = false; btn.textContent = '🔍 변경사항 분석';
+  }
+}
+
+function _escapeHtml(s) {
+  return (s || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+}
+
+function renderDiffReport(report, meta) {
+  const area = document.getElementById('diffReportArea');
+  const summaryEl = document.getElementById('diffReportSummary');
+  const sectionsEl = document.getElementById('diffReportSections');
+  area.classList.remove('hidden');
+
+  if (meta.noChanges) {
+    summaryEl.innerHTML = '🎉 <strong>변경사항이 없습니다.</strong> 두 기획서의 구조적 차이가 탐지되지 않았습니다.';
+    sectionsEl.innerHTML = '';
+    return;
+  }
+
+  if (!report.has_spec_codes) {
+    summaryEl.innerHTML = '⚠️ <strong>화면 코드(SCR/SCREEN/PAGE)가 탐지되지 않아 구조 비교가 어렵습니다.</strong><br>기획서에 <code>### SCR-001: 이름</code> 같은 헤더를 추가하거나, 「신규 TC 생성」 탭을 이용하세요.';
+    sectionsEl.innerHTML = '';
+    return;
+  }
+
+  const s = report.summary;
+  summaryEl.innerHTML = `🆕 신규 <strong>${s.added_n}</strong>개 · 🔄 수정 <strong>${s.modified_n}</strong>개 · 🗑️ 삭제 <strong>${s.removed_n}</strong>개 · ✅ 유지 <strong>${s.unchanged_n}</strong>개` +
+    (meta.existingCount ? ` <span style="color:var(--muted);">(기존 TC ${meta.existingCount}개)</span>` : '');
+
+  let html = '';
+
+  // 툴바: 전체 선택/해제 + 모두 펼치기/접기
+  const totalItems = report.added.length + report.modified.length + report.removed.length;
+  if (totalItems > 0) {
+    html += `<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+      <button type="button" onclick="toggleSectionSelection('all', true)" style="padding:4px 10px;font-size:11px;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:4px;cursor:pointer;font-weight:600;color:#1E40AF;">✓ 전체 선택 (${totalItems}개)</button>
+      <button type="button" onclick="toggleSectionSelection('all', false)" style="padding:4px 10px;font-size:11px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">☐ 전체 해제</button>
+      ${report.modified.length > 0 ? `
+        <span style="width:1px;background:#E5E7EB;margin:0 4px;"></span>
+        <button type="button" onclick="toggleAllDiffDetails(true)" style="padding:4px 10px;font-size:11px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">▼ 모두 펼치기</button>
+        <button type="button" onclick="toggleAllDiffDetails(false)" style="padding:4px 10px;font-size:11px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">▲ 모두 접기</button>
+      ` : ''}
+    </div>`;
+  }
+
+  if (report.added.length) {
+    html += `<div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;">
+      <strong style="color:#047857;">🆕 신규 화면 (승인 시 TC 생성) <span style="font-size:11px;color:var(--muted);font-weight:normal;">${report.added.length}개</span></strong>
+      <div style="display:flex;gap:4px;">
+        <button type="button" onclick="toggleSectionSelection('add', true)" style="padding:2px 8px;font-size:11px;background:#F0FDF4;border:1px solid #BBF7D0;border-radius:4px;cursor:pointer;">✓ 전체 선택</button>
+        <button type="button" onclick="toggleSectionSelection('add', false)" style="padding:2px 8px;font-size:11px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">☐ 전체 해제</button>
+      </div>
+    </div>`;
+    html += '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;">';
+    for (const [idx, a] of report.added.entries()) {
+      const detailsId = `diff-add-${idx}`;
+      html += `<div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:6px;overflow:hidden;">
+        <label style="display:flex;align-items:flex-start;gap:8px;padding:6px 10px;cursor:pointer;">
+          <input type="checkbox" class="diff-add-chk" value="${_escapeHtml(a.code)}" checked style="margin-top:3px;">
+          <div style="flex:1;"><strong>${_escapeHtml(a.code)}</strong> — ${_escapeHtml(a.name)} <span style="font-size:11px;color:var(--muted);">(예상 TC ~${a.estimated_tc_count}개)</span></div>
+          ${a.body ? `<button type="button" onclick="toggleDiffDetail('${detailsId}', this)" style="margin-left:auto;padding:2px 8px;font-size:11px;background:#FFFFFF;border:1px solid #86EFAC;border-radius:4px;cursor:pointer;white-space:nowrap;">▸ 내용</button>` : ''}
+        </label>
+        ${a.body ? `<div id="${detailsId}" style="display:none;padding:8px 12px;border-top:1px solid #BBF7D0;background:#FFFFFF;">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">신규 화면 내용 (미리보기)</div>
+          <pre style="font-size:11px;background:#F9FAFB;padding:8px;border-radius:4px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;">${_escapeHtml(a.body)}</pre>
+        </div>` : ''}
+      </div>`;
+    }
+    html += '</div>';
+  }
+  if (report.modified.length) {
+    html += `<div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;">
+      <strong style="color:#B45309;">🔄 수정 화면 (승인 시 해당 TC ID 유지하며 재작성) <span style="font-size:11px;color:var(--muted);font-weight:normal;">${report.modified.length}개</span></strong>
+      <div style="display:flex;gap:4px;">
+        <button type="button" onclick="toggleSectionSelection('mod', true)" style="padding:2px 8px;font-size:11px;background:#FEF3C7;border:1px solid #FDE68A;border-radius:4px;cursor:pointer;">✓ 전체 선택</button>
+        <button type="button" onclick="toggleSectionSelection('mod', false)" style="padding:2px 8px;font-size:11px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">☐ 전체 해제</button>
+      </div>
+    </div>`;
+    html += '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;">';
+    for (const [idx, m] of report.modified.entries()) {
+      const tcIds = (m.affected_tc_ids || []).slice(0, 5).join(', ') + (m.affected_count > 5 ? ` 외 ${m.affected_count - 5}` : '');
+      const detailsId = `diff-mod-${idx}`;
+      html += `<div style="background:#FEF3C7;border:1px solid #FDE68A;border-radius:6px;overflow:hidden;">
+        <label style="display:flex;align-items:flex-start;gap:8px;padding:6px 10px;cursor:pointer;">
+          <input type="checkbox" class="diff-mod-chk" value="${_escapeHtml(m.code)}" ${m.affected_count>0?'checked':''} style="margin-top:3px;">
+          <div style="flex:1;"><strong>${_escapeHtml(m.code)}</strong> — ${_escapeHtml(m.name)}<br>
+            <span style="font-size:11px;color:#92400E;">영향 TC: ${m.affected_count}개 ${tcIds ? '(' + _escapeHtml(tcIds) + ')' : '(매핑 없음)'}</span>
+          </div>
+          <button type="button" onclick="toggleDiffDetail('${detailsId}', this)" style="margin-left:auto;padding:2px 8px;font-size:11px;background:#FFFFFF;border:1px solid #FCD34D;border-radius:4px;cursor:pointer;white-space:nowrap;">▸ 변경 보기</button>
+        </label>
+        <div id="${detailsId}" style="display:none;padding:8px 12px;border-top:1px solid #FDE68A;background:#FFFFFF;">
+          <div style="display:flex;gap:8px;margin-bottom:6px;font-size:11px;">
+            <button type="button" onclick="switchDiffMode('${detailsId}', 'unified')" class="diff-mode-btn diff-mode-unified-${idx}" style="padding:3px 10px;background:#FDE68A;border:1px solid #F59E0B;border-radius:4px;cursor:pointer;font-weight:600;">🔀 변경점만 (기본)</button>
+            <button type="button" onclick="switchDiffMode('${detailsId}', 'sidebyside')" class="diff-mode-btn diff-mode-sidebyside-${idx}" style="padding:3px 10px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">📄 전체 2단 보기</button>
+          </div>
+          <div class="diff-view-unified-${idx}">${_renderUnifiedDiff(m.line_diff)}</div>
+          <div class="diff-view-sidebyside-${idx}" style="display:none;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+              <div>
+                <div style="font-size:11px;color:#991B1B;font-weight:600;margin-bottom:4px;">— 이전</div>
+                <pre style="font-size:11px;background:#FEF2F2;padding:8px;border-radius:4px;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;">${_escapeHtml(m.old_body || '(비어있음)')}</pre>
+              </div>
+              <div>
+                <div style="font-size:11px;color:#065F46;font-weight:600;margin-bottom:4px;">+ 새</div>
+                <pre style="font-size:11px;background:#F0FDF4;padding:8px;border-radius:4px;max-height:260px;overflow:auto;white-space:pre-wrap;">${_escapeHtml(m.new_body || '(비어있음)')}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  if (report.removed.length) {
+    html += `<div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;">
+      <strong style="color:#6B7280;">🗑️ 삭제 화면 (승인 시 기존 TC에 Deprecated 표시) <span style="font-size:11px;color:var(--muted);font-weight:normal;">${report.removed.length}개</span></strong>
+      <div style="display:flex;gap:4px;">
+        <button type="button" onclick="toggleSectionSelection('rem', true)" style="padding:2px 8px;font-size:11px;background:#F3F4F6;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">✓ 전체 선택</button>
+        <button type="button" onclick="toggleSectionSelection('rem', false)" style="padding:2px 8px;font-size:11px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;cursor:pointer;">☐ 전체 해제</button>
+      </div>
+    </div>`;
+    html += '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;">';
+    for (const [idx, r] of report.removed.entries()) {
+      const tcIds = (r.affected_tc_ids || []).slice(0, 5).join(', ') + (r.affected_count > 5 ? ` 외 ${r.affected_count - 5}` : '');
+      html += `<label style="display:flex;align-items:flex-start;gap:8px;padding:6px 10px;background:#F3F4F6;border:1px solid #D1D5DB;border-radius:6px;cursor:pointer;">
+        <input type="checkbox" class="diff-rem-chk" value="${_escapeHtml(r.code)}" ${r.affected_count>0?'checked':''} style="margin-top:3px;">
+        <div style="flex:1;"><strong>${_escapeHtml(r.code)}</strong> — ${_escapeHtml(r.name)}<br>
+          <span style="font-size:11px;color:var(--muted);">영향 TC: ${r.affected_count}개 ${tcIds ? '(' + _escapeHtml(tcIds) + ')' : '(매핑 없음)'}</span>
+        </div>
+      </label>`;
+    }
+    html += '</div>';
+  }
+  sectionsEl.innerHTML = html;
+
+  // 체크박스 변경 시 승인 버튼 상태 동기화
+  document.querySelectorAll('.diff-add-chk, .diff-mod-chk, .diff-rem-chk').forEach(cb => {
+    cb.addEventListener('change', _updateApproveButtonState);
+  });
+  _updateApproveButtonState();
+}
+
+function cancelDiff() {
+  document.getElementById('diffReportArea').classList.add('hidden');
+  _diffSid = null;
+  _diffReport = null;
+}
+
+// 섹션(add/mod/rem/all)별 체크박스 일괄 선택/해제
+function toggleSectionSelection(section, checked) {
+  const selectors = {
+    add: '.diff-add-chk',
+    mod: '.diff-mod-chk',
+    rem: '.diff-rem-chk',
+    all: '.diff-add-chk, .diff-mod-chk, .diff-rem-chk',
+  };
+  const sel = selectors[section];
+  if (!sel) return;
+  document.querySelectorAll(sel).forEach(cb => {
+    cb.checked = checked;
+  });
+  _updateApproveButtonState();
+}
+
+// 라인 단위 diff를 GitHub 스타일 unified diff로 렌더
+function _renderUnifiedDiff(blocks) {
+  if (!blocks || !blocks.length) {
+    return '<div style="font-size:12px;color:var(--muted);padding:8px;">변경 정보가 없습니다.</div>';
+  }
+  const lineStyle = 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;padding:2px 8px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent;';
+  let html = '<div style="max-height:360px;overflow:auto;background:#F9FAFB;border:1px solid #E5E7EB;border-radius:4px;">';
+  for (const blk of blocks) {
+    if (blk.tag === 'truncated') {
+      html += `<div style="${lineStyle}color:var(--muted);font-style:italic;padding:4px 8px;">... (이후 내용은 생략)</div>`;
+      continue;
+    }
+    if (blk.tag === 'equal') {
+      for (const ln of blk.old_lines) {
+        const txt = ln === '... (중략)' ? '  …' : '  ' + ln;
+        html += `<div style="${lineStyle}color:#6B7280;">${_escapeHtml(txt)}</div>`;
+      }
+      continue;
+    }
+    if (blk.tag === 'delete' || blk.tag === 'replace') {
+      for (const ln of blk.old_lines) {
+        html += `<div style="${lineStyle}background:#FEE2E2;border-left-color:#DC2626;color:#991B1B;">− ${_escapeHtml(ln)}</div>`;
+      }
+    }
+    if (blk.tag === 'insert' || blk.tag === 'replace') {
+      for (const ln of blk.new_lines) {
+        html += `<div style="${lineStyle}background:#DCFCE7;border-left-color:#16A34A;color:#166534;">+ ${_escapeHtml(ln)}</div>`;
+      }
+    }
+  }
+  html += '</div>';
+  return html;
+}
+
+function switchDiffMode(detailsId, mode) {
+  const container = document.getElementById(detailsId);
+  if (!container) return;
+  const idxMatch = detailsId.match(/\d+$/);
+  if (!idxMatch) return;
+  const idx = idxMatch[0];
+  const unified = container.querySelector('.diff-view-unified-' + idx);
+  const side    = container.querySelector('.diff-view-sidebyside-' + idx);
+  const btnU    = container.querySelector('.diff-mode-unified-' + idx);
+  const btnS    = container.querySelector('.diff-mode-sidebyside-' + idx);
+  if (mode === 'unified') {
+    if (unified) unified.style.display = 'block';
+    if (side)    side.style.display = 'none';
+    if (btnU) { btnU.style.background = '#FDE68A'; btnU.style.borderColor = '#F59E0B'; btnU.style.fontWeight = '600'; }
+    if (btnS) { btnS.style.background = '#FFFFFF'; btnS.style.borderColor = '#D1D5DB'; btnS.style.fontWeight = 'normal'; }
+  } else {
+    if (unified) unified.style.display = 'none';
+    if (side)    side.style.display = 'block';
+    if (btnU) { btnU.style.background = '#FFFFFF'; btnU.style.borderColor = '#D1D5DB'; btnU.style.fontWeight = 'normal'; }
+    if (btnS) { btnS.style.background = '#FDE68A'; btnS.style.borderColor = '#F59E0B'; btnS.style.fontWeight = '600'; }
+  }
+}
+
+// 수정 화면 카드의 변경 내용 펼침/접힘
+function toggleDiffDetail(detailsId, btn) {
+  const el = document.getElementById(detailsId);
+  if (!el) return;
+  const opened = el.style.display !== 'none';
+  el.style.display = opened ? 'none' : 'block';
+  if (btn) {
+    const base = btn.textContent.replace(/^[▸▾]\s*/, '');
+    btn.textContent = (opened ? '▸ ' : '▾ ') + base;
+  }
+}
+
+function toggleAllDiffDetails(open) {
+  document.querySelectorAll('[id^="diff-mod-"], [id^="diff-add-"]').forEach(el => {
+    if (!el.id.match(/^diff-(mod|add)-\d+$/)) return;
+    el.style.display = open ? 'block' : 'none';
+  });
+  // 버튼 라벨 동기화 — 각 카드의 "▸/▾" 표시
+  document.querySelectorAll('button').forEach(btn => {
+    const t = btn.textContent || '';
+    if (t.includes('변경 보기') || t.endsWith('내용')) {
+      btn.textContent = (open ? '▾ ' : '▸ ') + t.replace(/^[▸▾]\s*/, '');
+    }
+  });
+}
+
+function _getApprovedSelection() {
+  return {
+    added:    [...document.querySelectorAll('.diff-add-chk:checked')].map(el => el.value),
+    modified: [...document.querySelectorAll('.diff-mod-chk:checked')].map(el => el.value),
+    removed:  [...document.querySelectorAll('.diff-rem-chk:checked')].map(el => el.value),
+  };
+}
+
+function _updateApproveButtonState() {
+  const btn = document.querySelector('#diffReportArea .btn-primary');
+  if (!btn) return;
+  const sel = _getApprovedSelection();
+  const total = sel.added.length + sel.modified.length + sel.removed.length;
+  if (total === 0) {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.style.cursor = 'not-allowed';
+    btn.textContent = '⚠️ 승인할 항목을 1개 이상 선택하세요';
+  } else {
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.style.cursor = 'pointer';
+    btn.textContent = `✅ 승인 후 TC 갱신 시작 (${total}개)`;
+  }
+}
+
+async function approveAndUpdate() {
+  if (!_diffSid) { alert('분석 세션이 없습니다. 먼저 분석을 실행하세요.'); return; }
+  const approved = _getApprovedSelection();
+  if (approved.added.length + approved.modified.length + approved.removed.length === 0) {
+    alert('승인할 항목을 최소 1개 이상 선택하세요.');
+    return;
+  }
+  document.getElementById('card2').classList.remove('hidden');
+  setStepBar(2);
+  document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.getElementById('stageLabel').textContent = 'TC 갱신 시작 중...';
+
+  try {
+    const r = await fetch('/update-tc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sid: _diffSid, approved: approved })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('오류: ' + d.error); return; }
+    currentSid = d.sid;
+    connectStream(d.sid);
+  } catch(e) {
+    alert('네트워크 오류: ' + e.message);
+  }
+}
+
+// TC 수정 시작 (기존 — 레거시, 현재 UI에서는 사용 안 함)
 async function startModify() {
   const projectName = document.getElementById('projectSelect').value;
   const changeDesc  = document.getElementById('changeDesc').value.trim();

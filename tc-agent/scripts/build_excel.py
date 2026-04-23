@@ -193,6 +193,9 @@ def parse_tc_markdown(filepath):
         tc["priority"] = extract_table_field(block, "우선순위") or ""
         tc["platform"] = extract_table_field(block, "플랫폼") or ""
         tc["screen"]   = extract_table_field(block, "연관 화면") or ""
+        # 변경 이력 필드 (기획서 diff 기반 업데이트에서 주입됨)
+        tc["status"]         = extract_table_field(block, "상태") or ""
+        tc["change_reason"]  = extract_table_field(block, "수정 사유") or ""
 
         # 화면 코드 추출 (SCR-xxx / SCREEN-xxx / PAGE-xxx). 여러 개 가능 — 쉼표 분리.
         # "연관 화면" 값에서 코드만 뽑아낸다. 코드가 없으면 빈 문자열.
@@ -424,6 +427,7 @@ def _tc_list_columns(config):
 
     fixed = [
         ("Smoke",          8),
+        ("상태",               11),
         ("TC ID",              14),
         ("화면 코드",           12),
         ("우선순위",             9),
@@ -434,6 +438,7 @@ def _tc_list_columns(config):
         ("사전 조건",           28),
         ("스텝",               40),
         ("기대 결과",           38),
+        ("수정 사유",           28),
     ]
 
     all_cols = fixed
@@ -615,6 +620,14 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
             row_idx = 0
 
         bg_base = C_ROW_A if row_idx % 2 == 0 else C_ROW_B
+        # 변경 이력 상태별 배경색 덮어쓰기 (zebra 보다 우선)
+        _status = (tc.get("status") or "").strip()
+        if "신규" in _status or "🆕" in _status:
+            bg_base = "DCFCE7"   # 연한 초록
+        elif "수정" in _status or "🔄" in _status:
+            bg_base = "FEF3C7"   # 연한 노랑
+        elif "Deprecated" in _status or "🗑" in _status or "폐기" in _status:
+            bg_base = "E5E7EB"   # 회색
 
         # 대분류 표시
         major_display = tc.get("major", "") or tc["domain"]
@@ -633,6 +646,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
 
         col_data = {
             "Smoke":    "Y" if tc.get("smoke") else "",
+            "상태":           tc.get("status", ""),  # 🆕/🔄/🗑️/빈값
             "TC ID":         tc["id"],
             "우선순위":       _priority_to_kr(tc["priority"]),
             "거래소":         exchange_text,
@@ -643,6 +657,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
             "사전 조건":      tc["given"],
             "스텝":          tc["when"],
             "기대 결과":      tc["then"],
+            "수정 사유":      tc.get("change_reason", ""),
         }
 
         row_values = [col_data.get(name, "") for name in col_names]
@@ -661,7 +676,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
             else:
                 cbg  = bg_base
                 bold = tc["star"]
-            align = "center" if col_name in ("Smoke", "우선순위", "거래소", "화면 코드") else "left"
+            align = "center" if col_name in ("Smoke", "상태", "우선순위", "거래소", "화면 코드") else "left"
             set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg, align_h=align)
 
         ws.row_dimensions[r].height = 80
@@ -669,7 +684,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
         row_idx += 1
 
     # 컬럼 너비 자동 조정 (75퍼센타일 기준)
-    min_widths = {"Smoke": 8, "TC ID": 18, "우선순위": 9, "거래소": 10, "화면 코드": 12}
+    min_widths = {"Smoke": 8, "상태": 11, "TC ID": 18, "우선순위": 9, "거래소": 10, "화면 코드": 12, "수정 사유": 24}
     widths = _calc_col_widths(col_names, all_row_data, min_widths=min_widths, max_width=55)
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -880,6 +895,57 @@ def build_traceability(ws, tcs) -> int:
     return sum(1 for c in sorted_codes if c != "(화면 코드 없음)")
 
 
+# ── 변경 이력 시트 ───────────────────────────────────────────────────
+
+def build_change_history(ws, tcs) -> int:
+    """상태가 비어있지 않은 TC만 모아 변경 이력 시트 생성. 반환: 변경 TC 수.
+    상태(🆕/🔄/🗑️), TC ID, 대분류/중분류, 화면 코드, 수정 사유 표기.
+    """
+    changed = [t for t in tcs if (t.get("status") or "").strip()]
+    if not changed:
+        return 0
+    headers = ["상태", "TC ID", "화면 코드", "대분류", "중분류", "수정 사유"]
+    widths  = [12, 16, 12, 16, 18, 50]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        set_cell(ws, 1, i, h, bold=True, bg=C_DARK, font_color=C_WHITE,
+                 size=10, align_h="center")
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 22
+
+    # 정렬: 🆕 신규 → 🔄 수정 → 🗑️ Deprecated 순
+    def order_key(tc):
+        s = tc.get("status", "")
+        if "신규" in s or "🆕" in s: return (0, tc.get("id", ""))
+        if "수정" in s or "🔄" in s: return (1, tc.get("id", ""))
+        if "Deprecated" in s or "🗑" in s or "폐기" in s: return (2, tc.get("id", ""))
+        return (3, tc.get("id", ""))
+    changed.sort(key=order_key)
+
+    r = 2
+    for tc in changed:
+        s = tc.get("status", "")
+        if "신규" in s or "🆕" in s:
+            bg = "DCFCE7"
+        elif "수정" in s or "🔄" in s:
+            bg = "FEF3C7"
+        elif "Deprecated" in s or "🗑" in s or "폐기" in s:
+            bg = "E5E7EB"
+        else:
+            bg = C_ROW_A
+        set_cell(ws, r, 1, s, bold=True, bg=bg, align_h="center")
+        set_cell(ws, r, 2, tc.get("id", ""), bg=bg, align_h="center")
+        set_cell(ws, r, 3, tc.get("screen_code", ""), bg=bg, align_h="center")
+        set_cell(ws, r, 4, tc.get("major", ""), bg=bg, align_h="left")
+        set_cell(ws, r, 5, tc.get("middle", ""), bg=bg, align_h="left")
+        set_cell(ws, r, 6, tc.get("change_reason", ""), bg=bg, align_h="left")
+        ws.row_dimensions[r].height = 22
+        r += 1
+
+    ws.auto_filter.ref = f"A1:F{r-1}"
+    ws.freeze_panes = "A2"
+    return len(changed)
+
+
 # ── 시트명 생성 ────────────────────────────────────────────────────
 # Excel 제약: 31자 이내, `: \ / ? * [ ]` 금지, 같은 이름 중복 금지.
 
@@ -944,6 +1010,12 @@ def main():
         print(f"  → Traceability Matrix 생성 — 유니크 화면 코드 {scr_count}개")
     else:
         print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
+
+    # 변경 이력 시트: 상태가 있는 TC가 하나라도 있으면 추가
+    if any((t.get("status") or "").strip() for t in tcs):
+        ws_changes = wb.create_sheet("🔄 변경 이력")
+        chg_n = build_change_history(ws_changes, tcs)
+        print(f"  → 변경 이력 시트 생성 — {chg_n}개 변경 TC")
 
     # 대분류별 그룹핑 (major 컬럼 기준, 없으면 domain 코드 폴백)
     major_groups = defaultdict(list)
