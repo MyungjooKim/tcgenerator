@@ -497,6 +497,18 @@ def push_error(sess, msg: str):
     sess["status"] = "error"
     push(sess, "error", {"msg": msg})
 
+
+def count_unique_tc_ids(tc_content: str) -> int:
+    """tc_content에서 유니크 TC ID 개수를 반환.
+    build_excel의 parse_tc_markdown이 TC ID 기반 dedup을 수행하므로,
+    웹에 표시하는 값도 동일한 유니크 기준으로 맞춘다.
+    """
+    if not tc_content:
+        return 0
+    ids = re.findall(r"^###\s+\*?\*?([A-Z]{2,}-[A-Z0-9]+-\d+)", tc_content, re.MULTILINE)
+    return len(set(ids)) if ids else 0
+
+
 # ── Claude API 헬퍼 ────────────────────────────────────────────────────────────
 def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 8192) -> str:
     try:
@@ -1320,6 +1332,9 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
             push_log(sess, f"[TC 작성] {domain_code} — Suite-based 스킴 ({scheme_reason})")
 
         cumulative_seq = 1  # Suite-based 전용 (Screen-based는 매 중분류마다 1로 리셋)
+        # Screen-based 스킴: 이미 사용한 ScreenCode 추적 — 같은 코드가 여러 중분류에 매핑되면
+        # 두 번째부터 접미사를 붙여 TC ID 충돌(SC-CON-001 3회 생성 등)을 방지한다.
+        used_screen_codes = set()
 
         for mi, middle in enumerate(middles):
             label = f"{domain_code}/{middle}" if middle != "전체" else domain_code
@@ -1328,7 +1343,18 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
             screen_character = ""
             screen_navigation = ""
             if screen_based and middle != "전체":
-                effective_code = resolve_screen_code(middle, screen_map)
+                raw_code = resolve_screen_code(middle, screen_map)
+                # 충돌 해소: 같은 코드가 이미 쓰였으면 2/3/... 접미사 부여
+                effective_code = raw_code
+                if raw_code in used_screen_codes:
+                    for suffix in range(2, 100):
+                        cand = f"{raw_code}{suffix}"
+                        if cand not in used_screen_codes:
+                            effective_code = cand
+                            push_log(sess, f"[TC 작성] ⚠️ ScreenCode 충돌 감지 — {raw_code} → {effective_code} ({middle})")
+                            break
+                used_screen_codes.add(effective_code)
+
                 screen_character = resolve_screen_character(middle, screen_map)
                 screen_navigation = resolve_screen_navigation(middle, screen_map)
                 starting_seq = 1  # 화면 단위 독립 네임스페이스
@@ -3109,6 +3135,13 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         clear_pipeline_state(project_name)  # 완료 시 상태 파일 정리
         push_log(sess, f"[저장] TC 파일 저장: {tc_md_path.name}")
 
+        # 유니크 TC ID 수 — Excel 빌드 후 dedup 결과와 일치하도록 재계산
+        unique_tc = count_unique_tc_ids(tc_content)
+        if unique_tc and unique_tc != total_tc:
+            push_log(sess, f"[완료] TC ID 중복 제거 — {total_tc}개 헤더 중 유니크 {unique_tc}개")
+            total_tc = unique_tc
+            min_tc = max(1, round(total_tc * 0.35))
+
         sess["result"] = excel_path
         sess["status"] = "done"
         push_stage(sess, 5, "완료", 100)
@@ -3280,6 +3313,13 @@ TC 형식 규칙:
         tc_md_path = TC_FILES_DIR / f"{safe_name}_{today}.md"
         tc_md_path.write_text(modified_tc, encoding="utf-8")
         save_project(project_name, str(tc_md_path), str(excel_path))
+
+        # 유니크 TC ID 수 — Excel dedup 결과와 일치하도록 재계산
+        unique_tc = count_unique_tc_ids(modified_tc)
+        if unique_tc and unique_tc != total_tc:
+            push_log(sess, f"[완료] TC ID 중복 제거 — {total_tc}개 헤더 중 유니크 {unique_tc}개")
+            total_tc = unique_tc
+            min_tc = max(1, round(total_tc * 0.35))
 
         sess["result"] = excel_path
         sess["status"] = "done"
@@ -4117,6 +4157,9 @@ def update_tc():
                 encoding="utf-8"
             )
 
+            # 유니크 TC ID 수 — Excel dedup 결과와 일치하도록 재계산
+            unique_tc = count_unique_tc_ids(final_md) or len(existing_tcs)
+
             sess["result"] = excel_path
             sess["status"] = "done"
             push_stage(sess, 5, "완료", 100)
@@ -4124,9 +4167,9 @@ def update_tc():
                 "filename": excel_path.name,
                 "size": excel_path.stat().st_size,
                 "sid": sess["id"],
-                "total_tc": len(existing_tcs),
+                "total_tc": unique_tc,
                 "smoke_tc": sess.get("smoke_tc"),
-                "min_tc": max(1, round(len(existing_tcs) * 0.35)),
+                "min_tc": max(1, round(unique_tc * 0.35)),
                 "update_summary": {
                     "modified": modified_count,
                     "deprecated": deprecated_count,
