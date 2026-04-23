@@ -5388,10 +5388,66 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge">v0.9.5</span>
+    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.6 릴리즈 노트 보기">v0.9.6</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
+
+<!-- What's new 배너 (v0.9.6 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
+<div id="whatsNewBanner" style="display:none; margin:12px 0; padding:12px 16px; background:linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%); border:1px solid #93C5FD; border-radius:10px;">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
+    <div style="flex:1; font-size:13px; color:#1E40AF;">
+      🎉 <strong>v0.9.6 업데이트 — 새로워진 기능</strong>
+      <div style="margin-top:6px; font-size:12px; color:#374151; line-height:1.6;">
+        • 「기존 TC 수정」 탭 전면 개편 — 이전/새 기획서 비교 기반 자동 갱신<br>
+        • Quick 모드 추가 / 정책 반영 모드 최적화 (토큰 ~40% 절감)<br>
+        • Excel: 대분류별 시트 분할 + 🔗 Traceability + 🔄 변경 이력 시트<br>
+        • TC ID 충돌·중복 버그 수정 / 웹↔Excel 카운트 일치
+      </div>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:6px;">
+      <button onclick="showWhatsNew()" style="padding:4px 10px; font-size:11px; background:#2563EB; color:#FFFFFF; border:none; border-radius:6px; cursor:pointer; white-space:nowrap;">📖 자세히 보기</button>
+      <button onclick="dismissWhatsNew()" style="padding:4px 10px; font-size:11px; background:#FFFFFF; color:#6B7280; border:1px solid #D1D5DB; border-radius:6px; cursor:pointer; white-space:nowrap;">✕ 닫기</button>
+    </div>
+  </div>
+</div>
+
+<!-- What's new 상세 모달 -->
+<div id="whatsNewModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
+  <div style="background:#FFFFFF; border-radius:12px; max-width:720px; width:92%; max-height:84vh; overflow:hidden; display:flex; flex-direction:column;">
+    <div style="padding:16px 20px; border-bottom:1px solid #E5E7EB; display:flex; justify-content:space-between; align-items:center;">
+      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.6 릴리즈 노트</strong></div>
+      <button onclick="document.getElementById('whatsNewModal').style.display='none'" style="border:none; background:none; font-size:20px; cursor:pointer; color:#6B7280;">✕</button>
+    </div>
+    <div style="padding:16px 20px; overflow:auto; font-size:13px; line-height:1.7; color:#374151;">
+      <h3 style="margin:0 0 8px; color:#1E40AF;">🎉 v0.9.6 — 2026-04-23</h3>
+      <p><strong>「기존 TC 수정」 탭 전면 개편 · 파이프라인 효율 개선 · SCR Traceability</strong></p>
+      <h4 style="color:#065F46; margin-top:16px;">✨ 주요 신규 기능</h4>
+      <ul>
+        <li><strong>기획서 변경 기반 TC 갱신</strong>: 이전/새 기획서를 업로드하면 자동으로 신규/수정/삭제 화면을 탐지하고 기존 TC ID를 유지한 채 재작성합니다. GitHub 스타일 diff 뷰어로 변경점을 한눈에 확인.</li>
+        <li><strong>생성 모드 선택</strong>: 대용량 문서는 정책 반영 모드, 작은 문서는 Quick 모드 선택 가능 (토큰 ~40% 절감).</li>
+        <li><strong>Traceability 시트</strong>: 화면 코드(SCR-xxx)별 TC 역참조 매트릭스가 Excel에 자동 생성.</li>
+        <li><strong>Excel 구조 개선</strong>: 대분류별 시트 분리, 화면 코드 컬럼, 상태·수정 사유 컬럼, 변경 이력 시트.</li>
+      </ul>
+      <h4 style="color:#B45309; margin-top:16px;">🐛 주요 버그 수정</h4>
+      <ul>
+        <li>TC ID 충돌로 21개 손실되던 현상 (ScreenCode CON 중복 → CON2/CON3 자동 회피)</li>
+        <li>웹 표시 TC 개수와 Excel 실제 개수 불일치</li>
+        <li>프로젝트 드롭다운 유령 항목 잔존</li>
+        <li>Review 단계 중복 TC 생성</li>
+        <li>외부 URL fetch TLS 검증 비활성화 (기본 활성으로 복구)</li>
+      </ul>
+      <h4 style="color:#6B7280; margin-top:16px;">💡 참고</h4>
+      <ul>
+        <li>실행 방법 변경 없음 — 기존 `시작하기_v2.command` / `시작하기_v2_Windows.bat` 그대로 사용</li>
+        <li>전체 변경 이력은 프로젝트 루트 <code>CHANGELOG.md</code> 참고</li>
+      </ul>
+    </div>
+    <div style="padding:12px 20px; border-top:1px solid #E5E7EB; text-align:right;">
+      <button onclick="document.getElementById('whatsNewModal').style.display='none'" style="padding:6px 16px; background:#2563EB; color:#FFFFFF; border:none; border-radius:6px; cursor:pointer;">확인</button>
+    </div>
+  </div>
+</div>
 
 <!-- 진행 스텝 바 -->
 <div class="steps-bar">
@@ -7072,11 +7128,35 @@ function onGenModeChanged() {
   });
 }
 
-// 초기 선택 강조
+// 초기 선택 강조 + What's New 배너 체크
 if (typeof document !== 'undefined') {
   document.addEventListener('DOMContentLoaded', function() {
     try { onGenModeChanged(); refreshGenerationModeHint(); } catch(e) {}
+    try { checkWhatsNewBanner(); } catch(e) {}
   });
+}
+
+// v0.9.6 What's New 배너 표시 — localStorage에 dismiss 기록이 없으면 자동 표시
+const _WHATS_NEW_VERSION = 'v0.9.6';
+const _WHATS_NEW_KEY = 'tc_whatsnew_dismissed_' + _WHATS_NEW_VERSION;
+
+function checkWhatsNewBanner() {
+  try {
+    if (localStorage.getItem(_WHATS_NEW_KEY) === '1') return;
+  } catch(e) {}
+  const banner = document.getElementById('whatsNewBanner');
+  if (banner) banner.style.display = 'block';
+}
+
+function dismissWhatsNew() {
+  const banner = document.getElementById('whatsNewBanner');
+  if (banner) banner.style.display = 'none';
+  try { localStorage.setItem(_WHATS_NEW_KEY, '1'); } catch(e) {}
+}
+
+function showWhatsNew() {
+  const modal = document.getElementById('whatsNewModal');
+  if (modal) modal.style.display = 'flex';
 }
 
 function getSelectedGenerationMode() {
