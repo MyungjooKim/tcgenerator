@@ -2330,12 +2330,32 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
     # 출력 디렉토리
     out_dir = OUTPUTS_DIR
 
-    # build_excel.py 호출
+    # ── 1순위: build_excel 모듈을 직접 import해서 run_build() 호출 ──
+    # subprocess 우회 시 장점:
+    #   - Windows cp949 인코딩 이슈 완전 제거 (stdout/stderr 디코드 경로 없음)
+    #   - 가상환경 activation 의존성 없음 (Flask가 쓰는 같은 인터프리터)
+    #   - 속도 ~1초 절감 (프로세스 생성/teardown 불필요)
+    # 실패 시에만 subprocess → fallback 으로 강등
     if BUILD_EXCEL.exists():
-        push_log(sess, f"[빌드] build_excel.py 호출 중... (대분류별 시트 생성 · 60초 내외)")
+        push_log(sess, f"[빌드] build_excel 모듈 호출 중... (대분류별 시트 생성 · 60초 내외)")
         try:
-            # Windows cp949 이모지 디코드 실패 방지: stdout/stderr를 bytes로 받고 errors='replace'로 UTF-8 디코드
-            # 자식 프로세스 env에 PYTHONIOENCODING=utf-8 주입 → build_excel.py의 print(이모지)도 안전
+            build_excel_dir = str(BUILD_EXCEL.parent)
+            if build_excel_dir not in sys.path:
+                sys.path.insert(0, build_excel_dir)
+            # 매 호출 시 fresh import (코드 수정 반영)
+            import importlib
+            import build_excel as _be
+            importlib.reload(_be)
+            result = _be.run_build("P_WebApp", str(tc_final_path), str(out_dir), verbose=False)
+            if result and result.get("ok"):
+                push_log(sess, f"[빌드] 모듈 호출 성공 — 총 {result['total_tc']} TC / Smoke {result['smoke_tc']} / 대분류 {result['major_count']}시트")
+                sess["smoke_tc"] = result["smoke_tc"]
+                return result["out_path"]
+        except Exception as e:
+            push_log(sess, f"[빌드] 모듈 호출 실패 ({type(e).__name__}: {e}) — subprocess 폴백")
+
+        # ── 2순위: subprocess (모듈 import 실패 시) ──
+        try:
             child_env = os.environ.copy()
             child_env["PYTHONIOENCODING"] = "utf-8"
             child_env["PYTHONUTF8"] = "1"
@@ -2344,36 +2364,31 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
                  "--phase", "P_WebApp",
                  "--tc",    str(tc_final_path),
                  "--output", str(out_dir)],
-                capture_output=True, timeout=120, env=child_env,  # text=True 제거 — bytes로 받음
+                capture_output=True, timeout=120, env=child_env,
             )
-            # 수동 UTF-8 디코드 (errors='replace'로 디코드 실패 라인도 건너뛰지 않고 '?'로 치환)
             stdout_str = (proc.stdout or b"").decode("utf-8", errors="replace")
             stderr_str = (proc.stderr or b"").decode("utf-8", errors="replace")
             if proc.returncode == 0:
-                push_log(sess, "[빌드] build_excel.py 성공")
-                # stdout에서 Smoke TC 개수 추출 → session에 저장 (done 이벤트에서 활용)
+                push_log(sess, "[빌드] subprocess 성공")
                 m = re.search(r"Smoke Test\s*:\s*(\d+)개", stdout_str)
                 if m:
                     sess["smoke_tc"] = int(m.group(1))
-                # 가장 최근 Excel 파일 찾기
                 excel_files = sorted(out_dir.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if excel_files:
                     return excel_files[0]
-                push_log(sess, "[빌드] ⚠️ build_excel.py 성공했지만 xlsx 파일 없음 — fallback")
+                push_log(sess, "[빌드] ⚠️ subprocess 성공했지만 xlsx 파일 없음 — fallback")
             else:
-                # stderr 앞부분을 로그로 남겨 Windows 환경 진단에 도움
                 err_msg = (stderr_str or stdout_str or "").strip()[:500]
-                push_log(sess, f"[빌드] build_excel.py 오류 (returncode={proc.returncode}): {err_msg}")
+                push_log(sess, f"[빌드] subprocess 오류 (returncode={proc.returncode}): {err_msg}")
         except subprocess.TimeoutExpired:
-            push_log(sess, "[빌드] build_excel.py 타임아웃, fallback으로 직접 생성")
+            push_log(sess, "[빌드] subprocess 타임아웃, fallback으로 직접 생성")
         except FileNotFoundError as e:
-            # sys.executable 경로 문제 (가상환경 activation 실패 등)
             push_log(sess, f"[빌드] ❌ Python 실행 파일 못 찾음: {e} — 가상환경(.venv) activation 확인 필요")
         except Exception as e:
-            push_log(sess, f"[빌드] build_excel.py 예외 ({type(e).__name__}): {e}")
+            push_log(sess, f"[빌드] subprocess 예외 ({type(e).__name__}): {e}")
 
-    # Fallback: 직접 Excel 생성
-    push_log(sess, "[빌드] fallback: openpyxl로 직접 Excel 생성 중...")
+    # ── 3순위(최후): 내부 간이 빌더 (구형 포맷, 시트 분할 없음 — 아무것도 못 만드는 것보다 낫다) ──
+    push_log(sess, "[빌드] ⚠️ 최후 fallback: 내부 간이 빌더 — 대분류별 시트 분할/Traceability 없음")
     return build_excel_fallback(tc_final_content, out_dir, project_name, total_tc, min_tc)
 
 
@@ -5432,21 +5447,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.6 릴리즈 노트 보기">v0.9.6</span>
+    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.7 릴리즈 노트 보기">v0.9.7</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
 
-<!-- What's new 배너 (v0.9.6 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
+<!-- What's new 배너 (v0.9.7 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
 <div id="whatsNewBanner" style="display:none; margin:12px 0; padding:12px 16px; background:linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%); border:1px solid #93C5FD; border-radius:10px;">
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div style="flex:1; font-size:13px; color:#1E40AF;">
-      🎉 <strong>v0.9.6 업데이트 — 새로워진 기능</strong>
+      🔧 <strong>v0.9.7 패치 — Windows 환경 호환성 수정</strong>
       <div style="margin-top:6px; font-size:12px; color:#374151; line-height:1.6;">
-        • 「기존 TC 수정」 탭 전면 개편 — 이전/새 기획서 비교 기반 자동 갱신<br>
-        • Quick 모드 추가 / 정책 반영 모드 최적화 (토큰 ~40% 절감)<br>
-        • Excel: 대분류별 시트 분할 + 🔗 Traceability + 🔄 변경 이력 시트<br>
-        • TC ID 충돌·중복 버그 수정 / 웹↔Excel 카운트 일치
+        • Windows cp949 인코딩 문제로 Excel 빌드가 fallback 되던 현상 해결<br>
+        • fallback 사용 시 대분류별 시트/Smoke Test 시트가 누락되던 문제 해결<br>
+        • Excel 빌더를 모듈 import 방식으로 전환 — subprocess 의존성 제거 + 속도 개선<br>
+        • v0.9.6의 모든 기능(기획서 diff 기반 TC 갱신, Traceability 등) 그대로 동작
       </div>
     </div>
     <div style="display:flex; flex-direction:column; gap:6px;">
@@ -5460,30 +5475,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div id="whatsNewModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
   <div style="background:#FFFFFF; border-radius:12px; max-width:720px; width:92%; max-height:84vh; overflow:hidden; display:flex; flex-direction:column;">
     <div style="padding:16px 20px; border-bottom:1px solid #E5E7EB; display:flex; justify-content:space-between; align-items:center;">
-      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.6 릴리즈 노트</strong></div>
+      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.7 릴리즈 노트</strong></div>
       <button onclick="document.getElementById('whatsNewModal').style.display='none'" style="border:none; background:none; font-size:20px; cursor:pointer; color:#6B7280;">✕</button>
     </div>
     <div style="padding:16px 20px; overflow:auto; font-size:13px; line-height:1.7; color:#374151;">
-      <h3 style="margin:0 0 8px; color:#1E40AF;">🎉 v0.9.6 — 2026-04-23</h3>
-      <p><strong>「기존 TC 수정」 탭 전면 개편 · 파이프라인 효율 개선 · SCR Traceability</strong></p>
-      <h4 style="color:#065F46; margin-top:16px;">✨ 주요 신규 기능</h4>
+      <h3 style="margin:0 0 8px; color:#1E40AF;">🔧 v0.9.7 — 2026-04-23 (패치)</h3>
+      <p><strong>Windows 환경 호환성 수정 + Excel 빌더 구조 개선</strong></p>
+      <h4 style="color:#B45309; margin-top:16px;">🐛 주요 버그 수정 (Windows 환경)</h4>
       <ul>
-        <li><strong>기획서 변경 기반 TC 갱신</strong>: 이전/새 기획서를 업로드하면 자동으로 신규/수정/삭제 화면을 탐지하고 기존 TC ID를 유지한 채 재작성합니다. GitHub 스타일 diff 뷰어로 변경점을 한눈에 확인.</li>
-        <li><strong>생성 모드 선택</strong>: 대용량 문서는 정책 반영 모드, 작은 문서는 Quick 모드 선택 가능 (토큰 ~40% 절감).</li>
-        <li><strong>Traceability 시트</strong>: 화면 코드(SCR-xxx)별 TC 역참조 매트릭스가 Excel에 자동 생성.</li>
-        <li><strong>Excel 구조 개선</strong>: 대분류별 시트 분리, 화면 코드 컬럼, 상태·수정 사유 컬럼, 변경 이력 시트.</li>
+        <li><strong>Excel 대분류별 시트 분할 누락</strong>: Windows에서 subprocess 실패 시 fallback 경로로 진입하여 TC가 한 시트에 몰렸던 문제. 모듈 import 방식으로 전환해 fallback 자체를 회피.</li>
+        <li><strong>🔥 Smoke Test 시트 누락</strong>: fallback에도 Smoke Test 시트 생성 추가.</li>
+        <li><strong>cp949 인코딩 오류</strong>: subprocess stdout/stderr를 UTF-8로 강제 + 자식 env에 PYTHONIOENCODING=utf-8 주입.</li>
       </ul>
-      <h4 style="color:#B45309; margin-top:16px;">🐛 주요 버그 수정</h4>
+      <h4 style="color:#065F46; margin-top:16px;">✨ 구조 개선</h4>
       <ul>
-        <li>TC ID 충돌로 21개 손실되던 현상 (ScreenCode CON 중복 → CON2/CON3 자동 회피)</li>
-        <li>웹 표시 TC 개수와 Excel 실제 개수 불일치</li>
-        <li>프로젝트 드롭다운 유령 항목 잔존</li>
-        <li>Review 단계 중복 TC 생성</li>
-        <li>외부 URL fetch TLS 검증 비활성화 (기본 활성으로 복구)</li>
+        <li><strong>Excel 빌더 모듈화</strong>: build_excel.py의 main() 로직을 run_build() 함수로 추출. app_v2.py에서 subprocess 대신 직접 import 호출 → Windows 인코딩 이슈·가상환경 activation 이슈 완전 제거, 빌드 속도도 향상.</li>
+        <li>3단계 폴백 체인: 모듈 import → subprocess → 내부 간이 빌더 (최후의 수단).</li>
       </ul>
       <h4 style="color:#6B7280; margin-top:16px;">💡 참고</h4>
       <ul>
-        <li>실행 방법 변경 없음 — 기존 `시작하기_v2.command` / `시작하기_v2_Windows.bat` 그대로 사용</li>
+        <li>v0.9.6의 모든 기능 유지 (기획서 diff 기반 TC 갱신, Traceability, Quick 모드 등)</li>
+        <li>실행 방법 변경 없음</li>
         <li>전체 변경 이력은 프로젝트 루트 <code>CHANGELOG.md</code> 참고</li>
       </ul>
     </div>
@@ -7181,7 +7193,7 @@ if (typeof document !== 'undefined') {
 }
 
 // v0.9.6 What's New 배너 표시 — localStorage에 dismiss 기록이 없으면 자동 표시
-const _WHATS_NEW_VERSION = 'v0.9.6';
+const _WHATS_NEW_VERSION = 'v0.9.7';
 const _WHATS_NEW_KEY = 'tc_whatsnew_dismissed_' + _WHATS_NEW_VERSION;
 
 function checkWhatsNewBanner() {

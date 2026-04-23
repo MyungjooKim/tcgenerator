@@ -977,27 +977,43 @@ def _sheet_title_for_major(major_name: str, existing: list) -> str:
 
 # ── 메인 ───────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--phase",  default="P2_Mobile")
-    parser.add_argument("--tc",     default="phase2-mobile/_workspace/05_review/tc_final.md")
-    parser.add_argument("--output", default="phase2-mobile/outputs")
-    args = parser.parse_args()
+def run_build(phase: str, tc_path, output_dir,
+              verbose: bool = True) -> dict:
+    """재사용 가능한 Excel 빌드 엔트리 포인트.
 
-    base       = Path(__file__).parent.parent
-    tc_path    = base / args.tc
-    output_dir = base / args.output
+    Args:
+        phase:      "P_WebApp", "P2_Mobile" 등 PHASE_CONFIG 키
+        tc_path:    tc_final.md 파일 경로 (str | Path)
+        output_dir: 출력 디렉토리 (str | Path). 없으면 생성.
+        verbose:    True면 진행 메시지 print (subprocess 호출 시 유용)
+
+    Returns:
+        {
+          "ok":          bool,
+          "out_path":    Path  — 생성된 xlsx 경로
+          "total_tc":    int,
+          "smoke_tc":    int,
+          "high_tc":     int,
+          "scr_count":   int,
+          "major_count": int,
+          "changed_tc":  int,
+        }
+    """
+    tc_path = Path(tc_path)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    config   = PHASE_CONFIG.get(args.phase, PHASE_CONFIG["P2_Mobile"])
+    config   = PHASE_CONFIG.get(phase, PHASE_CONFIG["P2_Mobile"])
     date_str = datetime.today().strftime("%Y%m%d")
-    version  = get_next_version(output_dir, args.phase, date_str)
-    filename = f"SPCY_TC_{args.phase}_{date_str}_v{version}.xlsx"
+    version  = get_next_version(output_dir, phase, date_str)
+    filename = f"SPCY_TC_{phase}_{date_str}_v{version}.xlsx"
     out_path = output_dir / filename
 
-    print(f"TC 파싱 중: {tc_path}")
+    if verbose:
+        print(f"TC 파싱 중: {tc_path}")
     tcs = parse_tc_markdown(tc_path)
-    print(f"  → {len(tcs)}개 TC 파싱 완료")
+    if verbose:
+        print(f"  → {len(tcs)}개 TC 파싱 완료")
 
     wb = openpyxl.Workbook()
 
@@ -1014,16 +1030,19 @@ def main():
     build_stats(ws_stats, tcs, version)
     build_smoke(ws_smoke, tcs, config)
     scr_count = build_traceability(ws_trace, tcs)
-    if scr_count > 0:
-        print(f"  → Traceability Matrix 생성 — 유니크 화면 코드 {scr_count}개")
-    else:
-        print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
+    if verbose:
+        if scr_count > 0:
+            print(f"  → Traceability Matrix 생성 — 유니크 화면 코드 {scr_count}개")
+        else:
+            print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
 
     # 변경 이력 시트: 상태가 있는 TC가 하나라도 있으면 추가
+    changed_tc = 0
     if any((t.get("status") or "").strip() for t in tcs):
         ws_changes = wb.create_sheet("🔄 변경 이력")
-        chg_n = build_change_history(ws_changes, tcs)
-        print(f"  → 변경 이력 시트 생성 — {chg_n}개 변경 TC")
+        changed_tc = build_change_history(ws_changes, tcs)
+        if verbose:
+            print(f"  → 변경 이력 시트 생성 — {changed_tc}개 변경 TC")
 
     # 대분류별 그룹핑 (major 컬럼 기준, 없으면 domain 코드 폴백)
     major_groups = defaultdict(list)
@@ -1041,16 +1060,42 @@ def main():
         ws = wb.create_sheet(sheet_title)
         build_tc_list(ws, tcs_in_major, config, group_by="middle")
 
-    print(f"  → 대분류별 시트 {len(major_order)}개 생성")
+    if verbose:
+        print(f"  → 대분류별 시트 {len(major_order)}개 생성")
 
     wb.save(out_path)
 
     smoke_n = sum(1 for t in tcs if t.get("smoke"))
     high    = sum(1 for t in tcs if t["priority"] == "High")
-    print(f"\n✅ Excel 저장 완료: {out_path}")
-    print(f"   총 TC: {len(tcs)}개 | High: {high}개 | 🔥 Smoke Test: {smoke_n}개")
-    print(f"   Phase: {config['code']} | 버전: v{version}")
-    print(f"   거래소 컬럼: {config['exchanges'] if config['exchanges'] else '없음 (단일 거래소)'}")
+    if verbose:
+        print(f"\n✅ Excel 저장 완료: {out_path}")
+        print(f"   총 TC: {len(tcs)}개 | High: {high}개 | 🔥 Smoke Test: {smoke_n}개")
+        print(f"   Phase: {config['code']} | 버전: v{version}")
+        print(f"   거래소 컬럼: {config['exchanges'] if config['exchanges'] else '없음 (단일 거래소)'}")
+
+    return {
+        "ok":          True,
+        "out_path":    out_path,
+        "total_tc":    len(tcs),
+        "smoke_tc":    smoke_n,
+        "high_tc":     high,
+        "scr_count":   scr_count,
+        "major_count": len(major_order),
+        "changed_tc":  changed_tc,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--phase",  default="P2_Mobile")
+    parser.add_argument("--tc",     default="phase2-mobile/_workspace/05_review/tc_final.md")
+    parser.add_argument("--output", default="phase2-mobile/outputs")
+    args = parser.parse_args()
+
+    base       = Path(__file__).parent.parent
+    tc_path    = base / args.tc
+    output_dir = base / args.output
+    run_build(args.phase, tc_path, output_dir, verbose=True)
 
 
 if __name__ == "__main__":

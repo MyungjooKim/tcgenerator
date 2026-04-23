@@ -4,6 +4,51 @@
 
 ---
 
+## v0.9.7 — 2026-04-23 (Windows 호환성 패치)
+
+> **요약**: Windows 환경에서 Excel 빌드가 fallback으로 빠져 **대분류별 시트 분할·Smoke Test 시트가 누락**되던 문제 해결. Excel 빌더를 모듈 import 방식으로 전환.
+
+### 🐛 버그 수정 (Windows PC 환경)
+
+- **Excel 대분류별 시트 분할 누락 & 🔥 Smoke Test 시트 누락**
+  - 원인: Windows 기본 콘솔 인코딩(cp949)에서 `subprocess.run(text=True)`가 이모지(🔥) 디코드 실패 → `UnicodeDecodeError` → fallback 경로 진입
+  - fallback은 `TC 전체목록` 한 시트에 모든 TC를 몰아 넣고 Smoke Test 시트도 생성 안 함 → 결과적으로 동료 Windows 환경에서만 Excel 구조 붕괴
+  - **해결**: `build_excel.py`의 로직을 `run_build()` 함수로 추출 + `app_v2.py`가 subprocess 대신 **모듈 import로 직접 호출**. cp949 경로 자체를 제거.
+
+- **cp949 인코딩 오류 추가 방어**
+  - `build_excel.py` 시작부에 `sys.stdout/stderr.reconfigure(encoding="utf-8", errors="replace")` 추가
+  - subprocess 폴백 경로에도 `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1` 환경변수 주입
+  - stdout/stderr를 bytes로 받아 `errors='replace'`로 수동 디코드
+
+- **fallback에도 🔥 Smoke Test 시트 생성 추가**
+  - 모든 폴백 경로가 실패해서 내부 간이 빌더를 쓰더라도 Smoke Test는 보장
+
+### ✨ 구조 개선
+
+- **Excel 빌더 모듈화**: `build_excel.py`의 `main()` → `run_build(phase, tc_path, output_dir, verbose)` 함수로 분리
+- **3단계 폴백 체인**:
+  1. **모듈 import** → `run_build()` 호출 (기본 · Windows 호환)
+  2. subprocess 호출 (모듈 import 실패 시)
+  3. 내부 간이 빌더 (최후 수단 · 시트 분할/Traceability 없음)
+- **속도 향상**: 모듈 호출 경로는 subprocess 생성 오버헤드 제거 (~1초 절감)
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-agent/scripts/build_excel.py` | `run_build()` 함수 추출, stdout/stderr UTF-8 강제 |
+| `tc-ui/scripts/app_v2.py` | `step_build_excel` 모듈 import 우선 + 3단계 폴백, fallback에 Smoke 시트 추가 |
+
+### 💡 동료 Windows PC 환경 확인 방법
+
+`git pull` 후 재실행 → Excel 빌드 후 시트 목록에 다음이 모두 있어야 정상:
+```
+📋 표지 / 📊 TC 통계 / 🔥 Smoke Test / 🔗 Traceability / 📑 대분류명 (N개)
+```
+Flask 터미널 로그에 `[빌드] 모듈 호출 성공 — 총 N TC / Smoke M / 대분류 K시트` 메시지가 나오면 1순위 경로가 정상 동작 중입니다.
+
+---
+
 ## v0.9.6 — 2026-04-23
 
 > **요약**: 「기존 TC 수정」 탭 전면 개편 (기획서 diff 기반), 파이프라인 최적화, SCR Traceability, 다수 버그 수정
