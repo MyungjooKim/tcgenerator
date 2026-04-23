@@ -381,12 +381,18 @@ def check_stop(sess: dict):
 def load_projects() -> list:
     if PROJECTS_FILE.exists():
         try:
-            return json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+            data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
         except Exception:
             return []
+        # 이름이 비어있는 유령 레코드 자동 필터 (과거 버그로 남은 데이터 방어)
+        return [p for p in data if isinstance(p, dict) and (p.get("name") or "").strip()]
     return []
 
 def save_project(project_name: str, tc_file: str = "", excel_file: str = "", **extra):
+    # 빈 이름 저장 방지 — "단발성 작업"이나 프로젝트 미선택 케이스는 레코드를 남기지 않음
+    project_name = (project_name or "").strip()
+    if not project_name:
+        return
     projects = load_projects()
     existing = next((p for p in projects if p["name"] == project_name), None)
     entry = {
@@ -3569,10 +3575,20 @@ def create_project():
 
 @app.route("/projects/<path:project_name>", methods=["DELETE"])
 def delete_project(project_name):
-    """프로젝트 삭제"""
-    projects = load_projects()
-    projects = [p for p in projects if p["name"] != project_name]
-    PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
+    """프로젝트 삭제. 빈 이름 유령 레코드도 함께 정리."""
+    # 유령 레코드(name=빈값)를 포함한 잘못된 레코드까지 정리
+    raw = []
+    if PROJECTS_FILE.exists():
+        try:
+            raw = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            raw = []
+    target = (project_name or "").strip()
+    cleaned = [
+        p for p in raw
+        if isinstance(p, dict) and (p.get("name") or "").strip() and p.get("name") != target
+    ]
+    PROJECTS_FILE.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     return jsonify({"ok": True})
 
 
@@ -6246,7 +6262,9 @@ function showToast(msg) {
 async function loadProjects() {
   try {
     const r = await fetch('/projects');
-    projects = await r.json();
+    const raw = await r.json();
+    // 빈 이름 유령 레코드 제거 (최종 프론트엔드 방어선)
+    projects = Array.isArray(raw) ? raw.filter(p => p && (p.name || '').trim()) : [];
     const sel = document.getElementById('projectSelect');
     const selMod = document.getElementById('modifyProjectSelect');
     sel.innerHTML = '<option value="">— 프로젝트를 선택하세요 —</option>';
