@@ -2334,29 +2334,43 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
     if BUILD_EXCEL.exists():
         push_log(sess, f"[빌드] build_excel.py 호출 중... (대분류별 시트 생성 · 60초 내외)")
         try:
+            # Windows cp949 이모지 디코드 실패 방지: stdout/stderr를 bytes로 받고 errors='replace'로 UTF-8 디코드
+            # 자식 프로세스 env에 PYTHONIOENCODING=utf-8 주입 → build_excel.py의 print(이모지)도 안전
+            child_env = os.environ.copy()
+            child_env["PYTHONIOENCODING"] = "utf-8"
+            child_env["PYTHONUTF8"] = "1"
             proc = subprocess.run(
                 [sys.executable, str(BUILD_EXCEL),
                  "--phase", "P_WebApp",
                  "--tc",    str(tc_final_path),
                  "--output", str(out_dir)],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, timeout=120, env=child_env,  # text=True 제거 — bytes로 받음
             )
+            # 수동 UTF-8 디코드 (errors='replace'로 디코드 실패 라인도 건너뛰지 않고 '?'로 치환)
+            stdout_str = (proc.stdout or b"").decode("utf-8", errors="replace")
+            stderr_str = (proc.stderr or b"").decode("utf-8", errors="replace")
             if proc.returncode == 0:
                 push_log(sess, "[빌드] build_excel.py 성공")
                 # stdout에서 Smoke TC 개수 추출 → session에 저장 (done 이벤트에서 활용)
-                m = re.search(r"🔥 Smoke Test\s*:\s*(\d+)개", proc.stdout or "")
+                m = re.search(r"Smoke Test\s*:\s*(\d+)개", stdout_str)
                 if m:
                     sess["smoke_tc"] = int(m.group(1))
                 # 가장 최근 Excel 파일 찾기
                 excel_files = sorted(out_dir.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if excel_files:
                     return excel_files[0]
+                push_log(sess, "[빌드] ⚠️ build_excel.py 성공했지만 xlsx 파일 없음 — fallback")
             else:
-                push_log(sess, f"[빌드] build_excel.py 오류: {proc.stderr[:500]}")
+                # stderr 앞부분을 로그로 남겨 Windows 환경 진단에 도움
+                err_msg = (stderr_str or stdout_str or "").strip()[:500]
+                push_log(sess, f"[빌드] build_excel.py 오류 (returncode={proc.returncode}): {err_msg}")
         except subprocess.TimeoutExpired:
             push_log(sess, "[빌드] build_excel.py 타임아웃, fallback으로 직접 생성")
+        except FileNotFoundError as e:
+            # sys.executable 경로 문제 (가상환경 activation 실패 등)
+            push_log(sess, f"[빌드] ❌ Python 실행 파일 못 찾음: {e} — 가상환경(.venv) activation 확인 필요")
         except Exception as e:
-            push_log(sess, f"[빌드] build_excel.py 예외: {e}")
+            push_log(sess, f"[빌드] build_excel.py 예외 ({type(e).__name__}): {e}")
 
     # Fallback: 직접 Excel 생성
     push_log(sess, "[빌드] fallback: openpyxl로 직접 Excel 생성 중...")
@@ -2489,6 +2503,36 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
             c.font = Font(name="Calibri", size=9,
                           bold=(ci == 2 and is_min), color="1E2761" if is_min else "222222")
         ws.row_dimensions[ri].height = max(30, min(120, len(str(row_data[8])) // 3 + 20))
+
+    # 🔥 Smoke Test 시트 — Smoke 마킹된 TC만 모아 동일 구조로 렌더
+    smoke_tcs = [t for t in tcs if t.get("_smoke")]
+    ws_sm = wb.create_sheet("🔥 Smoke Test")
+    ws_sm.freeze_panes = "A3"
+    for ci, (h, w) in enumerate(zip(HEADERS, COL_W), 1):
+        c = ws_sm.cell(1, ci, h)
+        c.font = hfont(); c.fill = fill(NAVY); c.alignment = center(); c.border = bdr()
+        ws_sm.column_dimensions[get_column_letter(ci)].width = w
+    ws_sm.row_dimensions[1].height = 22
+    for ri, tc in enumerate(smoke_tcs, 2):
+        row_data = [
+            "Y",
+            tc.get("id", ""),
+            _priority_kr(tc.get("priority", "")),
+            "",
+            tc.get("major", ""),
+            tc.get("middle", ""),
+            tc.get("minor", ""),
+            tc.get("precondition", ""),
+            tc.get("steps", ""),
+            tc.get("expected", ""),
+        ]
+        for ci, val in enumerate(row_data, 1):
+            c = ws_sm.cell(ri, ci, val)
+            c.fill = PatternFill("solid", fgColor="E8F5E9")
+            c.alignment = left_align() if ci >= 9 else center()
+            c.border = bdr()
+            c.font = Font(name="Calibri", size=9)
+        ws_sm.row_dimensions[ri].height = max(30, min(120, len(str(row_data[8])) // 3 + 20))
 
     # 통계 시트
     stat = wb.create_sheet("통계")

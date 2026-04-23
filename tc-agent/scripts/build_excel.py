@@ -17,6 +17,14 @@ from pathlib import Path
 import argparse
 from collections import defaultdict
 
+# Windows cp949 콘솔 환경에서 이모지/한글 print 시 UnicodeEncodeError 방지:
+# stdout/stderr를 UTF-8로 강제 재설정 (Python 3.7+)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
