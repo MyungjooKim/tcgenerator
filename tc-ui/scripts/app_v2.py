@@ -19,14 +19,20 @@ from pathlib import Path
 from datetime import datetime
 
 # ── .env 로딩 ──────────────────────────────────────────────────────────────────
+# Windows 메모장 저장 시 BOM이 붙을 수 있어 utf-8-sig 사용 (없으면 무해).
 env_file = Path(__file__).parent.parent / ".env"
 if env_file.exists():
-    for line in env_file.read_text(encoding='utf-8').splitlines():
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            key, val = k.strip(), v.strip()
-            if not os.environ.get(key):   # 빈 값이면 .env 값으로 채움
-                os.environ[key] = val
+    for line in env_file.read_text(encoding='utf-8-sig').splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key, val = k.strip(), v.strip()
+        # 값이 "..." 또는 '...'로 감싸져 있으면 벗겨내기 (Windows 사용자 흔한 실수 방어)
+        if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+            val = val[1:-1]
+        if key and not os.environ.get(key):
+            os.environ[key] = val
 
 from flask import Flask, request, jsonify, render_template_string, send_file, Response
 
@@ -478,8 +484,11 @@ def clear_checkpoint():
 def push(sess: dict, etype: str, data: dict):
     sess["events"].put({"type": etype, "data": data})
 
-def push_stage(sess, stage: int, label: str, pct: int):
-    push(sess, "stage", {"stage": stage, "label": label, "pct": pct})
+def push_stage(sess, stage: int, label: str, pct: int, eta_sec: int | None = None):
+    data = {"stage": stage, "label": label, "pct": pct}
+    if eta_sec is not None:
+        data["eta_sec"] = eta_sec
+    push(sess, "stage", data)
 
 def push_log(sess, msg: str):
     push(sess, "log", {"msg": msg})
@@ -714,19 +723,29 @@ def fetch_web_page(sess: dict, url: str) -> str:
     try:
         import requests
         import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     except ImportError:
         raise RuntimeError("requests 패키지가 필요합니다: pip install requests")
     push_log(sess, f"[파싱] 웹 크롤링 중: {url}")
+    # TLS 검증: 기본 활성화. 사내 테스트 등 자가서명 인증서가 필요한 경우에만
+    # TC_WEB_INSECURE=1 환경변수로 명시적으로 비활성화 가능.
+    verify_tls = os.environ.get("TC_WEB_INSECURE", "").strip() not in ("1", "true", "yes")
+    if not verify_tls:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        push_log(sess, f"[파싱] ⚠️ TLS 검증 비활성화됨 (TC_WEB_INSECURE=1)")
     try:
         headers = {"User-Agent": "Mozilla/5.0 (TC-Automation/2.0)"}
-        resp = requests.get(url, headers=headers, timeout=30, verify=False)
+        resp = requests.get(url, headers=headers, timeout=30, verify=verify_tls)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "")
         if "html" in content_type:
             return html_to_text(resp.text)
         else:
             return resp.text
+    except requests.exceptions.SSLError as e:
+        raise RuntimeError(
+            f"TLS 인증서 검증 실패: {e}. "
+            f"자가서명 인증서 환경이라면 TC_WEB_INSECURE=1 환경변수를 설정하세요."
+        )
     except Exception as e:
         raise RuntimeError(f"웹 크롤링 실패: {e}")
 
@@ -752,6 +771,11 @@ def step_policy(sess: dict, raw_text: str, project_name: str, focus_area: str = 
 
 # 정책 분석 결과
 
+## 화면/페이지 인벤토리 (필수)
+(문서에 등장하는 모든 화면/페이지를 빠짐없이 나열 — ID·이름·간단 설명)
+(Splash, 진입 화면, 정적 화면, 브랜딩 화면, 빈 상태 화면 등 단순 화면도 반드시 포함)
+(SCR-xxx, SCREEN-xxx 같은 코드가 있으면 그대로 사용)
+
 ## 도메인별 정책
 (각 도메인별로 테스트 가능한 정책을 구체적으로 나열)
 
@@ -760,6 +784,12 @@ def step_policy(sess: dict, raw_text: str, project_name: str, focus_area: str = 
 
 ## 예외 처리 정책
 (오류 케이스, 엣지 케이스, 유효성 검증 규칙)
+
+⛔ 다음을 절대 드롭하지 마세요:
+- 단순 UI 진입 화면 (Splash, 브랜딩 화면, Welcome, Landing)
+- 정적 정보 화면 (About, Help, Empty State)
+- 짧은 설명의 화면도 화면 인벤토리에 반드시 ID와 이름을 기록
+- "테스트할 게 단순해 보여도" 생략하지 말 것 — UI 체크 TC 대상
 """
     focus_instruction = ""
     if focus_area:
@@ -774,12 +804,14 @@ def step_policy(sess: dict, raw_text: str, project_name: str, focus_area: str = 
 다음 문서에서 TC 작성에 필요한 모든 정책과 규칙을 추출해주세요:
 
 ---
-{raw_text[:15000]}
+{raw_text[:200000]}
 ---
 
 각 정책은 구체적이고 테스트 가능한 형태로 서술해주세요.{focus_instruction}
+
+⚠️ 문서에 등장하는 모든 화면/기능/섹션을 빠짐없이 정리하세요. 주요한 것만 선별하지 말고 전체를 포괄하세요.
 """
-    result = call_claude(system, user, max_tokens=4096)
+    result = call_claude(system, user, max_tokens=16000)
     policy_path = sess["workspace"] / "02_policy.md"
     policy_path.write_text(result, encoding="utf-8")
     push_log(sess, f"[정책] 분석 완료 → {len(result):,}자")
@@ -803,6 +835,11 @@ def step_features(sess: dict, policy_text: str, project_name: str, focus_area: s
 - 우선순위: High/Medium/Low
 
 각 도메인의 모든 기능을 빠짐없이 나열하세요.
+
+⛔ 필수: 정책 분석의 "화면/페이지 인벤토리"에 나열된 모든 화면을 각각 별도 기능으로 반드시 포함하세요.
+- Splash 같은 단순 진입 화면도 "화면 진입/표시/버튼 동작" 같은 테스트 포인트로 기능화
+- 정적 화면, Empty State, Welcome 화면도 모두 개별 기능으로 등록
+- "테스트할 게 적어 보인다"는 이유로 생략 금지 — UI/UX 체크 TC 대상
 """
     focus_instruction = ""
     if focus_area:
@@ -821,12 +858,101 @@ def step_features(sess: dict, policy_text: str, project_name: str, focus_area: s
 ---
 
 모든 주요 기능을 도메인별로 분류하여 나열하고, 각 기능의 테스트 포인트를 구체적으로 서술하세요.{focus_instruction}
+
+⚠️ 정책 분석에 등장한 모든 화면/기능을 빠짐없이 나열하세요. 선별하지 말고 전체를 다루세요.
 """
-    result = call_claude(system, user, max_tokens=4096)
+    result = call_claude(system, user, max_tokens=16000)
     features_path = sess["workspace"] / "03_features.md"
     features_path.write_text(result, encoding="utf-8")
     push_log(sess, f"[기능] 기능 목록 완료 → {len(result):,}자")
     return result
+
+
+def step_policy_features_combined(sess: dict, raw_text: str, project_name: str,
+                                    focus_area: str = "") -> tuple[str, str]:
+    """정책 반영 모드 최적화 — policy + features를 1회 호출로 통합 추출.
+    반환: (policy_text, features_text).
+    출력 형식은 기존 policy/features의 합집합 구조를 그대로 유지해 기존 코드 호환.
+    """
+    push_log(sess, "[정책+기능] 통합 추출 중... (1회 호출로 정책·기능 동시 생성)")
+    system = """당신은 소프트웨어 QA 전문가입니다. 주어진 원문에서 테스트 준비에 필요한
+정책·규칙과 기능 인벤토리를 **한 번에 통합 문서로** 추출합니다.
+
+다음 정확한 형식으로 출력하세요:
+
+# 통합 분석 결과 — {프로젝트명}
+
+## [SECTION: POLICY] 화면/페이지 인벤토리 (필수)
+(원문에 등장하는 모든 화면/페이지를 빠짐없이 나열 — ID · 이름 · 간단 설명 한 줄)
+(Splash, 진입 화면, 정적 화면, 브랜딩 화면, 빈 상태 화면 등 단순 화면도 반드시 포함)
+(SCR-xxx, SCREEN-xxx 같은 코드가 있으면 그대로 사용)
+
+## [SECTION: POLICY] 도메인별 정책
+(각 도메인별로 테스트 가능한 정책을 구체적으로 나열)
+
+## [SECTION: POLICY] 핵심 비즈니스 규칙
+(서비스의 핵심 로직과 검증 포인트)
+
+## [SECTION: POLICY] 예외 처리 정책
+(오류 케이스, 엣지 케이스, 유효성 검증 규칙)
+
+---
+
+# Feature List — {프로젝트명}
+
+## [SECTION: FEATURES] 도메인코드 — 도메인명
+
+### FT-001 기능명
+- 설명: (기능 설명)
+- 테스트 포인트: (주요 검증 항목)
+- 우선순위: High/Medium/Low
+
+(각 도메인·화면의 모든 기능을 빠짐없이 나열)
+
+⛔ 다음을 절대 드롭하지 마세요:
+- 단순 UI 진입 화면 (Splash, Welcome, Landing, 브랜딩)
+- 정적 정보 화면 (About, Help, Empty State)
+- 각 화면의 "진입·표시·버튼 동작" 같은 단순해 보이는 케이스
+- 화면 인벤토리에 등록된 모든 화면은 Feature List에도 최소 1개 기능으로 반드시 등록
+"""
+    focus_instruction = ""
+    if focus_area:
+        focus_instruction = f"""
+
+⚠️ 포커스 범위: 아래 범위에 해당하는 화면/기능만 포함하세요.
+→ {focus_area}"""
+    user = f"""프로젝트: {project_name}
+
+아래 원문에서 (1) 정책·규칙 분석 + (2) 기능 인벤토리를 **한 문서로 통합** 추출하세요.
+
+---
+{raw_text[:200000]}
+---
+{focus_instruction}
+
+⚠️ 문서에 등장하는 모든 화면/기능/섹션을 빠짐없이 다루세요. 선별하지 마세요.
+⚠️ 반드시 위의 출력 형식(SECTION 마커 포함)을 정확히 따르세요. 후처리가 의존합니다.
+"""
+    result = call_claude(system, user, max_tokens=16000)
+
+    # 결과를 policy_text / features_text 로 분리
+    # `---` 또는 `# Feature List` 기준으로 나눔. 실패 시 전체를 둘 다에 넣어 안전하게 처리.
+    policy_text = result
+    features_text = result
+    # 분리 마커: "# Feature List" (독립 # 헤더)
+    m = re.search(r"^# Feature List\b", result, re.MULTILINE)
+    if m:
+        policy_text = result[:m.start()].rstrip()
+        features_text = result[m.start():].strip()
+
+    # 저장 (디버깅용)
+    combined_path = sess["workspace"] / "02_combined.md"
+    combined_path.write_text(result, encoding="utf-8")
+    (sess["workspace"] / "02_policy.md").write_text(policy_text, encoding="utf-8")
+    (sess["workspace"] / "03_features.md").write_text(features_text, encoding="utf-8")
+
+    push_log(sess, f"[정책+기능] 통합 추출 완료 → 정책 {len(policy_text):,}자 · 기능 {len(features_text):,}자")
+    return policy_text, features_text
 
 
 # ── 4단계: 분류표 생성 ────────────────────────────────────────────────────────
@@ -853,6 +979,12 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 - ⛔ TC ID를 생성하지 마세요. TC ID는 이후 단계에서 검토자가 결정합니다.
 - ⛔ TC ID 생성 규칙, TC ID 예시표, 기능-TC 매핑표를 포함하지 마세요.
 - 분류표에는 대분류/중분류/소분류 구조만 출력하세요.
+
+⛔ 필수 완전성:
+- 기능 목록에 등장하는 모든 화면을 중분류로 반드시 포함하세요.
+- Splash, Login Options, Welcome, Landing, Empty State 같은 단순 UI 진입 화면도 반드시 중분류로 포함
+- 온보딩 흐름의 모든 화면(SCR-xxx 등 코드가 있으면 해당 화면명)을 누락 없이 분류
+- "단순해 보여서 생략"은 금지 — UI/UX 체크 TC 대상이므로 반드시 분류표에 등록
 """
     focus_instruction = ""
     if focus_area:
@@ -879,12 +1011,208 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 ---
 
 분류 결과는 TC ID 생성의 기반이 되므로, 명확하고 일관성 있는 코드를 사용하세요.{focus_instruction}{category_ref}
+
+⚠️ 문서 전체를 빠짐없이 분석하여 모든 대분류와 중분류를 포함하세요.
 """
-    result = call_claude(system, user, max_tokens=4096)
+    result = call_claude(system, user, max_tokens=16000)
     classify_path = sess["workspace"] / "04_classification_draft.md"
     classify_path.write_text(result, encoding="utf-8")
     push_log(sess, f"[분류] 분류표 생성 완료 → {len(result):,}자")
     return result
+
+
+# ── Quick 모드 전용 3단계: 인벤토리 → 분류 → 섹션발췌 ──────────────────────
+# 원문을 요약하지 않고 "항목 목록만" 먼저 추출한 뒤, 항목별로 원문의 해당 섹션만
+# 발췌해 TC 작성에 전달한다. 총 토큰은 기존 Quick과 비슷하거나 적고, 누락이 줄어든다.
+
+def step_quick_inventory(sess: dict, raw_text: str, project_name: str,
+                          focus_area: str = "") -> str:
+    """Quick 모드 1단계 — 원문에서 모든 화면/기능 인벤토리만 추출.
+    요약이 아니라 '목록'이어서 AI가 축약할 여지가 적다."""
+    push_log(sess, "[Quick 1/3] 인벤토리 추출 중...")
+    system = """당신은 기획 문서 스캐너입니다. 주어진 원문에서 테스트 가능한 모든 항목(화면/페이지/기능)의 인벤토리만 추출합니다.
+
+출력 형식 (정확히 이 형식만):
+# 인벤토리
+
+## 화면 목록
+- {ID} | {이름} | {한 줄 설명}
+- ...
+
+## 독립 기능 목록 (화면에 속하지 않는 기능)
+- {이름} | {한 줄 설명}
+- ...
+
+규칙:
+- 화면 ID(SCR-xxx, SCREEN-xxx 등)가 원문에 있으면 그대로 쓰세요. 없으면 비워 두세요.
+- 각 항목은 한 줄로 간결하게. 상세 설명·정책·절차는 절대 포함하지 마세요.
+- ⛔ Splash, Empty State, Landing, Welcome, 진입 화면, 정적 화면도 **반드시** 포함하세요.
+- ⛔ 원문에 등장하는 모든 화면을 빠짐없이 수집하세요. "단순해 보인다"고 생략 금지.
+- ⛔ 요약·정리·설명 문구를 추가하지 마세요. 항목 목록만 출력.
+- 일반적으로 원문 기획서 1개당 30~100개의 항목이 나옵니다. 10개 미만이면 뭔가 놓친 것입니다.
+"""
+    focus_instruction = ""
+    if focus_area:
+        focus_instruction = f"""
+
+⚠️ 포커스 범위: 아래 범위에 해당하는 항목만 인벤토리에 포함하세요.
+→ {focus_area}"""
+    user = f"""프로젝트: {project_name}
+
+아래 원문에서 화면/기능 인벤토리를 추출하세요.
+
+---
+{raw_text[:200000]}
+---
+{focus_instruction}
+
+⚠️ 빠짐없이 모든 화면을 수집하세요. Splash, Login Options, 각 Onboarding 단계 화면, Empty State 등 **단순 화면도 반드시** 포함.
+"""
+    result = call_claude(system, user, max_tokens=8000)
+    inv_path = sess["workspace"] / "02_inventory.md"
+    inv_path.write_text(result, encoding="utf-8")
+    # 간단한 카운트 로그
+    item_count = len(re.findall(r"^-\s+", result, re.MULTILINE))
+    push_log(sess, f"[Quick 1/3] 인벤토리 완료 — 항목 {item_count}개, {len(result):,}자")
+    return result
+
+
+def step_classify_from_inventory(sess: dict, inventory_text: str,
+                                  project_name: str, focus_area: str = "") -> str:
+    """Quick 모드 2단계 — 인벤토리 → 분류표.
+    원문을 입력하지 않으므로 AI가 축약하지 않고 모든 항목을 분류한다."""
+    push_log(sess, "[Quick 2/3] 분류표 생성 중...")
+    system = """당신은 TC 분류 전문가입니다. 주어진 인벤토리의 모든 항목을 대분류/중분류/소분류 계층으로 분류합니다.
+
+다음 형식으로 출력하세요:
+
+# TC 분류표 — {프로젝트명}
+
+## 대분류: {대분류명}
+
+### 중분류: {중분류명}
+
+#### 소분류
+- {소분류명}: {설명}
+
+규칙:
+- 대분류는 도메인 단위 (예: Onboarding, Authentication, Trading)
+- 중분류는 화면/주요 기능 단위 (인벤토리의 각 화면/기능이 중분류가 됨)
+- 소분류는 해당 중분류의 테스트 가능한 세부 케이스
+- ⛔ 대분류/중분류/소분류 이름에 괄호 코드를 붙이지 마세요. 예: "FOOTER (FOOT)" ❌ → "Footer" ✅
+- ⛔ TC ID를 생성하지 마세요.
+- ⛔ TC ID 생성 규칙, TC ID 예시표, 기능-TC 매핑표를 포함하지 마세요.
+- 분류표에는 대분류/중분류/소분류 구조만 출력하세요.
+
+⛔ 필수 완전성 (매우 중요):
+- 인벤토리의 **모든 항목을 반드시 중분류로** 포함하세요. 하나도 생략하지 마세요.
+- Splash, Login Options, Welcome, Landing, Empty State 등 단순 화면도 반드시 중분류로 등록
+- 인벤토리 항목 수 ≒ 중분류 수 (통상)
+- 중분류가 10개 미만이면 뭔가 빠뜨린 것입니다.
+"""
+    focus_instruction = ""
+    if focus_area:
+        focus_instruction = f"""
+
+⚠️ 포커스 범위: 인벤토리 중 아래 범위에 해당하는 항목만 분류하세요.
+→ {focus_area}"""
+    project_policies = load_project_policies(project_name)
+    category_ref = ""
+    if project_policies:
+        category_ref = f"""
+
+⚠️ 기존 프로젝트 카테고리 참조: 아래 기존 대분류/중분류 이름과 동일한 용어를 사용하세요.
+{project_policies[:4000]}"""
+    user = f"""프로젝트: {project_name}
+
+아래 인벤토리의 모든 항목을 대분류/중분류/소분류 계층으로 분류해주세요:
+
+---
+{inventory_text}
+---
+{focus_instruction}{category_ref}
+
+⚠️ 인벤토리의 **모든 항목**을 반드시 포함하세요. 빠뜨리면 안 됩니다.
+"""
+    result = call_claude(system, user, max_tokens=16000)
+    classify_path = sess["workspace"] / "04_classification_draft.md"
+    classify_path.write_text(result, encoding="utf-8")
+    push_log(sess, f"[Quick 2/3] 분류표 생성 완료 → {len(result):,}자")
+    return result
+
+
+def extract_section_from_raw(raw_text: str, middle_name: str,
+                              major_name: str = "", max_chars: int = 8000) -> str:
+    """Quick 모드 3단계용 — 원문에서 middle_name과 관련된 섹션만 발췌한다.
+    매칭 우선순위:
+      1. 정확한 middle_name을 포함한 헤더(###/##)
+      2. middle_name의 단어들을 포함한 헤더
+      3. major_name 매칭 (백업)
+    찾으면 해당 헤더부터 다음 같은 레벨 헤더까지 반환.
+    못 찾으면 middle_name이 언급된 주변 ±500자 컨텍스트 반환.
+    """
+    if not raw_text or not middle_name:
+        return ""
+    lines = raw_text.splitlines()
+
+    def header_level(line: str) -> int:
+        m = re.match(r"^(#+)\s", line)
+        return len(m.group(1)) if m else 0
+
+    # 후보 검색어: 원문 middle_name + 공백 대체 + 단어 분할
+    candidates = [middle_name.strip()]
+    if "/" in middle_name:
+        candidates.extend(p.strip() for p in middle_name.split("/") if p.strip())
+    # 영단어 3자 이상만 개별 매칭 (너무 일반적인 단어 방어)
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", middle_name) if len(w) > 2]
+    candidates.extend(words)
+
+    best_span = None
+    best_score = 0
+    for i, line in enumerate(lines):
+        lvl = header_level(line)
+        if lvl == 0:
+            continue
+        # 헤더 텍스트 추출
+        header_text = re.sub(r"^#+\s+", "", line).strip()
+        # 점수 산정: middle_name 완전 매칭 > 부분 매칭 > 단어 매칭
+        score = 0
+        if middle_name.lower() in header_text.lower():
+            score = 100
+        else:
+            for w in candidates:
+                if w and w.lower() in header_text.lower():
+                    score = max(score, 50)
+        if score == 0 and major_name and major_name.lower() in header_text.lower():
+            score = 10
+
+        if score > best_score:
+            # 같은 레벨 다음 헤더까지 발췌
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                jlvl = header_level(lines[j])
+                if jlvl > 0 and jlvl <= lvl:
+                    end = j
+                    break
+            best_span = (i, end)
+            best_score = score
+            if score >= 100:
+                # 완전 매칭이면 더 찾지 않음
+                break
+
+    if best_span:
+        i, end = best_span
+        section = "\n".join(lines[i:end])
+        return section[:max_chars]
+
+    # Fallback: middle_name 언급 위치 ±500자
+    pat = re.escape(middle_name)
+    m = re.search(pat, raw_text, re.IGNORECASE)
+    if m:
+        start = max(0, m.start() - 500)
+        end = min(len(raw_text), m.end() + 2000)
+        return raw_text[start:end][:max_chars]
+    return ""
 
 
 # ── 5단계: Human Gate (블로킹) ────────────────────────────────────────────────
@@ -969,9 +1297,54 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
         push_log(sess, f"[TC 작성] [{i+1}/{len(domains)}] {domain_code} — {domain_name} ({len(middles)}개 중분류)")
 
         domain_tc_parts = []
+        # TC ID 스킴 분기 (tc-rules.md 섹션 2-1):
+        #   - Suite-based (PC Web, SC): 중분류 전체에 걸쳐 cumulative seq
+        #   - Screen-based (Mobile, SM): 화면(중분류)별 독립 seq, SuiteCode 자리에 ScreenCode 사용
+        project_code = _detect_project_code(project_name)
+        domain_suite_code = domain.get("suite_code", "").strip().strip("-")
+        # 사용자 명시적 선택(auto_screen_code)이 있으면 우선, 없으면 프로젝트 코드 자동 판별
+        user_auto_flag = sess.get("auto_screen_code")
+        if user_auto_flag is True:
+            screen_based = True
+            scheme_reason = "사용자 선택: 시스템 규칙 자동 적용"
+        elif user_auto_flag is False:
+            screen_based = False
+            scheme_reason = "사용자 선택: 수동 SuiteCode 입력"
+        else:
+            screen_based = _is_screen_based(project_code)
+            scheme_reason = f"자동 판별 (project_code={project_code})"
+        screen_map = load_screen_code_map(project_name) if screen_based else {}
+        if screen_based:
+            push_log(sess, f"[TC 작성] {domain_code} — Screen-based 스킴 ({scheme_reason}, map {len(screen_map)}개)")
+        else:
+            push_log(sess, f"[TC 작성] {domain_code} — Suite-based 스킴 ({scheme_reason})")
+
+        cumulative_seq = 1  # Suite-based 전용 (Screen-based는 매 중분류마다 1로 리셋)
+
         for mi, middle in enumerate(middles):
             label = f"{domain_code}/{middle}" if middle != "전체" else domain_code
-            push_log(sess, f"[TC 작성] [{i+1}/{len(domains)}] {label} 작성 중...")
+
+            # 스킴별 effective code & starting seq 결정
+            screen_character = ""
+            screen_navigation = ""
+            if screen_based and middle != "전체":
+                effective_code = resolve_screen_code(middle, screen_map)
+                screen_character = resolve_screen_character(middle, screen_map)
+                screen_navigation = resolve_screen_navigation(middle, screen_map)
+                starting_seq = 1  # 화면 단위 독립 네임스페이스
+                id_scope_label = f"{effective_code} (screen)"
+            else:
+                effective_code = domain_suite_code
+                starting_seq = cumulative_seq
+                id_scope_label = f"{effective_code} (suite)" if effective_code else "(no-code)"
+
+            meta_msg = ""
+            if screen_character:
+                meta_msg += f" [성격: {screen_character}]"
+            if screen_navigation:
+                meta_msg += f" [네비: {screen_navigation}]"
+            push_log(sess, f"[TC 작성] [{i+1}/{len(domains)}] {label} 작성 중... "
+                            f"→ SM-{effective_code}-{starting_seq:03d}~ [{id_scope_label}]{meta_msg}")
             push(sess, "stage", {
                 "stage": 4,
                 "label": f"TC 작성: {label} ({mi+1}/{len(middles)})",
@@ -980,13 +1353,43 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
 
             system = build_tc_system_prompt(tc_rules, approved_classification, project_policies, fewshot)
 
-            # 중분류 단위 프롬프트 — 해당 중분류에 집중
+            # 섹션 발췌 모드: Quick 모드 또는 정책 반영 모드(최적화) 모두에서 원문 발췌 활성
+            # (`_section_extract` = 정책 반영 모드 TC 최적화, `_quick_mode` = Quick 전용 플래그)
+            effective_features = features_text
+            effective_policy = policy_text
+            use_section = (sess.get("_quick_mode") or sess.get("_section_extract"))
+            if use_section and middle != "전체":
+                raw_full = sess.get("_raw_text", "")
+                section = extract_section_from_raw(raw_full, middle, major_name=domain_name)
+                if section:
+                    effective_features = section
+                    if sess.get("_quick_mode"):
+                        effective_policy = section  # Quick은 원문 근거만
+                        push_log(sess, f"[Quick 3/3] {label} — 원문 섹션 발췌 ({len(section):,}자)")
+                    else:
+                        # 정책 반영 모드: 원문 섹션 + 정책 요약 앞부분(≤4KB) 병행
+                        effective_policy = (policy_text[:4000] + "\n\n---\n\n원문 섹션:\n" + section) if policy_text else section
+                        push_log(sess, f"[정책+섹션] {label} — 원문 섹션 발췌 ({len(section):,}자)")
+                # 섹션을 못 찾으면 features_text로 폴백
+
+            # 중분류 단위 프롬프트 — 해당 중분류에 집중, effective_code & starting_seq & 성격 & 네비 전달
             if middle != "전체":
                 domain_with_middle = dict(domain)
                 domain_with_middle["_focus_middle"] = middle
-                user = build_tc_user_prompt(domain_with_middle, features_text, policy_text, project_name, approved_classification)
+                domain_with_middle["suite_code"] = effective_code  # screen-based면 ScreenCode로 교체
+                user = build_tc_user_prompt(domain_with_middle, effective_features, effective_policy,
+                                            project_name, approved_classification,
+                                            starting_seq=starting_seq,
+                                            screen_character=screen_character,
+                                            screen_navigation=screen_navigation)
             else:
-                user = build_tc_user_prompt(domain, features_text, policy_text, project_name, approved_classification)
+                domain_copy = dict(domain)
+                domain_copy["suite_code"] = effective_code
+                user = build_tc_user_prompt(domain_copy, features_text, policy_text,
+                                            project_name, approved_classification,
+                                            starting_seq=starting_seq,
+                                            screen_character=screen_character,
+                                            screen_navigation=screen_navigation)
 
             try:
                 tc_draft = call_claude(system, user, max_tokens=16000)
@@ -1011,12 +1414,25 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
                     except Exception:
                         pass
 
-            tc_count = len(re.findall(r"^###\s", tc_draft, re.MULTILINE))
-            # 카테고리 헤더 제외
-            tc_count -= len(re.findall(r"^###\s*카테고리\s*\d", tc_draft, re.MULTILINE))
-            push_log(sess, f"[TC 작성] {label} 완료 — TC {tc_count}개")
+            # Post-processing: TC ID 재번호링 (유니크 강제)
+            if effective_code:
+                tc_draft, next_seq = renumber_tc_ids(tc_draft, project_code, effective_code, starting_seq)
+                renumbered_count = next_seq - starting_seq
+                if screen_based:
+                    # 화면별 독립 카운트 — cumulative_seq는 건드리지 않음
+                    push_log(sess, f"[TC 작성] {label} 완료 — TC {renumbered_count}개 "
+                                    f"(SM-{effective_code}-001~{next_seq-1:03d})")
+                else:
+                    cumulative_seq = next_seq
+                    push_log(sess, f"[TC 작성] {label} 완료 — TC {renumbered_count}개 (seq ~{cumulative_seq-1:03d})")
+                total_tc += renumbered_count
+            else:
+                tc_count = len(re.findall(r"^###\s", tc_draft, re.MULTILINE))
+                tc_count -= len(re.findall(r"^###\s*카테고리\s*\d", tc_draft, re.MULTILINE))
+                push_log(sess, f"[TC 작성] {label} 완료 — TC {tc_count}개")
+                total_tc += tc_count
+
             domain_tc_parts.append(tc_draft)
-            total_tc += tc_count
             check_stop(sess)
 
         # 도메인별 병합 저장
@@ -1089,7 +1505,7 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 {tc_rules[:8000] if tc_rules else "표준 TC 형식을 따릅니다."}
 {policy_section}{fewshot_section}
 ## 분류표
-{classification[:3000]}
+{classification[:10000]}
 
 ## TC 생성 카테고리 (4가지 — 순서대로 작성, 비율 준수)
 
@@ -1186,20 +1602,292 @@ def _detect_project_code(project_name: str) -> str:
         return "SM"
     return "SC"
 
+
+def _is_screen_based(project_code: str) -> bool:
+    """Screen-based TC ID 스킴을 사용하는 프로젝트 판정.
+
+    - SM (Mobile Web), SA (Mobile App) → Screen-based (화면별 001~)
+    - SC (PC Web) 등 → Suite-based (Suite 내 전역 001~)
+    """
+    return project_code.upper() in ("SM", "SA")
+
+
+# Screen Code Map 로더 (프로젝트별 projects/{name}/screen_code_map.md 파싱)
+# 매핑 구조: { middle_name: { "code": "SPL", "character": "entry" } }
+_SCREEN_CODE_CACHE: dict[str, dict[str, dict[str, str]]] = {}
+
+# 성격(character) → 필수 비기능 TC 가이드 (원칙 E, tc-rules.md §1-1)
+SCREEN_CHARACTER_NFR_GUIDE = {
+    "entry": "로딩 시간 3초 이내 (Google RAIL 기준). [미결] 임계치 PM 확정 필요.",
+    "data-fetch": "초기 로딩 5초 이내 + 빈 상태 표시 + Pull-to-refresh. [미결] 임계치 확정 필요.",
+    "realtime": "WebSocket 끊김 시 자동 재연결 + 지연 표시 인라인 배너. 재연결 10초 이내.",
+    "form": "입력 반응 100ms 이내 (RAIL First-Input-Delay, 선택적).",
+    "overlay": "외부 영역 탭 시 자동 닫힘 + 진입/퇴장 애니메이션 부드러움.",
+    "static": "비기능 TC 불필요 (정적 컨텐츠, 스크롤만).",
+}
+
+# 네비게이션(navigation) → 필수 뒤로가기/스와이프 TC 가이드 (원칙 F, tc-rules.md §1-1)
+SCREEN_NAVIGATION_TC_GUIDE = {
+    "tab-root": "탭바 최상위 — 뒤로가기 시 앱 종료 확인 모달 또는 Splash 복귀. 브라우저 뒤로가기 특수 처리 확인.",
+    "one-way": "⚠️ **이전 화면 복귀 금지** — 뒤로가기/iOS 스와이프 백 제스처 시 이전 화면(인증·주문 플로우)으로 돌아가면 안 됨. 차단 또는 홈 이동 또는 확인 모달. 재실행 방지 검증.",
+    "sequential": "뒤로가기 → 이전 단계 화면 복귀 + 입력값(이메일·코드·약관 체크) 유지 확인.",
+    "overlay": "뒤로가기 / 외부 영역 탭 / Escape → 오버레이만 닫힘, 배경 화면 상태 그대로 유지.",
+    "detail": "뒤로가기 → 리스트 화면 복귀 + 이전 스크롤 위치 유지.",
+    "static": "뒤로가기 → 상위 화면 자연 복귀 (depth 2+ 에서만 확인 TC 추가).",
+}
+
+
+def load_screen_code_map(project_name: str) -> dict[str, dict[str, str]]:
+    """projects/{project}/screen_code_map.md를 파싱.
+
+    Returns:
+        {middle_name: {"code": str, "character": str, "navigation": str}}
+    파일 테이블 형식:
+        `| Middle | Code | 성격 | 네비 | SCR-ID | 설명 |`
+        성격/네비 컬럼은 선택. 없으면 빈 문자열.
+    """
+    cache_key = project_name.lower()
+    if cache_key in _SCREEN_CODE_CACHE:
+        return _SCREEN_CODE_CACHE[cache_key]
+
+    if not PROJECTS_RULES_DIR.exists():
+        _SCREEN_CODE_CACHE[cache_key] = {}
+        return {}
+
+    pname_lower = project_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+    mapping: dict[str, dict[str, str]] = {}
+    valid_chars = {"entry", "data-fetch", "realtime", "form", "overlay", "static"}
+    valid_navs  = {"tab-root", "one-way", "sequential", "overlay", "detail", "static"}
+    for folder in PROJECTS_RULES_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        fname_lower = folder.name.lower().replace(" ", "").replace("-", "").replace("_", "")
+        if fname_lower not in pname_lower and pname_lower not in fname_lower:
+            continue
+        map_file = folder / "screen_code_map.md"
+        if not map_file.exists():
+            continue
+        text = map_file.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("|") or not line.endswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 2:
+                continue
+            middle, code = cells[0], cells[1]
+            if not middle or not code:
+                continue
+            if re.match(r"^-+$", middle) or middle.lower() in ("middle name", "이름"):
+                continue
+            if not re.fullmatch(r"[A-Z]{2,5}", code):
+                continue
+            # 3번째 셀: 성격 (선택)
+            character = ""
+            if len(cells) >= 3:
+                cand = cells[2].lower().strip()
+                if cand in valid_chars:
+                    character = cand
+            # 4번째 셀: 네비게이션 (선택)
+            navigation = ""
+            if len(cells) >= 4:
+                cand = cells[3].lower().strip()
+                if cand in valid_navs:
+                    navigation = cand
+            # navigation이 비어있으면 character 기반 기본 추론
+            if not navigation:
+                if character == "overlay":
+                    navigation = "overlay"
+                elif character == "static":
+                    navigation = "static"
+                else:
+                    navigation = "sequential"  # 안전한 기본값
+            if middle not in mapping:
+                mapping[middle] = {
+                    "code": code,
+                    "character": character,
+                    "navigation": navigation,
+                }
+        break
+
+    _SCREEN_CODE_CACHE[cache_key] = mapping
+    return mapping
+
+
+def resolve_screen_code(middle_name: str, screen_map: dict) -> str:
+    """Middle 이름을 ScreenCode로 변환.
+
+    1. screen_map 정확 일치 우선 (신규 구조 {code, character} 또는 구조 str)
+    2. 없으면 영문자 3자 uppercase 자동 파생
+    3. 영문자 부족 시 해시 기반 MID### 폴백
+    """
+    if not middle_name:
+        return "SCR"
+    if middle_name in screen_map:
+        entry = screen_map[middle_name]
+        # 구 포맷(str) / 신 포맷(dict) 양쪽 호환
+        if isinstance(entry, dict):
+            return entry.get("code") or "SCR"
+        return entry
+    alpha = re.sub(r"[^A-Za-z]", "", middle_name)
+    if len(alpha) >= 3:
+        return alpha[:3].upper()
+    return f"MID{abs(hash(middle_name)) % 1000:03d}"
+
+
+def resolve_screen_character(middle_name: str, screen_map: dict) -> str:
+    """Middle 이름의 성격(character) 반환. 맵에 없으면 빈 문자열.
+
+    비기능 TC 조건부 생성 (원칙 E)에서 프롬프트 힌트로 사용.
+    """
+    if not middle_name or middle_name not in screen_map:
+        return ""
+    entry = screen_map[middle_name]
+    if isinstance(entry, dict):
+        return entry.get("character", "")
+    return ""
+
+
+def resolve_screen_navigation(middle_name: str, screen_map: dict) -> str:
+    """Middle 이름의 네비게이션 분류 반환. 맵에 없으면 빈 문자열.
+
+    뒤로가기/스와이프 TC 조건부 생성 (원칙 F)에서 프롬프트 힌트로 사용.
+    """
+    if not middle_name or middle_name not in screen_map:
+        return ""
+    entry = screen_map[middle_name]
+    if isinstance(entry, dict):
+        return entry.get("navigation", "")
+    return ""
+
+
+def renumber_tc_ids(tc_md: str, project_code: str, suite_code: str, starting_seq: int) -> tuple[str, int]:
+    """Markdown 내 TC ID(`{PC}-{SC}-NNN`)를 starting_seq부터 연속 재번호.
+
+    같은 TC 블록(### ...) 안에서 여러 번 나오는 동일 ID는 하나로 취급.
+    Suite 내 SeqNumber 전역 유니크 규칙 (tc-rules.md 섹션 2-1) 강제.
+
+    Returns:
+        (renumbered_md, next_seq_after_last)
+    """
+    if not suite_code:
+        return tc_md, starting_seq
+
+    pattern = re.compile(
+        rf"({re.escape(project_code)}-{re.escape(suite_code)}-)(\d{{3,}})",
+        re.IGNORECASE,
+    )
+
+    # 블록 분할: "### " 헤더 기준
+    blocks = re.split(r"(?m)(?=^### )", tc_md)
+    next_seq = starting_seq
+    id_remap: dict[str, str] = {}
+
+    for i, block in enumerate(blocks):
+        header_match = re.match(r"^### .*", block)
+        if not header_match:
+            continue
+        header = header_match.group(0)
+        first = pattern.search(header)
+        if not first:
+            continue
+        old_id = first.group(0)
+        if old_id not in id_remap:
+            new_id = f"{first.group(1)}{next_seq:03d}"
+            id_remap[old_id] = new_id
+            next_seq += 1
+
+    # 모든 TC ID 치환 (블록 헤더 + 본문 참조 모두)
+    def _sub(m: re.Match) -> str:
+        old = m.group(0)
+        return id_remap.get(old, old)
+
+    return pattern.sub(_sub, tc_md), next_seq
+
+
 def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
-                          project_name: str, classification: str) -> str:
+                          project_name: str, classification: str,
+                          starting_seq: int = 1,
+                          screen_character: str = "",
+                          screen_navigation: str = "") -> str:
     # 해당 도메인의 분류 섹션 추출
     domain_section = extract_domain_section(classification, domain["code"])
     project_code = _detect_project_code(project_name)
 
     suite_code = domain.get("suite_code", "").strip().strip("-")  # trailing 하이픈 제거
     if suite_code:
-        example_id = f"{project_code}-{suite_code}-001"
-        tc_id_instruction = f"⚠️ TC ID 형식: `{example_id}`, `{project_code}-{suite_code}-002`, ... 하이픈은 정확히 이 위치에만. `{project_code}-{suite_code}--001` 처럼 하이픈이 연속되면 안 됩니다."
+        seq_str = f"{starting_seq:03d}"
+        next_str = f"{starting_seq+1:03d}"
+        example_id = f"{project_code}-{suite_code}-{seq_str}"
+        tc_id_instruction = (
+            f"⚠️ TC ID 형식: `{example_id}`, `{project_code}-{suite_code}-{next_str}`, ... "
+            f"하이픈은 정확히 이 위치에만. `{project_code}-{suite_code}--001` 처럼 하이픈이 연속되면 안 됩니다.\n"
+            f"⚠️ **Suite 내 SeqNumber 전역 유니크**: 이 호출의 시작 번호는 `{seq_str}`. "
+            f"중분류가 바뀌어도 001로 리셋하지 말고 {seq_str}부터 연속 증가. "
+            f"(tc-rules.md 섹션 2-1 SeqNumber 전역 유니크 규칙)"
+        )
     else:
         tc_id_instruction = f"⚠️ TC ID의 ProjectCode: `{project_code}` (예: {project_code}-XXXX-001). `TC-`로 시작하면 안 됩니다."
 
     focus_middle = domain.get("_focus_middle", "")
+
+    # 화면 성격별 비기능 TC 힌트 (tc-rules.md 원칙 E)
+    nfr_instruction = ""
+    if screen_character and screen_character != "static":
+        guide = SCREEN_CHARACTER_NFR_GUIDE.get(screen_character, "")
+        if guide:
+            screen_label = focus_middle or "화면"
+            nfr_instruction = (
+                f"\n## ⚙️ 비기능 TC 필수 포함 (원칙 E — 화면 성격: `{screen_character}`)\n\n"
+                f"이 화면은 `{screen_character}` 성격이므로 아래 비기능 TC를 **반드시 1개 이상** 포함하세요:\n"
+                f"- {guide}\n\n"
+                f"TC 작성 예시 (entry 성격 화면):\n"
+                f"```\n"
+                f"### {project_code}-{suite_code}-XXX — {screen_label} 로딩 시간\n"
+                f"| 분류 | Edge |\n| 우선순위 | Medium |\n\n"
+                f"**사전 조건**\n1. 3G 또는 저사양 기기 환경인 상태\n\n"
+                f"**테스트 단계**\n화면 완전 표시까지의 시간을 측정한다.\n\n"
+                f"**예상 결과**\n- (업계 표준 임계치) 이내에 표시된다\n\n"
+                f"**비고**\n- [미결] 임계치는 업계 표준 기반 추정. PM 확정 필요.\n"
+                f"```\n"
+            )
+    elif screen_character == "static":
+        nfr_instruction = (
+            f"\n## ⚙️ 비기능 TC (원칙 E — 화면 성격: `static`)\n\n"
+            f"이 화면은 정적 컨텐츠이므로 **비기능 TC는 생성하지 마세요** (로딩·성능·실시간 TC 불필요).\n"
+        )
+
+    # 네비게이션 분류별 뒤로가기/스와이프 TC 힌트 (tc-rules.md 원칙 F)
+    nav_instruction = ""
+    if screen_navigation:
+        nav_guide = SCREEN_NAVIGATION_TC_GUIDE.get(screen_navigation, "")
+        screen_label = focus_middle or "화면"
+        if screen_navigation == "one-way":
+            nav_instruction = (
+                f"\n## ⚠️ 뒤로가기/스와이프 TC 필수 (원칙 F — 네비게이션: `one-way`)\n\n"
+                f"이 화면은 **완료 화면**이므로 뒤로가기 시 이전 화면 복귀를 차단해야 합니다:\n"
+                f"- {nav_guide}\n\n"
+                f"**반드시 아래 Negative TC를 1개 포함하세요** (우선순위 High):\n"
+                f"```\n"
+                f"### {project_code}-{suite_code}-XXX — {screen_label} 후 뒤로가기/스와이프 차단\n"
+                f"| 분류 | Negative |\n| 우선순위 | High |\n\n"
+                f"**사전 조건**\n1. 모바일 브라우저에서 접속한 상태\n"
+                f"2. {screen_label} 화면에 진입 완료한 상태\n\n"
+                f"**테스트 단계**\n브라우저 뒤로가기 버튼 또는 iOS 스와이프 백 제스처를 실행한다.\n\n"
+                f"**예상 결과**\n- 이전 화면(인증·주문 등)으로 돌아가지 않는다\n"
+                f"- 홈 이동 / 뒤로가기 차단 / 확인 모달 중 하나가 발생한다\n"
+                f"- 이미 완료된 플로우를 재실행할 수 없는 상태가 유지된다\n\n"
+                f"**비고**\n- [미결] 구체적 차단 방식은 PM 확정 필요\n"
+                f"```\n"
+            )
+        elif screen_navigation in ("tab-root", "sequential", "overlay", "detail"):
+            nav_instruction = (
+                f"\n## ⚙️ 뒤로가기/스와이프 TC 포함 (원칙 F — 네비게이션: `{screen_navigation}`)\n\n"
+                f"이 화면의 뒤로가기 동작을 검증하는 TC를 1개 포함하세요:\n"
+                f"- {nav_guide}\n"
+            )
+        # static은 TC 불필요 (별도 instruction 없음)
+
     middle_instruction = ""
     if focus_middle:
         middle_instruction = f"""
@@ -1207,18 +1895,46 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 다른 중분류의 TC는 작성하지 마세요. "{focus_middle}" 중분류의 모든 소분류에 대해 빠짐없이 작성하세요.
 """
 
+    # 중분류 이름으로부터 관련 화면 코드(SCR-xxx / SCREEN-xxx / PAGE-xxx) 자동 탐지
+    # features_text(원문 섹션 발췌 or features 전체)에서 중분류 이름 근처의 화면 코드를 찾는다.
+    screen_code_hint = ""
+    if focus_middle:
+        detected = _detect_screen_codes_for_middle(focus_middle, features_text)
+        if detected:
+            codes_str = ", ".join(detected[:5])
+            screen_code_hint = f"""
+## 📱 연관 화면 코드 (필수 필드)
+이 중분류 "{focus_middle}"는 기획서의 다음 화면 코드와 대응합니다: **{codes_str}**
+
+⚠️ **필수**: 각 TC 메타 테이블에 반드시 `| 연관 화면 | {detected[0]} |` 형식으로 화면 코드를 기재하세요.
+- 여러 화면에 걸치면 쉼표로 구분: `| 연관 화면 | SCR-001, SCR-002 |`
+- 화면명 없이 코드만 적으세요. (예: "SCR-001" ✅ / "Splash (SCR-001)" ❌ — 화면명은 중분류에 이미 있음)
+"""
+        else:
+            # 코드가 없으면 fallback: 중분류 이름을 화면명으로 사용
+            screen_code_hint = f"""
+## 📱 연관 화면 (필수 필드)
+이 중분류에 대응하는 화면 코드(SCR-xxx/SCREEN-xxx 등)가 원문에서 자동 탐지되지 않았습니다.
+
+⚠️ **필수**: 각 TC 메타 테이블에 `| 연관 화면 | {focus_middle} |` 형식으로 화면명을 기재하세요.
+(원문에 SCR 코드가 있으면 코드를, 없으면 화면명을 사용)
+"""
+
     return f"""프로젝트: {project_name}
 도메인: {domain['name']} ({domain['code']})
 {tc_id_instruction}
 {middle_instruction}
+{nfr_instruction}
+{nav_instruction}
+{screen_code_hint}
 ## 이 도메인의 분류 구조
 {domain_section}
 
 ## 전체 기능 목록 (참고)
-{features_text[:3000]}
+{features_text[:15000]}
 
 ## 관련 정책
-{policy_text[:3000]}
+{policy_text[:15000]}
 
 위 도메인({domain['name']}){' 중 "' + focus_middle + '" 중분류' if focus_middle else ''}에 속하는 TC를 아래 4가지 카테고리 순서로 상세하게 작성해주세요.
 해당 카테고리에 만들 TC가 없으면 skip합니다.
@@ -1232,27 +1948,296 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 ⚠️ 이미 다른 TC에서 검증되는 내용은 중복 작성하지 마세요.
 ⚠️ 중분류당 TC는 5~15개가 적정합니다. 유의미한 TC만 작성하고 양을 채우기 위한 TC는 만들지 마세요.
 - 사전 조건은 반드시 번호 개조식으로 작성
+- **각 TC의 메타 테이블에 `| 연관 화면 |` 필드를 반드시 포함**하세요 (위 📱 섹션 참고)
 """
 
 
+def _detect_screen_codes_for_middle(middle: str, text: str) -> list[str]:
+    """중분류 이름이 언급된 부근에서 화면 코드(SCR-NNN / SCREEN-NNN / PAGE-NNN)를 추출.
+    우선순위:
+      1. `| SCR-xxx | {middle} | ...` 인벤토리 표 행 (정확 매칭)
+      2. middle 이름 주변 ±300자에 등장하는 SCR/SCREEN/PAGE 코드
+    반환: 등장 순서 · 중복 제거한 코드 리스트
+    """
+    if not middle or not text:
+        return []
+    codes = []
+    seen = set()
+
+    # 패턴 1: 인벤토리 표 행 — `| CODE | NAME | ...`
+    row_pat = re.compile(r"\|\s*((?:SCR|SCREEN|PAGE)-[A-Z0-9]+)\s*\|\s*([^|]+?)\s*\|")
+    for m in row_pat.finditer(text):
+        code, name = m.group(1), m.group(2).strip()
+        if middle.lower() in name.lower() or name.lower() in middle.lower():
+            if code not in seen:
+                codes.append(code)
+                seen.add(code)
+
+    if codes:
+        return codes
+
+    # 패턴 2: middle 이름 주변에 등장하는 코드 (±300자 윈도우)
+    code_pat = re.compile(r"(?:SCR|SCREEN|PAGE)-[A-Z0-9]+")
+    for m in re.finditer(re.escape(middle), text, re.IGNORECASE):
+        start = max(0, m.start() - 300)
+        end = min(len(text), m.end() + 300)
+        window = text[start:end]
+        for c in code_pat.findall(window):
+            if c not in seen:
+                codes.append(c)
+                seen.add(c)
+    return codes
+
+
 def extract_domain_section(classification: str, domain_code: str) -> str:
+    """분류표에서 특정 대분류 섹션 추출.
+    괄호 코드(`## 대분류: 이름 (CODE)`) 형식과 코드 없는 형식(`## 대분류: 이름`) 모두 지원.
+    domain_code는 extract_domains에서 자동 생성된 코드(이름의 영문자 대문자 약어)."""
     lines = classification.splitlines()
     result = []
     in_section = False
     for line in lines:
-        if re.search(rf"[\(\（]{domain_code}[\)\）]", line):
-            in_section = True
-        elif in_section and re.match(r"^##\s+대분류", line) and domain_code not in line:
-            break
+        # 새 섹션 시작 감지
+        m = re.match(r"^##\s+(.+)", line)
+        if m and not line.startswith("###"):
+            text = m.group(1).strip()
+            text = re.sub(r"^대분류[:\s]*", "", text).strip()
+            # 괄호 코드가 있으면 그걸로 매칭
+            cm = re.search(r"[\(\（]([A-Z]{2,8})[\)\）]", text)
+            if cm:
+                matched = (cm.group(1) == domain_code)
+            else:
+                # 괄호 없음 → 이름에서 코드 자동 생성하여 매칭
+                name_only = re.sub(r"\s*[\(\（][^\)\）]*[\)\）]", "", text).strip()
+                auto_code = re.sub(r"[^A-Za-z]", "", name_only).upper()[:6] or "FUNC"
+                matched = (auto_code == domain_code)
+            if matched:
+                in_section = True
+                result.append(line)
+                continue
+            elif in_section:
+                break
         if in_section:
             result.append(line)
     return "\n".join(result) if result else classification[:1000]
 
 
 # ── 7단계: TC 검토 ────────────────────────────────────────────────────────────
-def step_review(sess: dict, tc_content: str, project_name: str) -> str:
+def _extract_covered_middles(tc_content: str) -> set:
+    """TC 초안에서 실제로 다뤄진 (대분류, 중분류) 페어 추출.
+    세 가지 패턴 지원:
+      1. `**대분류**: X` / `**중분류**: Y` 라인 (bold 라인 스타일)
+      2. `## 대분류 / ### 중분류` 섹션 헤더 스타일
+      3. `| 대분류 | X |` / `| 중분류 | Y |` 마크다운 테이블 스타일 (현재 TC 형식)
+    """
+    covered = set()
+
+    # 패턴 1: bold 라인 스타일
+    major = None
+    middle = None
+    for line in tc_content.splitlines():
+        m_major = re.search(r"\*\*대분류\*\*\s*[:：]\s*(.+)", line)
+        m_middle = re.search(r"\*\*중분류\*\*\s*[:：]\s*(.+)", line)
+        if m_major:
+            major = m_major.group(1).strip()
+        if m_middle:
+            middle = m_middle.group(1).strip()
+            if major and middle:
+                covered.add((major, middle))
+
+    # 패턴 2: 섹션 헤더 스타일
+    cur_major = None
+    for line in tc_content.splitlines():
+        line_s = line.strip()
+        if line_s.startswith("## ") and not line_s.startswith("### "):
+            txt = re.sub(r"^##\s+", "", line_s).strip()
+            txt = re.sub(r"^대분류[:\s]*", "", txt).strip()
+            txt = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", txt).strip()
+            if txt and not txt.startswith("카테고리"):
+                cur_major = txt
+        elif line_s.startswith("### ") and cur_major:
+            txt = re.sub(r"^###\s+", "", line_s).strip()
+            txt = re.sub(r"^중분류[:\s]*", "", txt).strip()
+            txt = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", txt).strip()
+            if txt and not txt.lower().startswith("tc") and not txt.startswith("카테고리"):
+                covered.add((cur_major, txt))
+
+    # 패턴 3: 마크다운 테이블 — TC 블록별로 대분류/중분류 짝맞춤
+    # 각 `### TC-ID` 블록 안에서 `| 대분류 | X |`과 `| 중분류 | Y |`를 찾는다
+    blocks = re.split(r"\n(?=###\s)", tc_content)
+    for block in blocks:
+        if not block.strip().startswith("###"):
+            continue
+        major_match = re.search(r"\|\s*대분류\s*\|\s*([^|]+?)\s*\|", block)
+        middle_match = re.search(r"\|\s*중분류\s*\|\s*([^|]+?)\s*\|", block)
+        if major_match and middle_match:
+            maj = major_match.group(1).strip()
+            mid = middle_match.group(1).strip()
+            # 괄호 코드 제거
+            maj = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", maj).strip()
+            mid = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", mid).strip()
+            if maj and mid:
+                covered.add((maj, mid))
+
+    return covered
+
+
+def _extract_classification_middles(classification: str) -> list:
+    """분류표에서 (대분류, 중분류) 순서 리스트 반환."""
+    pairs = []
+    cur_major = None
+    for line in classification.splitlines():
+        line_s = line.strip()
+        if line_s.startswith("## ") and not line_s.startswith("### "):
+            txt = re.sub(r"^##\s+", "", line_s).strip()
+            txt = re.sub(r"^대분류[:\s]*", "", txt).strip()
+            txt = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", txt).strip()
+            if txt:
+                cur_major = txt
+        elif line_s.startswith("### ") and cur_major:
+            txt = re.sub(r"^###\s+", "", line_s).strip()
+            txt = re.sub(r"^중분류[:\s]*", "", txt).strip()
+            txt = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", txt).strip()
+            if txt:
+                pairs.append((cur_major, txt))
+    return pairs
+
+
+def _generate_missing_tc_for_middle(sess: dict, major: str, middle: str,
+                                    classification: str, features_text: str,
+                                    policy_text: str, project_name: str,
+                                    tc_rules: str, fewshot: str,
+                                    project_policies: str,
+                                    screen_based: bool, screen_map: dict,
+                                    project_code: str) -> str:
+    """누락된 (대분류, 중분류) 하나에 대해 TC를 생성해 돌려준다."""
+    # 대분류 코드 복원 (extract_domains 규칙과 동일)
+    cm = re.search(r"[\(\（]([A-Z]{2,8})[\)\）]", major)
+    if cm:
+        domain_code = cm.group(1)
+        domain_name = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", major).strip()
+    else:
+        domain_name = major
+        domain_code = re.sub(r"[^A-Za-z]", "", domain_name).upper()[:6] or "FUNC"
+
+    # Screen-based면 screen code 매핑
+    if screen_based:
+        effective_code = resolve_screen_code(middle, screen_map)
+        screen_character = resolve_screen_character(middle, screen_map)
+        screen_navigation = resolve_screen_navigation(middle, screen_map)
+        starting_seq = 1
+    else:
+        effective_code = domain_code
+        screen_character = ""
+        screen_navigation = ""
+        starting_seq = 1
+
+    domain_with_middle = {
+        "name": domain_name,
+        "code": domain_code,
+        "suite_code": effective_code,
+        "_focus_middle": middle,
+    }
+    # 섹션 발췌 (Quick / 정책 반영 최적화 공통)
+    effective_features = features_text
+    effective_policy = policy_text
+    if sess.get("_quick_mode") or sess.get("_section_extract"):
+        raw_full = sess.get("_raw_text", "")
+        section = extract_section_from_raw(raw_full, middle, major_name=domain_name)
+        if section:
+            effective_features = section
+            if sess.get("_quick_mode"):
+                effective_policy = section
+            else:
+                effective_policy = (policy_text[:4000] + "\n\n---\n\n원문 섹션:\n" + section) if policy_text else section
+    system = build_tc_system_prompt(tc_rules, classification, project_policies, fewshot)
+    user = build_tc_user_prompt(domain_with_middle, effective_features, effective_policy,
+                                project_name, classification,
+                                starting_seq=starting_seq,
+                                screen_character=screen_character,
+                                screen_navigation=screen_navigation)
+    try:
+        tc_draft = call_claude(system, user, max_tokens=16000)
+    except Exception as e:
+        push_log(sess, f"[검토-보강] {domain_code}/{middle} 생성 실패: {e}")
+        return ""
+
+    # TC ID 재번호링
+    if effective_code:
+        tc_draft, _ = renumber_tc_ids(tc_draft, project_code, effective_code, starting_seq)
+    return tc_draft
+
+
+def step_review(sess: dict, tc_content: str, project_name: str,
+                approved_classification: str = "",
+                features_text: str = "", policy_text: str = "") -> str:
+    """TC 품질 검토 + 누락 중분류 자동 보강.
+    approved_classification이 주어지면 분류표 vs TC 초안 비교하여 누락 중분류의 TC를 자동 생성하고 tc_content에 추가한다.
+    sess["_augmented_tc"]에 보강된 tc_content를 저장한다."""
     push_log(sess, "[검토] TC 품질 검토 중...")
+
+    # ── 1) 누락 탐지 ─────────────────────────────────────────────
+    augmented = tc_content
+    missing_pairs = []
+    if approved_classification:
+        expected = _extract_classification_middles(approved_classification)
+        covered = _extract_covered_middles(tc_content)
+        # 대소문자·공백 관용 매칭
+        def norm(s): return re.sub(r"\s+", "", s).lower()
+        covered_norm = {(norm(a), norm(b)) for a, b in covered}
+        for (maj, mid) in expected:
+            if (norm(maj), norm(mid)) not in covered_norm:
+                missing_pairs.append((maj, mid))
+        if missing_pairs:
+            push_log(sess, f"[검토] 누락된 중분류 {len(missing_pairs)}개 탐지: "
+                             + ", ".join(f"{m}/{n}" for m, n in missing_pairs[:5])
+                             + (" ..." if len(missing_pairs) > 5 else ""))
+        else:
+            push_log(sess, "[검토] 누락된 중분류 없음 (분류표 전체 커버)")
+
+    # ── 2) 누락 보강 ─────────────────────────────────────────────
+    if missing_pairs and features_text and policy_text:
+        tc_rules = load_tc_rules()
+        fewshot = load_fewshot_examples()
+        project_policies = load_project_policies(project_name)
+        project_code = _detect_project_code(project_name)
+        user_auto_flag = sess.get("auto_screen_code")
+        if user_auto_flag is True:
+            screen_based = True
+        elif user_auto_flag is False:
+            screen_based = False
+        else:
+            screen_based = _is_screen_based(project_code)
+        screen_map = load_screen_code_map(project_name) if screen_based else {}
+
+        added_parts = []
+        total_missing = len(missing_pairs)
+        # 보강 단계: 82 → 87 구간을 누락 개수로 분할 + ETA 동적 갱신
+        for idx, (maj, mid) in enumerate(missing_pairs):
+            push_log(sess, f"[검토-보강] [{idx+1}/{total_missing}] {maj}/{mid} TC 생성 중...")
+            remaining = total_missing - idx
+            pct = 82 + int(5 * (idx / max(total_missing, 1)))
+            push_stage(sess, 4, f"TC 보강 {idx+1}/{total_missing} — {mid}", pct,
+                       eta_sec=remaining * 30 + 10)
+            part = _generate_missing_tc_for_middle(
+                sess, maj, mid, approved_classification, features_text, policy_text,
+                project_name, tc_rules, fewshot, project_policies,
+                screen_based, screen_map, project_code
+            )
+            if part.strip():
+                added_parts.append(part)
+            check_stop(sess)
+        if added_parts:
+            augmented = tc_content + "\n\n---\n\n## 검토 단계 보강 TC\n\n" + "\n\n---\n\n".join(added_parts)
+            push_log(sess, f"[검토-보강] 보강 완료 — {len(added_parts)}개 중분류 TC 추가")
+
+    sess["_augmented_tc"] = augmented
+
+    # ── 3) 리포트 작성 ──────────────────────────────────────────
     system = """당신은 시니어 QA 리뷰어입니다. TC 초안을 검토하고 개선 리포트를 작성합니다."""
+    missing_section = ""
+    if missing_pairs:
+        missing_section = "\n누락 중분류 (자동 보강됨):\n" + "\n".join(f"- {m}/{n}" for m, n in missing_pairs[:30])
     user = f"""프로젝트: {project_name}
 
 다음 TC 초안을 검토하고 review_report.md를 작성해주세요:
@@ -1264,6 +2249,7 @@ def step_review(sess: dict, tc_content: str, project_name: str) -> str:
 4. 최소 TC 세트 선별 적절성
 5. 예상 결과 측정 가능성
 6. 누락된 케이스
+{missing_section}
 
 TC 초안 (처음 5000자):
 ---
@@ -1276,8 +2262,12 @@ TC 초안 (처음 5000자):
 ## 발견된 이슈
 ## 개선 권장 사항
 ## 최소 TC 세트 검증
+## 누락 중분류 보강 결과
 """
-    result = call_claude(system, user, max_tokens=3000)
+    try:
+        result = call_claude(system, user, max_tokens=3000)
+    except Exception as e:
+        result = f"# TC 검토 보고서\n\n검토 실행 중 오류: {e}\n"
     review_path = sess["workspace"] / "07_review_report.md"
     review_path.write_text(result, encoding="utf-8")
     push_log(sess, "[검토] 검토 완료")
@@ -1310,7 +2300,7 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
 
     # build_excel.py 호출
     if BUILD_EXCEL.exists():
-        push_log(sess, f"[빌드] build_excel.py 호출 중...")
+        push_log(sess, f"[빌드] build_excel.py 호출 중... (대분류별 시트 생성 · 60초 내외)")
         try:
             proc = subprocess.run(
                 [sys.executable, str(BUILD_EXCEL),
@@ -1321,6 +2311,10 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
             )
             if proc.returncode == 0:
                 push_log(sess, "[빌드] build_excel.py 성공")
+                # stdout에서 Smoke TC 개수 추출 → session에 저장 (done 이벤트에서 활용)
+                m = re.search(r"🔥 Smoke Test\s*:\s*(\d+)개", proc.stdout or "")
+                if m:
+                    sess["smoke_tc"] = int(m.group(1))
                 # 가장 최근 Excel 파일 찾기
                 excel_files = sorted(out_dir.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if excel_files:
@@ -1653,38 +2647,70 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         if focus_area:
             push_log(sess, f"[포커스] TC 생성 범위: {focus_area}")
 
-        # ── 정책 분석 ──
-        if resumed and resumed.get("stage") in ("features", "classifying", "gate_waiting", "tc_writing"):
-            policy_text = resumed["data"].get("policy_text", "")
-            push_log(sess, f"[이어서] 정책 분석 복원됨 ({len(policy_text):,}자)")
+        # 생성 모드 결정 (resume 시에도 동일 로직 사용)
+        gen_mode = sess.get("generation_mode", "summary")
+        if gen_mode == "direct":
+            push_log(sess, f"[모드] Quick 모드 — 3단계 (인벤토리 → 분류 → 섹션 발췌 TC)")
         else:
-            sess["status"] = "policy"
-            push_stage(sess, 2, "정책 분석", 15)
-            policy_text = step_policy(sess, raw_text, project_name, focus_area)
-            check_stop(sess)
-            save_pipeline_state(project_name, "policy", {"raw_text": raw_text[:20000], "policy_text": policy_text, "focus_area": focus_area, "sources_info": _sources_info})
+            push_log(sess, f"[모드] 정책 반영 모드 — 3단계 (통합 추출 → 분류 → 섹션 발췌 TC)")
 
-        # ── 기능 목록 ──
-        if resumed and resumed.get("stage") in ("classifying", "gate_waiting", "tc_writing"):
-            features_text = resumed["data"].get("features_text", "")
-            push_log(sess, f"[이어서] 기능 목록 복원됨 ({len(features_text):,}자)")
-        else:
-            sess["status"] = "features"
-            push_stage(sess, 2, "기능 목록 생성", 25)
-            features_text = step_features(sess, policy_text, project_name, focus_area)
-            check_stop(sess)
-            save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "focus_area": focus_area, "sources_info": _sources_info})
+        if gen_mode == "direct":
+            # ── Quick 모드 3단계: 인벤토리 → 분류표 → 섹션발췌(TC 작성 시) ──
+            # policy_text는 원문 전체 유지 (TC 작성 시 일반 정책 참조용으로도 사용됨)
+            policy_text = raw_text
+            if resumed and resumed.get("stage") in ("gate_waiting", "tc_writing"):
+                # 복원 시 inventory도 복원 (있으면)
+                inventory_text = resumed["data"].get("inventory_text", "") or resumed["data"].get("features_text", "")
+                features_text = inventory_text or raw_text
+                classification = resumed["data"].get("classification", "")
+                push_log(sess, f"[이어서] 분류표 복원됨 ({len(classification):,}자)")
+            else:
+                # 1단계: 인벤토리 추출
+                sess["status"] = "inventory"
+                push_stage(sess, 2, "인벤토리 추출 (Quick 1/3)", 18)
+                inventory_text = step_quick_inventory(sess, raw_text, project_name, focus_area)
+                check_stop(sess)
+                save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": raw_text[:20000], "features_text": inventory_text, "inventory_text": inventory_text, "focus_area": focus_area, "sources_info": _sources_info})
 
-        # ── 분류표 ──
-        if resumed and resumed.get("stage") in ("gate_waiting", "tc_writing"):
-            classification = resumed["data"].get("classification", "")
-            push_log(sess, f"[이어서] 분류표 복원됨 ({len(classification):,}자)")
+                # 2단계: 인벤토리 → 분류표
+                sess["status"] = "classifying"
+                push_stage(sess, 2, "분류표 생성 (Quick 2/3)", 35)
+                classification = step_classify_from_inventory(sess, inventory_text, project_name, focus_area)
+                check_stop(sess)
+                # features_text 자리에 inventory_text를 세팅 — TC 작성 시 참고 목록으로 사용
+                features_text = inventory_text
+                save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": raw_text[:20000], "features_text": inventory_text, "inventory_text": inventory_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info})
+            # sess에 flag 저장 — step_write_tc가 섹션 발췌 모드로 동작하도록
+            sess["_quick_mode"] = True
+            sess["_raw_text"] = raw_text
         else:
-            sess["status"] = "classifying"
-            push_stage(sess, 2, "분류표 생성", 38)
-            classification = step_classify(sess, features_text, project_name, focus_area)
-            check_stop(sess)
-            save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info})
+            # ── 정책 반영 모드 (최적화: 정책+기능 통합 1회 호출 + TC 작성 섹션 발췌) ──
+            # 정책+기능 통합 추출 (기존 policy→features 2회 호출을 1회로)
+            if resumed and resumed.get("stage") in ("classifying", "gate_waiting", "tc_writing"):
+                policy_text = resumed["data"].get("policy_text", "")
+                features_text = resumed["data"].get("features_text", "")
+                push_log(sess, f"[이어서] 정책·기능 복원됨 (정책 {len(policy_text):,}자, 기능 {len(features_text):,}자)")
+            else:
+                sess["status"] = "policy_features"
+                push_stage(sess, 2, "정책·기능 통합 추출", 22)
+                policy_text, features_text = step_policy_features_combined(sess, raw_text, project_name, focus_area)
+                check_stop(sess)
+                save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "focus_area": focus_area, "sources_info": _sources_info})
+
+            # 분류표
+            if resumed and resumed.get("stage") in ("gate_waiting", "tc_writing"):
+                classification = resumed["data"].get("classification", "")
+                push_log(sess, f"[이어서] 분류표 복원됨 ({len(classification):,}자)")
+            else:
+                sess["status"] = "classifying"
+                push_stage(sess, 2, "분류표 생성", 38)
+                classification = step_classify(sess, features_text, project_name, focus_area)
+                check_stop(sess)
+                save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info})
+
+            # 정책 반영 모드도 TC 작성 시 원문 섹션 발췌 적용 (Quick 모드와 동일)
+            sess["_raw_text"] = raw_text
+            sess["_section_extract"] = True
 
         # Human Gate
         push_stage(sess, 3, "분류표 검토 대기", 45)
@@ -1700,16 +2726,34 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         )
         check_stop(sess)
 
-        # TC 검토
+        # TC 검토 (누락 중분류 자동 보강 포함)
         sess["status"] = "reviewing"
-        push_stage(sess, 4, "TC 품질 검토", 82)
-        step_review(sess, tc_content, project_name)
+        # 검토 시작 — 누락 탐지 약 10초 + 보강(중분류당 ~30초) 가변
+        push_stage(sess, 4, "TC 품질 검토 — 누락 탐지 중", 82, eta_sec=20)
+        step_review(sess, tc_content, project_name,
+                    approved_classification=approved,
+                    features_text=features_text,
+                    policy_text=policy_text)
         check_stop(sess)
+        # 보강된 TC가 있으면 채택
+        augmented_tc = sess.get("_augmented_tc")
+        if augmented_tc and augmented_tc != tc_content:
+            tc_content = augmented_tc
+            # 보강된 TC의 개수 재계산
+            new_tc_count = len(re.findall(r"^###\s+(?!카테고리)", tc_content, re.MULTILINE))
+            if new_tc_count > total_tc:
+                added = new_tc_count - total_tc
+                push_log(sess, f"[검토-보강] TC 총 {new_tc_count}개 (원본 {total_tc} + 보강 {added})")
+                total_tc = new_tc_count
+                min_tc = max(1, round(total_tc * 0.35))
 
-        # Excel 빌드
+        push_stage(sess, 4, "TC 검토 완료 · Excel 준비", 88, eta_sec=10)
+
+        # Excel 빌드 — tc_final.md 생성(즉시) + build_excel.py 호출(60초 내외)
         sess["status"] = "building"
-        push_stage(sess, 5, "Excel 빌드", 90)
+        push_stage(sess, 5, "Excel 빌드 — 시트 구성 중", 92, eta_sec=60)
         excel_path = step_build_excel(sess, tc_content, project_name, total_tc, min_tc)
+        push_stage(sess, 5, "Excel 빌드 완료 · 마무리 중", 98, eta_sec=3)
 
         # TC 마크다운을 tc_files/에 저장 (수정 모드에서 재사용)
         today = datetime.now().strftime("%Y%m%d")
@@ -1729,6 +2773,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
             "sid":       sess["id"],
             "total_tc":  total_tc,
             "min_tc":    min_tc,
+            "smoke_tc":  sess.get("smoke_tc"),
         })
         push_log(sess, f"[완료] Excel 파일 생성: {excel_path.name} ({excel_path.stat().st_size:,} bytes)")
 
@@ -1901,6 +2946,7 @@ TC 형식 규칙:
             "sid":       sess["id"],
             "total_tc":  total_tc,
             "min_tc":    min_tc,
+            "smoke_tc":  sess.get("smoke_tc"),
         })
         push_log(sess, f"[완료] 수정 Excel 저장: {excel_path.name}")
 
@@ -2020,6 +3066,11 @@ def start():
     sess = new_session()
     sess["project_name"] = project_name
     sess["focus_area"] = focus_area
+    # 생성 모드: "summary" (기본, policy/features/classify 3단계) / "direct" (원문 직접 분류)
+    gen_mode = (data.get("generation_mode") or "summary").strip().lower()
+    if gen_mode not in ("summary", "direct"):
+        gen_mode = "summary"
+    sess["generation_mode"] = gen_mode
     # 소스 정보를 프로젝트에 저장 (다음에 불러오기용)
     sources_to_save = []
     for src in sources:
@@ -2413,6 +3464,25 @@ def stop_pipeline(sid):
     return jsonify({"ok": True})
 
 
+@app.route("/screen-code-map", methods=["GET"])
+def get_screen_code_map():
+    """프로젝트별 Screen Code 매핑 테이블 조회.
+
+    프론트엔드의 Human Gate에서 "시스템 규칙 자동 적용" 모드 ON 시,
+    각 중분류가 어떤 ScreenCode로 매핑될지 미리보기하는 데 사용.
+    """
+    project_name = request.args.get("project", "").strip()
+    project_code = _detect_project_code(project_name)
+    screen_based_default = _is_screen_based(project_code)
+    mapping = load_screen_code_map(project_name) if project_name else {}
+    return jsonify({
+        "ok": True,
+        "project_code": project_code,
+        "screen_based_default": screen_based_default,
+        "map": mapping,
+    })
+
+
 @app.route("/regenerate-classification", methods=["POST"])
 def regenerate_classification():
     """분류표 재생성 — 정책/기능 목록은 유지하고 분류표부터 다시 생성"""
@@ -2466,6 +3536,11 @@ def approve(sid):
     # SuiteCode 저장 (검토자가 Human Gate에서 입력)
     suite_codes = data.get("suite_codes")  # list of codes
     sess["suite_codes"] = suite_codes if suite_codes else []
+    # 시스템 규칙 자동 적용 (screen_code_map 기반 Screen-based 스킴) 여부.
+    # None이면 프로젝트 코드 기반 자동 판별 (_is_screen_based).
+    # True/False면 사용자 명시적 선택 우선.
+    auto_flag = data.get("auto_screen_code")
+    sess["auto_screen_code"] = auto_flag  # None / True / False
     sess["approved"] = content
     sess["gate_event"].set()
     return jsonify({"ok": True})
@@ -2671,7 +3746,10 @@ def get_drive_service():
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
 
-    SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+    SCOPES = [
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
     if not DRIVE_CREDS_FILE.exists():
         raise FileNotFoundError(
             "credentials.json이 없습니다.\n"
@@ -2706,11 +3784,54 @@ def open_folder():
     return jsonify({"ok": True})
 
 
+@app.route("/drive/status")
+def drive_status():
+    """Drive 인증 상태 + 현재 계정 이메일 확인"""
+    try:
+        service = get_drive_service()
+        about = service.about().get(fields="user(emailAddress,displayName)").execute()
+        user = about.get("user", {})
+        return jsonify({
+            "ok": True,
+            "authenticated": True,
+            "email": user.get("emailAddress", ""),
+            "name": user.get("displayName", ""),
+        })
+    except FileNotFoundError as e:
+        return jsonify({"ok": False, "authenticated": False, "error": str(e), "need_credentials": True})
+    except Exception as e:
+        return jsonify({"ok": False, "authenticated": False, "error": str(e)})
+
+
+@app.route("/drive/folders")
+def drive_folders():
+    """Drive 폴더 목록 조회 (검색어 지원)"""
+    q = (request.args.get("q") or "").strip()
+    try:
+        service = get_drive_service()
+        query = "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        if q:
+            # 이름에 검색어 포함된 폴더
+            query += f" and name contains '{q}'"
+        result = service.files().list(
+            q=query,
+            fields="files(id,name,parents,modifiedTime)",
+            orderBy="modifiedTime desc",
+            pageSize=50
+        ).execute()
+        return jsonify({"ok": True, "folders": result.get("files", [])})
+    except FileNotFoundError as e:
+        return jsonify({"ok": False, "error": str(e), "need_credentials": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/upload-to-drive", methods=["POST"])
 def upload_to_drive():
     data = request.get_json() or {}
     filename = data.get("filename", "")
     sid = data.get("sid", "")
+    folder_id = data.get("folder_id", "")  # 사용자가 선택한 폴더 (우선)
 
     # 세션에서 결과 파일 경로 확인, 없으면 outputs 폴더에서 탐색
     file_path = None
@@ -2725,10 +3846,12 @@ def upload_to_drive():
     if not file_path:
         return jsonify({"ok": False, "error": "파일을 찾을 수 없습니다."})
 
-    config = load_config()
-    folder_id = config.get("google_drive", {}).get("upload_folder_id")
+    # 폴더 ID: 요청 파라미터 > config 기본값
     if not folder_id:
-        return jsonify({"ok": False, "error": "config.json에 google_drive.upload_folder_id가 없습니다."})
+        config = load_config()
+        folder_id = config.get("google_drive", {}).get("upload_folder_id")
+    if not folder_id:
+        return jsonify({"ok": False, "error": "업로드할 폴더를 선택해주세요.", "need_folder": True})
 
     try:
         from googleapiclient.http import MediaFileUpload
@@ -2739,22 +3862,24 @@ def upload_to_drive():
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         uploaded = service.files().create(
-            body=file_metadata, media_body=media, fields="id,webViewLink"
+            body=file_metadata, media_body=media, fields="id,webViewLink,parents"
         ).execute()
-        folder_url = config.get("google_drive", {}).get("folder_url", "")
+        # 업로드된 폴더 URL 구성
+        parent_id = uploaded.get("parents", [folder_id])[0]
+        folder_url = f"https://drive.google.com/drive/folders/{parent_id}"
         return jsonify({
             "ok": True,
             "file_id": uploaded.get("id"),
-            "link": folder_url or uploaded.get("webViewLink"),
+            "link": folder_url,
+            "file_link": uploaded.get("webViewLink"),
         })
     except FileNotFoundError as e:
         return jsonify({"ok": False, "error": str(e), "need_credentials": True})
     except Exception as e:
         err_str = str(e)
-        # OAuth 권한 부족 또는 Drive API 미활성화
         if any(k in err_str for k in ["insufficient_scope", "accessNotConfigured",
                                        "forbidden", "403", "Request had insufficient"]):
-            return jsonify({"ok": False, "error": "Google Drive 접근 권한이 없습니다. Drive API가 활성화된 계정인지 확인해주세요.", "need_credentials": True})
+            return jsonify({"ok": False, "error": "Google Drive 접근 권한이 없습니다.", "need_credentials": True})
         return jsonify({"ok": False, "error": err_str})
 
 
@@ -3380,6 +4505,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer;
   }
 
+  /* Drive 폴더 선택 리스트 */
+  .drive-folder-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid #E2E8F0;
+    cursor: pointer; transition: background 0.1s;
+    font-size: 13px;
+  }
+  .drive-folder-item:hover { background: #EBF2FF; }
+  .drive-folder-item.selected { background: #DBEAFE; border-left: 3px solid #2563EB; }
+  .drive-folder-item:last-child { border-bottom: none; }
+
   /* 토스트 */
   #toast {
     position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
@@ -3520,11 +4656,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span>TC 생성 범위</span>
           <span style="font-size:11px;color:var(--muted);font-weight:400">선택 — 비우면 전체 TC 생성</span>
         </label>
-        <textarea id="focusArea" class="form-input" rows="2"
-          style="resize:vertical; min-height:48px; font-size:13px; line-height:1.5;"
+        <textarea id="focusArea" class="form-input" rows="5"
+          style="resize:vertical; min-height:110px; font-size:13px; line-height:1.5;"
+          oninput="onInputsChanged()"
           placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리"></textarea>
         <div style="font-size:11px; color:var(--muted); margin-top:3px;">
           입력하면 해당 기능에 집중하여 TC를 생성합니다. 여러 기능은 쉼표 또는 줄바꿈으로 구분하세요.
+        </div>
+        <!-- 이전 범위 힌트 배너 (프로젝트 선택 시 동적으로 표시) -->
+        <div id="previousFocusHint" style="display:none; margin-top:8px; padding:8px 12px; background:#FFFBEB; border:1px solid #FCD34D; border-radius:6px; font-size:12px; color:#92400E; display:none;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <div>
+              💡 이전 작업 범위:
+              <code id="previousFocusValue" style="background:#FFFFFF;padding:2px 6px;border-radius:3px;border:1px solid #FCD34D;font-family:monospace;margin-left:4px;"></code>
+            </div>
+            <div style="display:flex;gap:6px;">
+              <button type="button" onclick="reusePreviousFocus()" style="padding:4px 10px;background:#F59E0B;color:#FFFFFF;border:none;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;">↪ 재사용</button>
+              <button type="button" onclick="dismissPreviousFocusHint()" style="padding:4px 10px;background:#FFFFFF;color:#92400E;border:1px solid #FCD34D;border-radius:4px;font-size:11px;cursor:pointer;">✕ 무시</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-group" id="generationModeGroup" style="padding:12px 14px;background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;">
+        <label class="form-label" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+          <span>⚙️ 생성 모드</span>
+          <span style="font-size:11px;color:var(--muted);font-weight:400;">선택</span>
+        </label>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <label style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid #D1D5DB;border-radius:6px;background:#FFFFFF;cursor:pointer;" id="modeStdLabel">
+            <input type="radio" name="genMode" value="summary" checked onchange="onGenModeChanged()" style="margin-top:3px;">
+            <div style="flex:1;">
+              <div style="font-size:13px;font-weight:600;color:#111827;">정책 반영 모드 <span style="font-size:11px;color:#6B7280;font-weight:400;">(기본)</span></div>
+              <div style="font-size:12px;color:#4B5563;margin-top:2px;">정책·기능·분류 3단계 분석으로 규칙을 체계적으로 반영합니다. 대용량·복잡한 문서에 적합.</div>
+            </div>
+          </label>
+          <label style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid #D1D5DB;border-radius:6px;background:#FFFFFF;cursor:pointer;" id="modeQuickLabel">
+            <input type="radio" name="genMode" value="direct" onchange="onGenModeChanged()" style="margin-top:3px;">
+            <div style="flex:1;">
+              <div style="font-size:13px;font-weight:600;color:#111827;">Quick 모드 <span style="font-size:11px;color:#6B7280;font-weight:400;">(원문 직접)</span></div>
+              <div style="font-size:12px;color:#4B5563;margin-top:2px;">요약 단계 없이 원문을 직접 분류합니다. 누락 최소화 · 200KB 이하 권장.</div>
+            </div>
+          </label>
+        </div>
+        <div id="modeSourceHint" style="font-size:11px;color:#6B7280;margin-top:8px;">
+          ▸ 소스 크기: <span id="modeSourceSize">-</span> · <span id="modeSourceStatus">소스를 추가하면 권장 모드가 안내됩니다.</span>
         </div>
       </div>
 
@@ -3644,6 +4820,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 결과를 확인한 뒤 승인하세요.
     </div>
 
+    <!-- TC ID 생성 방식 선택 패널 (독립 영역, 항상 표시) -->
+    <div id="tcIdModePanel" style="background:linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%);border:2px solid #3B82F6;border-radius:12px;padding:16px 20px;margin:14px 0 18px 0;box-shadow:0 2px 8px rgba(59, 130, 246, 0.15);">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:300px;">
+          <div style="font-size:15px;font-weight:700;color:#1E3A5F;margin-bottom:6px;display:flex;align-items:center;gap:8px;">
+            <span style="font-size:18px;">🪪</span>
+            <span>TC ID 생성 방식</span>
+          </div>
+          <div id="tcIdModeDesc" style="font-size:12.5px;color:#1E3A5F;line-height:1.6;">
+            체크하면 시스템이 화면별 코드(<code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #93C5FD;font-family:monospace;">SM-SPL-001</code>, <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #93C5FD;font-family:monospace;">SM-LGI-001</code>...)로 자동 매핑합니다.<br>
+            해제하면 아래 <strong>TC 분류 요약</strong> 표에서 SuiteCode를 직접 입력할 수 있습니다.
+          </div>
+        </div>
+        <label id="tcIdModeLabel" style="display:inline-flex;align-items:center;gap:10px;background:#FFFFFF;padding:12px 16px;border-radius:10px;border:2px solid #3B82F6;cursor:pointer;user-select:none;font-weight:700;color:#1E3A5F;box-shadow:0 1px 3px rgba(0,0,0,0.08);white-space:nowrap;transition:all 0.2s;">
+          <input type="checkbox" id="tcIdModeToggle" checked onchange="setTcIdMode(this.checked)" style="width:20px;height:20px;cursor:pointer;accent-color:#3B82F6;">
+          <span style="font-size:13.5px;">System Generated TC IDs</span>
+        </label>
+      </div>
+    </div>
+
     <!-- 채팅 + Viewer 2-column 레이아웃 -->
     <div class="gate-layout">
 
@@ -3759,8 +4955,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="tc-stat-label">총 TC</div>
       </div>
       <div class="tc-stat">
-        <div class="tc-stat-num" id="statMin">—</div>
-        <div class="tc-stat-label">최소 TC (≈35%)</div>
+        <div class="tc-stat-num" id="statSmoke">—</div>
+        <div class="tc-stat-label">🔥 Smoke TC</div>
       </div>
     </div>
 
@@ -3843,6 +5039,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         Cloud Console 열기
       </button>
       <button class="btn-modal-close" onclick="closeDriveModal()">닫기</button>
+    </div>
+  </div>
+</div>
+
+<!-- Google Drive 폴더 선택 모달 -->
+<div class="modal-bg" id="drive-folder-modal">
+  <div class="modal" style="max-width:540px;">
+    <h2 style="display:flex;align-items:center;gap:8px;">📁 업로드할 Drive 폴더 선택</h2>
+    <div id="driveFolderEmail" style="font-size:12px;color:#666;margin-bottom:10px;"></div>
+    <input type="text" id="driveFolderSearch" placeholder="폴더명 검색..."
+      oninput="loadDriveFolders(this.value)"
+      style="width:100%;padding:8px 12px;border:1.5px solid #D0D7DE;border-radius:8px;font-size:13px;margin-bottom:10px;">
+    <div id="driveFolderList" style="max-height:320px;overflow-y:auto;border:1px solid #E2E8F0;border-radius:8px;background:#F9FAFB;"></div>
+    <div id="driveSelectedFolder" style="font-size:12px;color:#166534;margin-top:8px;min-height:18px;"></div>
+    <div class="modal-btns" style="margin-top:14px;">
+      <button id="driveUploadBtn" onclick="confirmDriveUpload()" disabled
+        style="padding:8px 18px;background:#2563EB;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;">
+        ✅ 이 폴더에 업로드
+      </button>
+      <button class="btn-modal-close" onclick="closeDriveFolderModal()">취소</button>
     </div>
   </div>
 </div>
@@ -3941,8 +5157,43 @@ async function onProjectDropdownChange() {
     }
   }
 
+  // 프로젝트 변경 시 이전 세션의 UI 상태 완전 초기화
+  // (중요: 이전 focus_area가 input에 남아 새 파이프라인에 전달되는 버그 방지
+  //  + startBtn 등 버튼 상태가 이전 세션에 묶여 비활성으로 남는 문제 방지)
+  document.getElementById('focusArea').value = '';
+  document.getElementById('previousFocusHint').style.display = 'none';
+  window._previousFocusArea = '';
+
+  // SSE 연결 끊기 + 세션 참조 리셋
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  currentSid = null;
+  currentFilename = null;
+  stopCountdown();
+
+  // 진행/결과 카드 숨김
+  ['card2','card3','card4','card5'].forEach(function(id) {
+    var card = document.getElementById(id);
+    if (card) card.classList.add('hidden');
+  });
+
+  // 중단/오류 배너 제거
+  document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
+
+  // 모든 버튼 재활성화 (이전 세션에서 disable된 상태 승계 방지)
+  document.getElementById('startBtn').disabled = false;
+  var startModifyBtn = document.getElementById('startModifyBtn');
+  if (startModifyBtn) startModifyBtn.disabled = false;
+  setStopButtonsDisabled(false);
+
+  // TC 모드 토글 상태 리셋 (새 프로젝트는 다시 판별)
+  window._autoScreenCode = undefined;
+
+  // Step bar를 1단계로
+  setStepBar(1);
+
   // ── 해당 프로젝트 데이터 로드 ──
   // 이전 작업 상태 확인
+  var prevFocus = '';
   try {
     var r = await fetch('/projects/' + encodeURIComponent(name) + '/state');
     var d = await r.json();
@@ -3952,7 +5203,8 @@ async function onProjectDropdownChange() {
       document.getElementById('resumeStage').textContent = stageNames[d.stage] || d.stage;
       document.getElementById('resumeSavedAt').textContent = d.saved_at || '';
       document.getElementById('resumeBar').style.display = 'flex';
-      if (d.focus_area) document.getElementById('focusArea').value = d.focus_area;
+      // focus_area는 자동 채우지 않고 힌트로만 제공 — 의도치 않은 범위 제한 방지
+      if (d.focus_area) prevFocus = d.focus_area;
     }
   } catch(e) {}
   // 이전 소스 복원
@@ -3967,10 +5219,31 @@ async function onProjectDropdownChange() {
         sources.push({ id: id, type: s.type, content: s.content || '', selected_files: s.selected_files || null });
       });
       renderSources();
-      if (d2.focus_area) document.getElementById('focusArea').value = d2.focus_area;
+      if (d2.focus_area) prevFocus = d2.focus_area;  // state의 값과 sources의 값 중 존재하는 것
       showToast('이전 소스 ' + d2.sources.length + '개를 불러왔습니다.');
     }
   } catch(e) {}
+
+  // 이전 범위가 있으면 힌트 배너로 표시 (자동 채움 X)
+  if (prevFocus) {
+    window._previousFocusArea = prevFocus;
+    document.getElementById('previousFocusValue').textContent = prevFocus;
+    document.getElementById('previousFocusHint').style.display = 'block';
+  }
+}
+
+// 이전 범위 재사용 (사용자 명시적 클릭 시에만)
+function reusePreviousFocus() {
+  if (!window._previousFocusArea) return;
+  document.getElementById('focusArea').value = window._previousFocusArea;
+  document.getElementById('previousFocusHint').style.display = 'none';
+  showToast('이전 범위를 불러왔습니다: ' + window._previousFocusArea.substring(0, 40) + (window._previousFocusArea.length > 40 ? '...' : ''));
+}
+
+// 힌트 무시
+function dismissPreviousFocusHint() {
+  document.getElementById('previousFocusHint').style.display = 'none';
+  window._previousFocusArea = '';
 }
 
 function toggleNewProjectInline() {
@@ -4480,10 +5753,127 @@ function applyTreeSelection(srcId) {
 let sources = [];
 let sourceCounter = 0;
 
+// ── 입력 변경 감지 ──────────────────────────────────────────────
+// 사용자가 소스(추가/삭제/수정) 또는 TC 생성 범위를 변경하면 호출.
+// 이전 세션의 결과 카드를 숨기고 startBtn을 활성화해 "다시 시작 가능" 상태로.
+// 진행 중 세션(currentSid)이 있으면 해당 카드는 유지 (사용자 실수로 실행 중단 방지).
+function onInputsChanged() {
+  // 1. 새 파이프라인 시작 가능하도록 버튼 활성
+  var startBtn = document.getElementById('startBtn');
+  if (startBtn) startBtn.disabled = false;
+  var startModifyBtn = document.getElementById('startModifyBtn');
+  if (startModifyBtn) startModifyBtn.disabled = false;
+
+  // 2. 이전 결과 카드는 항상 무효화 (입력이 바뀌면 이전 결과는 stale)
+  var card5 = document.getElementById('card5');
+  if (card5) card5.classList.add('hidden');
+
+  // 3. 실행 중이 아니면 진행/Gate/작성 카드도 숨김
+  if (!currentSid) {
+    ['card2','card3','card4'].forEach(function(id) {
+      var card = document.getElementById(id);
+      if (card) card.classList.add('hidden');
+    });
+    document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
+    setStepBar(1);
+  }
+
+  // 4. 생성 모드 안내 갱신 (소스 크기 기반 권장 모드 제시)
+  refreshGenerationModeHint();
+}
+
+// ── 생성 모드 관련 ──────────────────────────────────────────────
+// 정책 반영 모드(summary): policy → features → classify 3단계
+// Quick 모드(direct): 원문을 직접 분류 — 누락 최소화, 200KB 이하 권장
+const DIRECT_MODE_SIZE_LIMIT = 200 * 1024; // 200KB
+
+function estimateSourceBytes() {
+  // 각 소스의 content 크기 합산 (UTF-8 기준 대략)
+  let total = 0;
+  for (const s of sources) {
+    if (!s || !s.content) continue;
+    try { total += new Blob([s.content]).size; } catch(e) { total += (s.content || '').length; }
+  }
+  return total;
+}
+
+function formatBytes(n) {
+  if (n <= 0) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+function refreshGenerationModeHint() {
+  const sizeEl = document.getElementById('modeSourceSize');
+  const statusEl = document.getElementById('modeSourceStatus');
+  const quickLabel = document.getElementById('modeQuickLabel');
+  const quickRadio = document.querySelector('input[name="genMode"][value="direct"]');
+  if (!sizeEl || !statusEl) return;
+
+  const bytes = estimateSourceBytes();
+  sizeEl.textContent = bytes > 0 ? formatBytes(bytes) : '-';
+
+  if (bytes === 0) {
+    statusEl.textContent = '소스를 추가하면 권장 모드가 안내됩니다.';
+    statusEl.style.color = '#6B7280';
+    if (quickLabel) quickLabel.style.opacity = '1';
+    if (quickRadio) quickRadio.disabled = false;
+    return;
+  }
+
+  if (bytes <= DIRECT_MODE_SIZE_LIMIT) {
+    statusEl.innerHTML = '🟢 Quick 모드 사용 가능 (원문 직접 분류 — 누락 최소화)';
+    statusEl.style.color = '#047857';
+    if (quickLabel) quickLabel.style.opacity = '1';
+    if (quickRadio) quickRadio.disabled = false;
+  } else {
+    statusEl.innerHTML = '🟡 소스가 200KB를 초과합니다 — 정책 반영 모드 권장';
+    statusEl.style.color = '#92400E';
+    if (quickLabel) quickLabel.style.opacity = '0.55';
+    if (quickRadio) {
+      quickRadio.disabled = true;
+      // 비활성 시 기본 모드로 복귀
+      if (quickRadio.checked) {
+        const stdRadio = document.querySelector('input[name="genMode"][value="summary"]');
+        if (stdRadio) stdRadio.checked = true;
+      }
+    }
+  }
+}
+
+function onGenModeChanged() {
+  // 선택된 라디오 카드에 outline 강조
+  document.querySelectorAll('input[name="genMode"]').forEach(function(r) {
+    const box = r.closest('label');
+    if (!box) return;
+    if (r.checked) {
+      box.style.borderColor = '#2563EB';
+      box.style.background = '#EFF6FF';
+    } else {
+      box.style.borderColor = '#D1D5DB';
+      box.style.background = '#FFFFFF';
+    }
+  });
+}
+
+// 초기 선택 강조
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', function() {
+    try { onGenModeChanged(); refreshGenerationModeHint(); } catch(e) {}
+  });
+}
+
+function getSelectedGenerationMode() {
+  const sel = document.querySelector('input[name="genMode"]:checked');
+  return sel ? sel.value : 'summary';
+}
+
 function addSource(type) {
   const id = ++sourceCounter;
   sources.push({ id, type, content: '' });
   renderSources();
+  onInputsChanged();  // 소스 추가 감지
   if (type === 'url' || type === 'web') {
     setTimeout(() => document.getElementById('srcUrl_' + id)?.focus(), 50);
   } else if (type === 'text') {
@@ -4499,11 +5889,13 @@ function addSource(type) {
 function removeSource(id) {
   sources = sources.filter(s => s.id !== id);
   renderSources();
+  onInputsChanged();  // 소스 삭제 감지
 }
 
 function updateSourceContent(id, value) {
   const s = sources.find(s => s.id === id);
   if (s) s.content = value;
+  onInputsChanged();  // 소스 내용 편집 감지 (URL/텍스트 입력 등)
 }
 
 async function onSrcFileChange(id, input) {
@@ -4521,6 +5913,7 @@ async function onSrcFileChange(id, input) {
       const s = sources.find(s => s.id === id);
       if (s) s.content = data.filename;
       if (zone) zone.innerHTML = '<span class="src-file-name">✅ ' + data.filename + '</span>';
+      onInputsChanged();  // PDF 업로드 완료 감지
     } else {
       if (zone) zone.innerHTML = '❌ ' + data.error;
     }
@@ -4543,6 +5936,7 @@ async function onMdFileChange(id, input) {
       const s = sources.find(s => s.id === id);
       if (s) s.content = data.filename;
       if (zone) zone.innerHTML = '<span class="src-file-name">✅ ' + data.filename + '</span>';
+      onInputsChanged();  // MD 업로드 완료 감지
     } else {
       if (zone) zone.innerHTML = '❌ ' + data.error;
     }
@@ -4616,12 +6010,16 @@ async function startPipeline() {
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  // 새 파이프라인 시작 시 중단 버튼 재활성화 (이전 세션 상태 승계 방지)
+  setStopButtonsDisabled(false);
+  var stopBtn2Init = document.getElementById('stopBtn2');
+  if (stopBtn2Init) stopBtn2Init.style.display = '';
 
   try {
     const resp = await fetch('/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sources: payload, project_name: projectName, focus_area: focusArea || null })
+      body: JSON.stringify({ sources: payload, project_name: projectName, focus_area: focusArea || null, generation_mode: getSelectedGenerationMode() })
     });
     const data = await resp.json();
     if (!data.ok) {
@@ -4641,6 +6039,10 @@ function connectStream(sid) {
   // 이전 중단 배너 제거
   document.querySelectorAll('.stopped-banner').forEach(el => el.remove());
   eventSource = new EventSource('/stream/' + sid);
+  // SSE 연결 성공 시 중단 버튼 활성화 보장 (재연결 포함)
+  eventSource.onopen = () => {
+    setStopButtonsDisabled(false);
+  };
   eventSource.onmessage = (e) => {
     try {
       const evt = JSON.parse(e.data);
@@ -4649,6 +6051,9 @@ function connectStream(sid) {
   };
   eventSource.onerror = () => {
     addLog('⚠️ SSE 연결 오류. 재연결 시도...', true);
+    // SSE가 끊겨도 /stop/<sid> POST는 가능하므로 버튼은 활성 유지
+    // (파이프라인이 서버에서 계속 돌고 있을 수 있음)
+    setStopButtonsDisabled(false);
   };
 }
 
@@ -4656,8 +6061,8 @@ function handleEvent(evt) {
   if (evt.type === 'ping') return;
 
   if (evt.type === 'stage') {
-    const { stage, label, pct } = evt.data;
-    updateProgress(label, pct);
+    const { stage, label, pct, eta_sec } = evt.data;
+    updateProgress(label, pct, eta_sec);
     updateSubsteps(stage);
     if (stage >= 4) {
       document.getElementById('tcStageLabel').textContent = label;
@@ -4695,12 +6100,29 @@ function handleEvent(evt) {
     renderDomainChecklist(evt.data.content);
     document.getElementById('card3').classList.remove('hidden');
     setStepBar(3);
+
+    // TC ID 모드 기본값 결정: 프로젝트가 SM/SA면 System Generated ON, 아니면 OFF
+    // (screen_code_map 서버 응답으로 screen_based_default 확인)
+    var _projName = document.getElementById('projectName').value || '';
+    loadScreenCodeMap(_projName).then(function(res) {
+      var defaultOn = !!(res && res.screen_based_default);
+      // 사용자가 아직 선택하지 않았다면 기본값 적용
+      if (window._autoScreenCode === undefined) {
+        window._autoScreenCode = defaultOn;
+      }
+      var topToggle = document.getElementById('tcIdModeToggle');
+      if (topToggle) {
+        topToggle.checked = !!window._autoScreenCode;
+        setTcIdMode(topToggle.checked);
+      }
+    });
+
     document.getElementById('card3').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   if (evt.type === 'done') {
     stopCountdown();
-    const { filename, size, sid, total_tc, min_tc } = evt.data;
+    const { filename, size, sid, total_tc, min_tc, smoke_tc } = evt.data;
     currentFilename = filename;
     document.getElementById('card4').classList.add('hidden');
     document.getElementById('card5').classList.remove('hidden');
@@ -4708,7 +6130,9 @@ function handleEvent(evt) {
     document.getElementById('resultMeta').textContent =
       `${(size / 1024).toFixed(1)} KB`;
     document.getElementById('statTotal').textContent = total_tc;
-    document.getElementById('statMin').textContent = min_tc;
+    // Smoke TC: 서버가 smoke_tc를 보내면 우선 사용, 없으면 min_tc 폴백 (하위호환)
+    const smokeVal = (typeof smoke_tc === 'number') ? smoke_tc : min_tc;
+    document.getElementById('statSmoke').textContent = (smokeVal !== undefined && smokeVal !== null) ? smokeVal : '—';
     setStepBar(5);
     setStopButtonsDisabled(true);
     document.getElementById('card5').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -4806,11 +6230,17 @@ function startCountdown(seconds) {
   }, 1000);
 }
 
-function updateProgress(label, pct) {
+function updateProgress(label, pct, etaSec) {
   document.getElementById('stageLabel').textContent = label + ' (' + pct + '%)';
   document.getElementById('progressBar').style.width = pct + '%';
-  // 단계별 예상 시간 카운트다운
-  var estimates = {5: 20, 15: 30, 25: 50, 38: 30, 50: 90, 82: 20, 90: 15};
+  // 서버가 eta_sec을 명시하면 우선, 없으면 pct 기반 기본값 매핑
+  if (typeof etaSec === 'number' && etaSec > 0) {
+    startCountdown(etaSec);
+    return;
+  }
+  // 기본 예상 시간 (폴백)
+  var estimates = {5: 20, 15: 30, 22: 45, 25: 50, 30: 30, 35: 30, 38: 30, 50: 90,
+                   82: 20, 88: 10, 90: 60, 92: 60, 98: 3};
   var estSec = estimates[pct];
   if (estSec) startCountdown(estSec);
 }
@@ -5031,16 +6461,177 @@ function updateTcIdPreview(input) {
   }
 }
 
+// ── Screen Code Map 캐시 (Auto 모드 미리보기용) ──
+var _screenCodeMap = null;
+var _screenCodeMapLoading = null;
+
+async function loadScreenCodeMap(projectName) {
+  if (_screenCodeMap) return _screenCodeMap;
+  if (_screenCodeMapLoading) return _screenCodeMapLoading;
+  _screenCodeMapLoading = fetch('/screen-code-map?project=' + encodeURIComponent(projectName || ''))
+    .then(r => r.json())
+    .then(d => {
+      _screenCodeMap = d.ok ? d : { map: {}, project_code: 'SC', screen_based_default: false };
+      _screenCodeMapLoading = null;
+      return _screenCodeMap;
+    })
+    .catch(() => {
+      _screenCodeMap = { map: {}, project_code: 'SC', screen_based_default: false };
+      _screenCodeMapLoading = null;
+      return _screenCodeMap;
+    });
+  return _screenCodeMapLoading;
+}
+
+// Middle name → ScreenCode 프론트엔드 해석 (백엔드 resolve_screen_code와 동일 로직)
+function resolveScreenCodeFE(middleName, screenMap) {
+  if (!middleName) return 'SCR';
+  if (screenMap && screenMap[middleName]) return screenMap[middleName];
+  var alpha = middleName.replace(/[^A-Za-z]/g, '');
+  if (alpha.length >= 3) return alpha.substring(0, 3).toUpperCase();
+  // 해시 폴백 (간이 버전)
+  var h = 0;
+  for (var i = 0; i < middleName.length; i++) {
+    h = ((h << 5) - h) + middleName.charCodeAt(i);
+    h = h & h;
+  }
+  return 'MID' + String(Math.abs(h) % 1000).padStart(3, '0');
+}
+
+// 중분류명 정제
+function cleanMiddleName(raw) {
+  return String(raw || '').replace(/중분류[:\s]*/g, '').replace(/\(.*?\)/g, '').trim();
+}
+
+// 통합 TC ID 모드 설정 — 상단 독립 패널의 체크박스 핸들러
+// (기존 toggleAutoScreenCode는 이 함수의 alias로 유지)
+function setTcIdMode(systemGenerated) {
+  window._autoScreenCode = !!systemGenerated;
+
+  // 상단 독립 패널 — 설명 텍스트 업데이트
+  var desc = document.getElementById('tcIdModeDesc');
+  if (desc) {
+    if (systemGenerated) {
+      desc.innerHTML =
+        '✅ <strong style="color:#1D4ED8;">System Generated 모드 ON</strong> — ' +
+        '시스템이 각 화면을 <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #93C5FD;font-family:monospace;">screen_code_map.md</code>에 따라 ' +
+        '<code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #93C5FD;font-family:monospace;">SM-SPL-001</code>, ' +
+        '<code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #93C5FD;font-family:monospace;">SM-LGI-001</code> 식으로 ' +
+        '자동 매핑합니다. 아래 SuiteCode 입력란은 비활성화됩니다.';
+    } else {
+      desc.innerHTML =
+        '✏️ <strong style="color:#B45309;">Manual 모드</strong> — ' +
+        '아래 <strong>TC 분류 요약</strong> 표에서 각 도메인의 <strong>SuiteCode</strong>를 직접 입력하세요. ' +
+        '입력한 값으로 <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #FCD34D;font-family:monospace;">SM-{SuiteCode}-001</code> 형태의 TC ID가 생성됩니다.';
+    }
+  }
+
+  // 상단 패널 라벨 색상 표현
+  var label = document.getElementById('tcIdModeLabel');
+  if (label) {
+    label.style.background = systemGenerated ? '#3B82F6' : '#FFFFFF';
+    label.style.color = systemGenerated ? '#FFFFFF' : '#1E3A5F';
+    label.style.borderColor = systemGenerated ? '#1D4ED8' : '#93C5FD';
+  }
+
+  // 분류 요약 테이블 내 체크박스도 동기화 (역순 동기화 루프 방지용 이벤트 없이 값만 설정)
+  var innerToggle = document.getElementById('autoScreenCodeToggle');
+  if (innerToggle && innerToggle.checked !== systemGenerated) {
+    innerToggle.checked = systemGenerated;
+  }
+
+  // SuiteCode 입력란 활성/비활성 + 스타일
+  var inputs = document.querySelectorAll('.suite-code-input');
+  inputs.forEach(function(inp) {
+    inp.disabled = systemGenerated;
+    inp.style.opacity = systemGenerated ? '0.4' : '1';
+    inp.style.background = systemGenerated ? '#F3F4F6' : '#FFFFFF';
+    inp.title = systemGenerated ? '자동 모드에서는 편집할 수 없습니다. 각 중분류는 screen_code_map에서 자동 매핑됩니다.' : '';
+  });
+
+  // 미리보기 재렌더
+  var previewCells = document.querySelectorAll('[id^="tcIdPreview_"]');
+  previewCells.forEach(function(cell) {
+    var idx = cell.id.replace('tcIdPreview_', '');
+    rerenderPreviewForRow(idx, systemGenerated);
+  });
+
+  // 헬프 문구 토글 (요약 테이블 내)
+  var helpNormal = document.getElementById('suiteCodeHelpNormal');
+  var helpAuto = document.getElementById('suiteCodeHelpAuto');
+  if (helpNormal) helpNormal.style.display = systemGenerated ? 'none' : '';
+  if (helpAuto) helpAuto.style.display = systemGenerated ? '' : 'none';
+}
+
+// 기존 호환: 테이블 내 체크박스가 호출하는 함수 → 상단 토글과 동기화
+function toggleAutoScreenCode(checkbox) {
+  var topToggle = document.getElementById('tcIdModeToggle');
+  if (topToggle) topToggle.checked = checkbox.checked;
+  setTcIdMode(checkbox.checked);
+}
+
+function rerenderPreviewForRow(idx, auto) {
+  var cell = document.getElementById('tcIdPreview_' + idx);
+  if (!cell) return;
+  var pcode = cell.dataset.pcode || 'SC';
+  if (auto) {
+    // 중분류별 ScreenCode 나열
+    var middlesJson = cell.dataset.middles || '[]';
+    var middles = [];
+    try { middles = JSON.parse(middlesJson); } catch(e) {}
+    var mapData = (_screenCodeMap && _screenCodeMap.map) ? _screenCodeMap.map : {};
+    if (middles.length === 0) {
+      cell.textContent = '-';
+    } else {
+      var parts = middles.slice(0, 4).map(function(m) {
+        var code = resolveScreenCodeFE(m, mapData);
+        return pcode + '-' + code + '-001';
+      });
+      var suffix = middles.length > 4 ? ' ... (+' + (middles.length - 4) + ')' : '';
+      cell.textContent = parts.join(', ') + suffix;
+    }
+  } else {
+    // Suite-based (수동): 입력 필드 값 사용
+    var input = document.querySelector('.suite-code-input[data-domain="' + idx + '"]');
+    var code = input ? input.value.trim().toUpperCase() : '';
+    cell.textContent = code ? pcode + '-' + code + '-001' : '-';
+  }
+}
+
 function renderGateViewer(mdText) {
   var viewer = document.getElementById('gateViewer');
   // 분류 요약 카드
   var cats = extractCategorySummary(mdText);
   var summaryHtml = '';
   if (cats.length > 0) {
-    var _pcode = (document.getElementById('projectName').value || '').toLowerCase().indexOf('mobile') >= 0 ? 'SM' : 'SC';
+    var _projName = document.getElementById('projectName').value || '';
+    var _pcode = _projName.toLowerCase().indexOf('mobile') >= 0 || _projName.indexOf('모바일') >= 0 ? 'SM' : 'SC';
+    // Screen Code Map 비동기 로드 (렌더 후 상단 패널 모드 기준으로 미리보기 재렌더)
+    loadScreenCodeMap(_projName).then(function(res) {
+      // 상단 독립 패널 토글이 단일 소스 — 거기 상태 기준으로 미리보기 동기화
+      var topToggle = document.getElementById('tcIdModeToggle');
+      if (topToggle) {
+        // 초기 기본값이 아직 결정 안 됐으면 screen_based_default 적용
+        if (window._autoScreenCode === undefined) {
+          window._autoScreenCode = !!(res && res.screen_based_default);
+          topToggle.checked = window._autoScreenCode;
+        }
+        setTcIdMode(topToggle.checked);
+      }
+    });
+
     summaryHtml = '<div style="background:#F0F9FF;border:1.5px solid #93C5FD;border-radius:10px;padding:14px 16px;margin-bottom:16px;">';
-    summaryHtml += '<div style="font-size:14px;font-weight:700;color:#1E3A5F;margin-bottom:4px;">TC 분류 요약</div>';
-    summaryHtml += '<div style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code>, <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-002</code> ...</div>';
+    summaryHtml += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
+    summaryHtml += '<div style="font-size:14px;font-weight:700;color:#1E3A5F;">TC 분류 요약</div>';
+    // 자동 적용 토글 (우측)
+    summaryHtml += '<label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#1E3A5F;cursor:pointer;user-select:none;background:#FFFFFF;padding:5px 10px;border:1.5px solid #93C5FD;border-radius:6px;">';
+    summaryHtml += '<input type="checkbox" id="autoScreenCodeToggle" onchange="toggleAutoScreenCode(this)" style="margin:0;cursor:pointer;">';
+    summaryHtml += '<span>🤖 <strong>시스템 규칙 자동 적용</strong></span>';
+    summaryHtml += '</label>';
+    summaryHtml += '</div>';
+    // 도움말 — 모드별 2종 (display toggle)
+    summaryHtml += '<div id="suiteCodeHelpNormal" style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code> ...</div>';
+    summaryHtml += '<div id="suiteCodeHelpAuto" style="display:none;font-size:12px;color:#4B5563;margin-bottom:10px;">🤖 <strong>시스템 규칙 자동 적용</strong> — 각 중분류(화면)가 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">screen_code_map.md</code>에 등록된 ScreenCode로 자동 매핑됩니다.<br>예: Splash → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-SPL-001</code>, Login Options → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-LGI-001</code> ... (화면별 독립 001~)</div>';
     summaryHtml += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
     summaryHtml += '<tr style="background:#DBEAFE;"><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">시트명</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">SuiteCode</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">TC ID 미리보기</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">소분류</th></tr>';
     for (var ci = 0; ci < cats.length; ci++) {
@@ -5054,16 +6645,27 @@ function renderGateViewer(mdText) {
       var minText = c.minors.length > 0 ? c.minors.join(', ') : '-';
       var bg = ci % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
       var previewId = _pcode + '-' + autoCode + '-001';
+      // 중분류 정제 목록 (Auto 모드 미리보기용, data-middles에 JSON 저장)
+      var cleanedMiddles = c.middles.map(function(m){ return cleanMiddleName(m); }).filter(function(x){ return x; });
+      var middlesJson = JSON.stringify(cleanedMiddles).replace(/"/g, '&quot;');
       summaryHtml += '<tr style="background:' + bg + ';">';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:600;">' + sheetName + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;"><input type="text" class="suite-code-input" data-domain="' + ci + '" data-pcode="' + _pcode + '" value="' + autoCode + '" placeholder="예: GNBF" oninput="updateTcIdPreview(this)" style="width:80px;padding:4px 6px;border:1.5px solid #93C5FD;border-radius:4px;font-size:12px;font-weight:700;text-transform:uppercase;font-family:monospace;"></td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-family:monospace;font-size:11px;color:#1D4ED8;" id="tcIdPreview_' + ci + '">' + previewId + '</td>';
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-family:monospace;font-size:11px;color:#1D4ED8;" id="tcIdPreview_' + ci + '" data-pcode="' + _pcode + '" data-middles="' + middlesJson + '">' + previewId + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + majorClean + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + midText + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#666;">' + minText + '</td>';
       summaryHtml += '</tr>';
     }
     summaryHtml += '</table>';
+    var totalMiddles = 0;
+    for (var mi = 0; mi < cats.length; mi++) totalMiddles += Math.max(cats[mi].middles.length, 1);
+    var estMin = totalMiddles * 5;
+    var estMax = totalMiddles * 15;
+    summaryHtml += '<div style="margin-top:10px;padding:8px 12px;background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;font-size:12px;color:#166534;display:flex;align-items:center;gap:8px;">';
+    summaryHtml += '<span style="font-size:16px;">📊</span>';
+    summaryHtml += '<span>예상 TC 수량: <strong>' + estMin + '~' + estMax + '개</strong> (중분류 ' + totalMiddles + '개 × 5~15개)</span>';
+    summaryHtml += '</div>';
     summaryHtml += '</div>';
   }
   // SuiteCode 테이블은 Viewer 밖 독립 영역에 렌더링 (문서 업데이트해도 유지)
@@ -5184,6 +6786,9 @@ async function approveGate() {
   const content = document.getElementById('gateContent').value.trim();
   if (!content) { alert('내용이 비어있습니다.'); return; }
 
+  // Auto 모드 여부 (체크박스 상태)
+  var autoScreenCode = !!window._autoScreenCode;
+
   // SuiteCode 수집
   var suiteCodeInputs = document.querySelectorAll('.suite-code-input');
   var suiteCodes = {};
@@ -5193,10 +6798,11 @@ async function approveGate() {
     if (!code) hasEmpty = true;
     suiteCodes[input.dataset.domain] = code;
   });
-  if (suiteCodeInputs.length > 0 && hasEmpty) {
-    alert('모든 도메인의 SuiteCode를 입력해주세요.'); return;
+  // Auto 모드에서는 SuiteCode 입력 검증 생략 (screen_code_map이 중분류별로 자동 매핑)
+  if (!autoScreenCode && suiteCodeInputs.length > 0 && hasEmpty) {
+    alert('모든 도메인의 SuiteCode를 입력해주세요.\\n(또는 "🤖 시스템 규칙 자동 적용" 체크박스를 켜면 자동 매핑됩니다.)'); return;
   }
-  // SuiteCode 목록 (순서대로)
+  // SuiteCode 목록 (순서대로) — Auto 모드에서도 백엔드 로그 표시용으로 전송
   var suiteCodeList = [];
   for (var i = 0; i < suiteCodeInputs.length; i++) {
     suiteCodeList.push(suiteCodeInputs[i].value.trim().toUpperCase().replace(/^-+|-+$/g, ''));
@@ -5215,7 +6821,12 @@ async function approveGate() {
   approveBtn.disabled = true;
   approveBtn.textContent = '⏳ 처리 중...';
 
-  var codeMsg = suiteCodeList.length > 0 ? ' (SuiteCode: ' + suiteCodeList.join(', ') + ')' : '';
+  var codeMsg;
+  if (autoScreenCode) {
+    codeMsg = ' (🤖 시스템 규칙 자동 적용 — 화면별 ScreenCode로 자동 매핑)';
+  } else {
+    codeMsg = suiteCodeList.length > 0 ? ' (SuiteCode: ' + suiteCodeList.join(', ') + ')' : '';
+  }
   const scopeMsg = selectedDomains
     ? selCount + '개 도메인 범위로 TC를 생성합니다.' + codeMsg + ' 계속할까요?'
     : '전체 도메인(' + allCount + '개)으로 TC를 생성합니다.' + codeMsg + ' 계속할까요?';
@@ -5229,7 +6840,12 @@ async function approveGate() {
     const resp = await fetch('/approve/' + currentSid, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, selected_domains: selectedDomains, suite_codes: suiteCodeList })
+      body: JSON.stringify({
+        content,
+        selected_domains: selectedDomains,
+        suite_codes: suiteCodeList,
+        auto_screen_code: autoScreenCode
+      })
     });
     const data = await resp.json();
     if (data.ok) {
@@ -5297,36 +6913,125 @@ async function uploadToDrive() {
   if (!currentFilename) return;
   const btn = document.getElementById('driveBtn');
   btn.disabled = true;
-  btn.innerHTML = '⏳ 업로드 중...';
-  showToast('☁️ Google Drive에 업로드 중...');
+  btn.innerHTML = '⏳ 인증 확인 중...';
+  // 1. 인증 상태 확인
+  try {
+    const sr = await fetch('/drive/status');
+    const sd = await sr.json();
+    if (!sd.ok || !sd.authenticated) {
+      if (sd.need_credentials) {
+        openDriveModal();
+        btn.innerHTML = '⚠️ Drive 연동 설정 필요';
+        btn.style.borderColor = '#e53e3e';
+        btn.style.color = '#e53e3e';
+        btn.disabled = false;
+        return;
+      }
+      // 토큰 만료 → 백엔드에서 재인증 필요 (get_drive_service 내부에서 브라우저 열림)
+      btn.innerHTML = '⏳ 로그인 창이 열립니다...';
+      showToast('Google 로그인이 필요합니다. 브라우저 창에서 로그인을 완료하세요.', 'info');
+      // drive/status 재호출로 인증 유도
+      await fetch('/drive/status');
+      btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
+      btn.disabled = false;
+      showToast('로그인 완료 후 다시 Drive 버튼을 눌러주세요.');
+      return;
+    }
+    // 2. 폴더 선택 모달 열기
+    openDriveFolderModal(sd.email || '');
+    btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
+    btn.disabled = false;
+  } catch(e) {
+    showToast('❌ 오류: ' + e.message, 'error');
+    btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
+    btn.disabled = false;
+  }
+}
+
+async function openDriveFolderModal(email) {
+  const modal = document.getElementById('drive-folder-modal');
+  modal.classList.add('open');
+  document.getElementById('driveFolderEmail').textContent = email ? '로그인 계정: ' + email : '';
+  document.getElementById('driveFolderSearch').value = '';
+  await loadDriveFolders('');
+  document.getElementById('driveFolderSearch').focus();
+}
+
+function closeDriveFolderModal() {
+  document.getElementById('drive-folder-modal').classList.remove('open');
+}
+
+async function loadDriveFolders(query) {
+  const list = document.getElementById('driveFolderList');
+  list.innerHTML = '<div style="padding:20px;text-align:center;color:#888;">⏳ 폴더 조회 중...</div>';
+  try {
+    const url = '/drive/folders' + (query ? '?q=' + encodeURIComponent(query) : '');
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok) {
+      list.innerHTML = '<div style="padding:20px;color:#c53030;">❌ ' + (d.error || '폴더 조회 실패') + '</div>';
+      return;
+    }
+    if (d.folders.length === 0) {
+      list.innerHTML = '<div style="padding:20px;text-align:center;color:#888;">검색 결과 없음</div>';
+      return;
+    }
+    list.innerHTML = '';
+    d.folders.forEach(function(f) {
+      var div = document.createElement('div');
+      div.className = 'drive-folder-item';
+      div.onclick = function(e) { selectDriveFolder(f.id, f.name, e.currentTarget); };
+      div.innerHTML = '<span style="font-size:18px;">📁</span> <span style="flex:1;">' + f.name + '</span>' +
+        '<span style="font-size:11px;color:#888;">' + (f.modifiedTime || '').substring(0, 10) + '</span>';
+      list.appendChild(div);
+    });
+  } catch(e) {
+    list.innerHTML = '<div style="padding:20px;color:#c53030;">❌ ' + e.message + '</div>';
+  }
+}
+
+let _selectedDriveFolder = null;
+function selectDriveFolder(id, name, element) {
+  _selectedDriveFolder = { id: id, name: name };
+  document.querySelectorAll('.drive-folder-item').forEach(el => el.classList.remove('selected'));
+  if (element) element.classList.add('selected');
+  document.getElementById('driveUploadBtn').disabled = false;
+  document.getElementById('driveSelectedFolder').textContent = '✓ 선택됨: ' + name;
+}
+
+async function confirmDriveUpload() {
+  if (!_selectedDriveFolder) { alert('폴더를 선택해주세요.'); return; }
+  const uploadBtn = document.getElementById('driveUploadBtn');
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = '⏳ 업로드 중...';
   try {
     const r = await fetch('/upload-to-drive', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sid: currentSid, filename: currentFilename })
+      body: JSON.stringify({
+        sid: currentSid,
+        filename: currentFilename,
+        folder_id: _selectedDriveFolder.id
+      })
     });
     const d = await r.json();
     if (d.ok) {
-      showToast('✅ Google Drive 업로드 완료!');
+      closeDriveFolderModal();
+      showToast('✅ "' + _selectedDriveFolder.name + '" 폴더에 업로드 완료!');
+      const btn = document.getElementById('driveBtn');
       btn.innerHTML = DRIVE_SVG + ' Drive 업로드 완료';
       btn.style.borderColor = '#34a853';
       if (d.link) window.open(d.link, '_blank');
-      return;
-    } else if (d.need_credentials) {
-      openDriveModal();
-      showToast('🔑 Drive 연동 설정이 필요합니다', 'error');
-      btn.innerHTML = '⚠️ Drive 연동 설정 필요';
-      btn.style.borderColor = '#e53e3e';
-      btn.style.color = '#e53e3e';
     } else {
-      showToast('❌ ' + d.error, 'error');
-      btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
+      alert('❌ ' + d.error);
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = '✅ 이 폴더에 업로드';
     }
   } catch(e) {
-    showToast('❌ 오류: ' + e.message, 'error');
-    btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
+    alert('오류: ' + e.message);
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = '✅ 이 폴더에 업로드';
   }
-  btn.disabled = false;
 }
 
 function openDriveModal() { document.getElementById('drive-modal').classList.add('open'); }

@@ -33,10 +33,7 @@ REM 브라우저 오픈 (3초 후)
 timeout /t 3 /nobreak > NUL
 start "" "http://localhost:%PORT%"
 
-REM .env 환경변수 로드
-for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
-  if not "%%A"=="" if not "%%A:~0,1%"=="#" set "%%A=%%B"
-)
+REM .env 로드는 app_v2.py 내부에서 처리됨 (cross-platform)
 
 REM 서버 실행
 %PYTHON% scripts\app_v2.py

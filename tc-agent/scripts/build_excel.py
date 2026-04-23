@@ -151,6 +151,11 @@ def parse_tc_markdown(filepath):
         if re.match(r'###\s*카테고리\s*\d', first_line):
             continue
 
+        # 분류 구분 헤더 스킵 (Claude가 섹션 구분용으로 남긴 "### 중분류: XXX" 등)
+        # 이를 TC로 오인식하면 "중분류: Splash"가 TC ID가 되는 유령 TC가 생성됨
+        if re.match(r'###\s*(대분류|중분류|소분류|Category|Middle|Minor)\s*[:：]', first_line, re.IGNORECASE):
+            continue
+
         tc = {}
 
         # 최소 TC: ### **SC-XXX-YYY-001** — 제목
@@ -189,6 +194,12 @@ def parse_tc_markdown(filepath):
         tc["platform"] = extract_table_field(block, "플랫폼") or ""
         tc["screen"]   = extract_table_field(block, "연관 화면") or ""
 
+        # 화면 코드 추출 (SCR-xxx / SCREEN-xxx / PAGE-xxx). 여러 개 가능 — 쉼표 분리.
+        # "연관 화면" 값에서 코드만 뽑아낸다. 코드가 없으면 빈 문자열.
+        code_pat = re.compile(r"(?:SCR|SCREEN|PAGE)-[A-Za-z0-9]+")
+        codes_found = code_pat.findall(tc["screen"]) if tc["screen"] else []
+        tc["screen_code"] = ", ".join(dict.fromkeys(codes_found))  # 중복 제거 · 순서 유지
+
         # 대분류/중분류/소분류 추출 (신규 형식)
         # 대분류 필드 예: "Authentication & Onboarding (AUTH)" → "AUTH" 코드 파싱
         cat_raw = extract_table_field(block, "대분류") or ""
@@ -196,12 +207,17 @@ def parse_tc_markdown(filepath):
         tc["middle"] = extract_table_field(block, "중분류") or ""
         tc["minor"]  = extract_table_field(block, "소분류") or ""
 
-        # 도메인 코드 결정: 신규 SC- 형식이면 두 번째 세그먼트, 구형이면 첫 번째
+        # 도메인 코드 결정:
+        # - 신규 Project-Suite-NNN 형식 (SC/SM/SA 등 2글자 ProjectCode): 두 번째 세그먼트가 도메인
+        #   예: SC-AUTH-001 → AUTH, SM-SPL-001 → SPL, SC-TRD-ORDR-012 → TRD
+        # - 구형 도메인-기능-번호 형식: 첫 번째 세그먼트
+        #   예: AUTH-OAUTH-001 → AUTH, LEVR-POPUP-001 → LEVR
         parts = tc["id"].split("-")
-        if parts[0] == "SC" and len(parts) >= 3:
-            tc["domain"] = parts[1]  # SC-AUTH-LOGN-001 → AUTH
-        elif len(parts) >= 1:
-            tc["domain"] = parts[0]  # AUTH-OAUTH-001 → AUTH
+        PROJECT_CODES = ("SC", "SM", "SA")  # 향후 다른 Project Code 추가 시 확장
+        if parts and parts[0].upper() in PROJECT_CODES and len(parts) >= 3:
+            tc["domain"] = parts[1]
+        elif parts:
+            tc["domain"] = parts[0]
         else:
             tc["domain"] = "ETC"
 
@@ -214,7 +230,24 @@ def parse_tc_markdown(filepath):
 
         tcs.append(tc)
 
-    return tcs
+    # ── TC ID 기반 중복 제거 (최종 안전장치) ──
+    # review 보강/재생성 등으로 같은 TC ID가 중복 수집된 경우 먼저 등장한 것을 유지한다.
+    seen_ids = set()
+    unique_tcs = []
+    dup_count = 0
+    for tc in tcs:
+        tid = tc.get("id", "").strip()
+        if not tid:
+            unique_tcs.append(tc)
+            continue
+        if tid in seen_ids:
+            dup_count += 1
+            continue
+        seen_ids.add(tid)
+        unique_tcs.append(tc)
+    if dup_count > 0:
+        print(f"  ⚠️ 중복 TC ID {dup_count}개 제거됨 (TC ID 기반 dedup)")
+    return unique_tcs
 
 def extract_table_field(block, field_name):
     m = re.search(rf'\|\s*{field_name}\s*\|\s*(.+?)\s*\|', block)
@@ -392,6 +425,7 @@ def _tc_list_columns(config):
     fixed = [
         ("Smoke",          8),
         ("TC ID",              14),
+        ("화면 코드",           12),
         ("우선순위",             9),
         ("거래소",              10),
         ("대분류",              13),
@@ -504,8 +538,12 @@ def _mark_smoke(tcs):
             domain_has[d] = True
 
 
-def build_tc_list(ws, tcs, config, include_reason=False):
-    """TC 목록 시트 생성"""
+def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
+    """TC 목록 시트 생성.
+    group_by:
+      - "domain": TC 코드(도메인) 변경 시 섹션 헤더 (기존 동작)
+      - "middle": 중분류 변경 시 섹션 헤더 (대분류별 시트 내부 분할용)
+    """
     _mark_smoke(tcs)
     cols = _tc_list_columns(config)
     col_names = [c[0] for c in cols]
@@ -518,25 +556,55 @@ def build_tc_list(ws, tcs, config, include_reason=False):
 
     data_start = 2
 
-    # 데이터 행 (도메인 그룹 헤더 삽입)
-    prev_domain = None
+    # 데이터 행 (그룹 헤더 삽입)
+    prev_group_key = None
     r = data_start
     row_idx = 0
     all_row_data = []  # 너비 계산용
 
-    # 도메인이 2개 이상일 때만 그룹 헤더 표시
-    unique_domains = set(tc["domain"] for tc in tcs)
-    show_domain_headers = len(unique_domains) > 1
+    # 그룹 키가 2개 이상일 때만 그룹 헤더 표시
+    if group_by == "middle":
+        unique_groups = set((tc["domain"], tc.get("middle", "")) for tc in tcs)
+    else:
+        unique_groups = set(tc["domain"] for tc in tcs)
+    show_group_headers = len(unique_groups) > 1
 
     for tc in tcs:
         domain = tc["domain"]
+        middle = tc.get("middle", "")
 
-        # 도메인 변경 시 그룹 헤더 행 삽입 (도메인 2개 이상일 때만)
-        if show_domain_headers and domain != prev_domain:
-            prev_domain = domain
+        # 그룹 키 결정
+        if group_by == "middle":
+            group_key = (domain, middle)
+        else:
+            group_key = domain
+
+        # 그룹 변경 시 헤더 행 삽입
+        if show_group_headers and group_key != prev_group_key:
+            prev_group_key = group_key
             color  = DOMAIN_COLORS.get(domain, "636363")
-            label  = DOMAIN_LABELS.get(domain, domain)
-            text   = f"{domain}  ·  {label}"
+            if group_by == "middle":
+                # 중분류별 헤더: "📱 Email Input  ·  SM-EML"
+                screen_code = ""
+                m_id = re.match(r"^([A-Z]{2})-([A-Z]{2,8})-", tc["id"])
+                if m_id:
+                    screen_code = f"{m_id.group(1)}-{m_id.group(2)}"
+                label = middle or tc.get("major") or domain
+                text = f"📱  {label}  ·  {screen_code}" if screen_code else f"📱  {label}"
+            else:
+                # label 결정 우선순위:
+                #   1. DOMAIN_LABELS에 등록된 한글 설명 (AUTH→"인증·온보딩·자금 지급" 등)
+                #   2. Screen-based TC라면 tc["middle"] (예: SPL → "Splash")
+                #   3. tc["major"] (대분류명, 예: "Onboarding")
+                #   4. domain 코드 자체
+                label = (
+                    DOMAIN_LABELS.get(domain)
+                    or tc.get("middle")
+                    or tc.get("major")
+                    or domain
+                )
+                # 동일 텍스트 반복 방지 ("SM · SM", "중분류: Splash · 중분류: Splash" 방어)
+                text = f"{domain}  ·  {label}" if domain != label else domain
             for i in range(1, len(col_names) + 1):
                 set_cell(ws, r, i, text if i == 1 else "",
                          bold=True, bg=color, font_color=C_WHITE,
@@ -570,6 +638,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
             "거래소":         exchange_text,
             "대분류":         major_display,
             "중분류":         middle_display,
+            "화면 코드":      tc.get("screen_code", ""),
             "소분류":         minor_display,
             "사전 조건":      tc["given"],
             "스텝":          tc["when"],
@@ -592,7 +661,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
             else:
                 cbg  = bg_base
                 bold = tc["star"]
-            align = "center" if col_name in ("Smoke", "우선순위", "거래소") else "left"
+            align = "center" if col_name in ("Smoke", "우선순위", "거래소", "화면 코드") else "left"
             set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg, align_h=align)
 
         ws.row_dimensions[r].height = 80
@@ -600,7 +669,7 @@ def build_tc_list(ws, tcs, config, include_reason=False):
         row_idx += 1
 
     # 컬럼 너비 자동 조정 (75퍼센타일 기준)
-    min_widths = {"Smoke": 8, "TC ID": 18, "우선순위": 9, "거래소": 10}
+    min_widths = {"Smoke": 8, "TC ID": 18, "우선순위": 9, "거래소": 10, "화면 코드": 12}
     widths = _calc_col_widths(col_names, all_row_data, min_widths=min_widths, max_width=55)
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -729,6 +798,109 @@ def build_smoke(ws, tcs, config):
     build_tc_list(ws, smoke_tcs, config)
 
 
+# ── Traceability Matrix 시트 ────────────────────────────────────────
+
+def build_traceability(ws, tcs) -> int:
+    """SCR(화면 코드) → TC 역참조 매트릭스 시트 생성. 반환: 유니크 SCR 수.
+    screen_code가 비어있는 TC는 '(화면 코드 없음)' 그룹으로 집계.
+    각 TC가 여러 코드를 가지면 쉼표 분리 후 각 코드에 모두 포함.
+    """
+    # SCR → [TC...] 맵핑 구성
+    scr_map = defaultdict(list)  # code -> list of tc dict
+    for tc in tcs:
+        codes_str = (tc.get("screen_code") or "").strip()
+        if not codes_str:
+            scr_map["(화면 코드 없음)"].append(tc)
+            continue
+        for code in [c.strip() for c in codes_str.split(",") if c.strip()]:
+            scr_map[code].append(tc)
+
+    # 정렬: SCR-001, SCR-002... 숫자 파트 기준 / "없음" 그룹은 맨 뒤
+    def sort_key(code):
+        if code == "(화면 코드 없음)":
+            return (1, 0, code)
+        m = re.match(r"^(SCR|SCREEN|PAGE)-(.+)$", code)
+        if m:
+            suffix = m.group(2)
+            # 숫자면 int, 아니면 큰 값 고정
+            try:
+                return (0, int(re.sub(r"\D", "", suffix) or 999999), code)
+            except ValueError:
+                return (0, 999999, code)
+        return (0, 999999, code)
+
+    sorted_codes = sorted(scr_map.keys(), key=sort_key)
+
+    # 헤더
+    headers = ["화면 코드", "대분류", "중분류", "TC 개수", "Smoke", "TC ID 목록"]
+    widths = [14, 16, 18, 9, 8, 60]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        set_cell(ws, 1, i, h, bold=True, bg=C_DARK, font_color=C_WHITE,
+                 size=10, align_h="center")
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 22
+
+    r = 2
+    row_idx = 0
+    for code in sorted_codes:
+        items = scr_map[code]
+        # 대표 대분류/중분류 (다수결 또는 첫 등장)
+        majors = [t.get("major", "") for t in items if t.get("major")]
+        middles = [t.get("middle", "") for t in items if t.get("middle")]
+        major_label = majors[0] if majors else ""
+        middle_label = middles[0] if middles else ""
+        # 섞여있는 경우 "외 N" 표기
+        unique_majors = set(majors)
+        unique_middles = set(middles)
+        if len(unique_majors) > 1:
+            major_label = f"{major_label} 외 {len(unique_majors)-1}"
+        if len(unique_middles) > 1:
+            middle_label = f"{middle_label} 외 {len(unique_middles)-1}"
+
+        tc_ids = [t.get("id", "") for t in items if t.get("id")]
+        smoke_count = sum(1 for t in items if t.get("smoke"))
+
+        bg = C_ROW_A if row_idx % 2 == 0 else C_ROW_B
+        set_cell(ws, r, 1, code, bold=True, bg=bg, align_h="center")
+        set_cell(ws, r, 2, major_label, bg=bg, align_h="left")
+        set_cell(ws, r, 3, middle_label, bg=bg, align_h="left")
+        set_cell(ws, r, 4, len(tc_ids), bg=bg, align_h="center")
+        set_cell(ws, r, 5, smoke_count if smoke_count else "", bg=bg, align_h="center")
+        set_cell(ws, r, 6, ", ".join(tc_ids), bg=bg, align_h="left")
+        ws.row_dimensions[r].height = max(20, min(100, 16 + 2 * (len(tc_ids) // 6)))
+        r += 1
+        row_idx += 1
+
+    # 필터 + 틀 고정
+    last_col = get_column_letter(len(headers))
+    ws.auto_filter.ref = f"A1:{last_col}{r - 1}"
+    ws.freeze_panes = "A2"
+
+    # SCR 코드 있는 것만 센 유니크 수
+    return sum(1 for c in sorted_codes if c != "(화면 코드 없음)")
+
+
+# ── 시트명 생성 ────────────────────────────────────────────────────
+# Excel 제약: 31자 이내, `: \ / ? * [ ]` 금지, 같은 이름 중복 금지.
+
+def _sheet_title_for_major(major_name: str, existing: list) -> str:
+    """대분류명을 엑셀 시트명으로 변환. 중복이면 번호를 붙여 유일화."""
+    s = re.sub(r'[:\\/\?\*\[\]]', ' ', major_name).strip() or "Sheet"
+    # 괄호 코드 제거 — 시트명은 사람 친화형
+    s = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", s).strip()
+    # 이모지 prefix — 폴더 느낌
+    candidate = f"📑 {s}"
+    if len(candidate) > 31:
+        candidate = candidate[:31]
+    base = candidate
+    i = 2
+    while candidate in existing:
+        suffix = f" ({i})"
+        candidate = (base[:31 - len(suffix)]) + suffix
+        i += 1
+    return candidate
+
+
 # ── 메인 ───────────────────────────────────────────────────────────
 
 def main():
@@ -755,15 +927,41 @@ def main():
 
     wb = openpyxl.Workbook()
 
-    ws_cover = wb.active;                ws_cover.title = "📋 표지"
-    ws_list  = wb.create_sheet("🧪 TC 전체목록")
-    ws_stats = wb.create_sheet("📊 TC 통계")
-    ws_smoke = wb.create_sheet("🔥 Smoke Test")
+    # Smoke 마킹을 먼저 수행 — 모든 시트 빌더가 smoke 속성 참조 가능
+    _mark_smoke(tcs)
+
+    # 공통 시트: 표지 / 통계 / Smoke Test / Traceability Matrix
+    ws_cover  = wb.active;                ws_cover.title = "📋 표지"
+    ws_stats  = wb.create_sheet("📊 TC 통계")
+    ws_smoke  = wb.create_sheet("🔥 Smoke Test")
+    ws_trace  = wb.create_sheet("🔗 Traceability")
 
     build_cover(ws_cover, tcs, config, date_str, version)
-    build_tc_list(ws_list, tcs, config)
     build_stats(ws_stats, tcs, version)
     build_smoke(ws_smoke, tcs, config)
+    scr_count = build_traceability(ws_trace, tcs)
+    if scr_count > 0:
+        print(f"  → Traceability Matrix 생성 — 유니크 화면 코드 {scr_count}개")
+    else:
+        print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
+
+    # 대분류별 그룹핑 (major 컬럼 기준, 없으면 domain 코드 폴백)
+    major_groups = defaultdict(list)
+    major_order = []  # 등장 순서 유지
+    for tc in tcs:
+        key = (tc.get("major") or "").strip() or tc.get("domain") or "ETC"
+        if key not in major_groups:
+            major_order.append(key)
+        major_groups[key].append(tc)
+
+    # 각 대분류별 시트 생성
+    for major_name in major_order:
+        tcs_in_major = major_groups[major_name]
+        sheet_title = _sheet_title_for_major(major_name, existing=wb.sheetnames)
+        ws = wb.create_sheet(sheet_title)
+        build_tc_list(ws, tcs_in_major, config, group_by="middle")
+
+    print(f"  → 대분류별 시트 {len(major_order)}개 생성")
 
     wb.save(out_path)
 
