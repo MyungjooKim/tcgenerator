@@ -3447,18 +3447,41 @@ def upload():
 
 @app.route("/upload-md", methods=["POST"])
 def upload_md():
-    """마크다운 파일 업로드"""
+    """마크다운 파일 업로드. 같은 이름 파일이 이미 있으면 _1/_2... 접미사로 구분 보존."""
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "파일 없음"}), 400
     f = request.files["file"]
-    if not f.filename:
+    raw_name = (f.filename or "").strip()
+    if not raw_name:
         return jsonify({"ok": False, "error": "파일명 없음"}), 400
-    ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+    # webkitdirectory로 업로드 시 webkitRelativePath로 들어오는 경로 분리자 제거
+    raw_name = raw_name.replace("\\", "/").split("/")[-1]
+    # 안전한 파일명 (경로 조작 방지)
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", raw_name).strip(". ")
+    if not safe_name:
+        return jsonify({"ok": False, "error": "유효하지 않은 파일명"}), 400
+    ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
     if ext not in ("md", "markdown", "txt"):
-        return jsonify({"ok": False, "error": ".md / .txt 파일만 허용"}), 400
-    save_path = SPECS_DIR / f.filename
+        return jsonify({"ok": False, "error": ".md / .markdown / .txt 파일만 허용"}), 400
+
+    # 중복 처리: 기존 파일 있으면 _1, _2 ... 접미사 자동 부여
+    stem, suffix = safe_name.rsplit(".", 1)
+    final_name = safe_name
+    counter = 1
+    while (SPECS_DIR / final_name).exists():
+        final_name = f"{stem}_{counter}.{suffix}"
+        counter += 1
+        if counter > 999:
+            return jsonify({"ok": False, "error": "같은 이름의 파일이 너무 많습니다"}), 400
+
+    save_path = SPECS_DIR / final_name
     f.save(str(save_path))
-    return jsonify({"ok": True, "filename": f.filename})
+    return jsonify({
+        "ok": True,
+        "filename": final_name,
+        "original_filename": raw_name,
+        "renamed": final_name != safe_name,
+    })
 
 
 @app.route("/start", methods=["POST"])
@@ -5447,21 +5470,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.7 릴리즈 노트 보기">v0.9.7</span>
+    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.7a 릴리즈 노트 보기">v0.9.7a</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
 
-<!-- What's new 배너 (v0.9.7 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
+<!-- What's new 배너 (v0.9.7a 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
 <div id="whatsNewBanner" style="display:none; margin:12px 0; padding:12px 16px; background:linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%); border:1px solid #93C5FD; border-radius:10px;">
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div style="flex:1; font-size:13px; color:#1E40AF;">
-      🔧 <strong>v0.9.7 패치 — Windows 환경 호환성 수정</strong>
+      📦 <strong>v0.9.7a — 마크다운 다중·폴더 업로드 추가</strong>
       <div style="margin-top:6px; font-size:12px; color:#374151; line-height:1.6;">
-        • Windows cp949 인코딩 문제로 Excel 빌드가 fallback 되던 현상 해결<br>
-        • fallback 사용 시 대분류별 시트/Smoke Test 시트가 누락되던 문제 해결<br>
-        • Excel 빌더를 모듈 import 방식으로 전환 — subprocess 의존성 제거 + 속도 개선<br>
-        • v0.9.6의 모든 기능(기획서 diff 기반 TC 갱신, Traceability 등) 그대로 동작
+        • 📄 파일 선택: 여러 .md 파일 한 번에 업로드 (쪽대본 묶음 처리)<br>
+        • 📁 폴더 선택: 폴더 통째로 끌어와 내부 .md만 자동 필터링<br>
+        • 같은 이름 파일은 서버가 <code>_1</code>, <code>_2</code> 자동 접미사로 보존<br>
+        • Windows cp949 호환 수정(v0.9.7) 포함
       </div>
     </div>
     <div style="display:flex; flex-direction:column; gap:6px;">
@@ -5475,22 +5498,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div id="whatsNewModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
   <div style="background:#FFFFFF; border-radius:12px; max-width:720px; width:92%; max-height:84vh; overflow:hidden; display:flex; flex-direction:column;">
     <div style="padding:16px 20px; border-bottom:1px solid #E5E7EB; display:flex; justify-content:space-between; align-items:center;">
-      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.7 릴리즈 노트</strong></div>
+      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.7a 릴리즈 노트</strong></div>
       <button onclick="document.getElementById('whatsNewModal').style.display='none'" style="border:none; background:none; font-size:20px; cursor:pointer; color:#6B7280;">✕</button>
     </div>
     <div style="padding:16px 20px; overflow:auto; font-size:13px; line-height:1.7; color:#374151;">
-      <h3 style="margin:0 0 8px; color:#1E40AF;">🔧 v0.9.7 — 2026-04-23 (패치)</h3>
-      <p><strong>Windows 환경 호환성 수정 + Excel 빌더 구조 개선</strong></p>
-      <h4 style="color:#B45309; margin-top:16px;">🐛 주요 버그 수정 (Windows 환경)</h4>
+      <h3 style="margin:0 0 8px; color:#1E40AF;">📦 v0.9.7a — 2026-04-24 (기능 추가)</h3>
+      <p><strong>마크다운 다중·폴더 업로드 지원 + Windows 호환성 수정(v0.9.7) 포함</strong></p>
+      <h4 style="color:#065F46; margin-top:16px;">✨ 신규 기능 (v0.9.7a)</h4>
       <ul>
-        <li><strong>Excel 대분류별 시트 분할 누락</strong>: Windows에서 subprocess 실패 시 fallback 경로로 진입하여 TC가 한 시트에 몰렸던 문제. 모듈 import 방식으로 전환해 fallback 자체를 회피.</li>
-        <li><strong>🔥 Smoke Test 시트 누락</strong>: fallback에도 Smoke Test 시트 생성 추가.</li>
-        <li><strong>cp949 인코딩 오류</strong>: subprocess stdout/stderr를 UTF-8로 강제 + 자식 env에 PYTHONIOENCODING=utf-8 주입.</li>
+        <li><strong>📄 마크다운 다중 파일 업로드</strong>: 파일 선택창에서 여러 .md를 한 번에 선택 가능. 쪽대본처럼 쪼개진 기획서 묶음을 한 번에 처리.</li>
+        <li><strong>📁 폴더 선택 업로드</strong>: 폴더 통째로 선택 시 내부 .md/.markdown/.txt만 자동 필터링하고 파일명 순으로 정렬해 업로드. 50개 초과 시 확인 프롬프트로 실수 방지.</li>
+        <li><strong>중복 파일명 자동 보존</strong>: 같은 이름 파일을 연속 업로드하면 서버가 <code>_1</code>, <code>_2</code> 접미사를 자동 부여해 덮어쓰기 방지.</li>
+        <li>업로드된 파일마다 독립된 소스 카드로 자동 분할 — 이후 개별 삭제·관리 가능.</li>
       </ul>
-      <h4 style="color:#065F46; margin-top:16px;">✨ 구조 개선</h4>
+      <h4 style="color:#B45309; margin-top:16px;">🐛 v0.9.7 포함 내용 (Windows 환경)</h4>
       <ul>
-        <li><strong>Excel 빌더 모듈화</strong>: build_excel.py의 main() 로직을 run_build() 함수로 추출. app_v2.py에서 subprocess 대신 직접 import 호출 → Windows 인코딩 이슈·가상환경 activation 이슈 완전 제거, 빌드 속도도 향상.</li>
-        <li>3단계 폴백 체인: 모듈 import → subprocess → 내부 간이 빌더 (최후의 수단).</li>
+        <li>Excel 대분류별 시트 분할·🔥 Smoke Test 시트가 fallback으로 빠져 누락되던 문제</li>
+        <li>cp949 인코딩으로 subprocess 실패하던 문제</li>
+        <li>Excel 빌더를 모듈 import 방식으로 전환해 근본 해결</li>
       </ul>
       <h4 style="color:#6B7280; margin-top:16px;">💡 참고</h4>
       <ul>
@@ -7193,7 +7218,7 @@ if (typeof document !== 'undefined') {
 }
 
 // v0.9.6 What's New 배너 표시 — localStorage에 dismiss 기록이 없으면 자동 표시
-const _WHATS_NEW_VERSION = 'v0.9.7';
+const _WHATS_NEW_VERSION = 'v0.9.7a';
 const _WHATS_NEW_KEY = 'tc_whatsnew_dismissed_' + _WHATS_NEW_VERSION;
 
 function checkWhatsNewBanner() {
@@ -7273,27 +7298,106 @@ async function onSrcFileChange(id, input) {
   }
 }
 
+// 공통 업로드 헬퍼 — File[] 배열 → /upload-md 순차 업로드 → sources 배열 갱신
+async function _uploadMdFilesToSources(id, files) {
+  const zone = document.getElementById('srcZone_' + id);
+  const uploaded = [];
+  const failed = [];
+
+  if (zone) zone.innerHTML = `⏳ ${files.length}개 파일 업로드 중...`;
+
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    if (zone) zone.innerHTML = `⏳ 업로드 중 ${i+1}/${files.length}: ${_escapeHtml(f.name)}`;
+    const fd = new FormData();
+    // webkitdirectory로 들어온 File은 webkitRelativePath 있음 — 서버는 파일명만 쓰므로 파일 객체 그대로 전달
+    fd.append('file', f);
+    try {
+      const resp = await fetch('/upload-md', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (data.ok) {
+        uploaded.push(data.filename);
+      } else {
+        failed.push(f.name + ': ' + (data.error || '업로드 실패'));
+      }
+    } catch(e) {
+      failed.push(f.name + ': 네트워크 오류');
+    }
+  }
+
+  if (uploaded.length === 0) {
+    if (zone) zone.innerHTML = '❌ 모든 파일 업로드 실패<br><span style="font-size:11px;">' + failed.map(_escapeHtml).join('<br>') + '</span>';
+    return { uploaded: [], failed };
+  }
+
+  // 첫 파일 → 현재 카드
+  const firstSource = sources.find(s => s.id === id);
+  if (firstSource) firstSource.content = uploaded[0];
+
+  // 나머지 파일 → 새 md 소스로 추가
+  for (let i = 1; i < uploaded.length; i++) {
+    const newId = ++sourceCounter;
+    sources.push({ id: newId, type: 'md', content: uploaded[i] });
+  }
+
+  renderSources();
+  onInputsChanged();
+
+  if (failed.length > 0) {
+    showToast('⚠️ ' + failed.length + '개 파일 업로드 실패 — 콘솔 확인');
+    console.warn('마크다운 업로드 실패 목록:', failed);
+  } else if (uploaded.length > 1) {
+    showToast('✅ ' + uploaded.length + '개 마크다운 파일 추가됨');
+  }
+  return { uploaded, failed };
+}
+
 async function onMdFileChange(id, input) {
   if (!input.files.length) return;
-  const file = input.files[0];
-  const zone = document.getElementById('srcZone_' + id);
-  if (zone) zone.innerHTML = '⏳ 업로드 중...';
-  const fd = new FormData();
-  fd.append('file', file);
-  try {
-    const resp = await fetch('/upload-md', { method: 'POST', body: fd });
-    const data = await resp.json();
-    if (data.ok) {
-      const s = sources.find(s => s.id === id);
-      if (s) s.content = data.filename;
-      if (zone) zone.innerHTML = '<span class="src-file-name">✅ ' + data.filename + '</span>';
-      onInputsChanged();  // MD 업로드 완료 감지
-    } else {
-      if (zone) zone.innerHTML = '❌ ' + data.error;
-    }
-  } catch(e) {
-    if (zone) zone.innerHTML = '❌ 업로드 실패';
+  const files = Array.from(input.files);
+  await _uploadMdFilesToSources(id, files);
+}
+
+async function onMdFolderChange(id, input) {
+  if (!input.files.length) return;
+  const all = Array.from(input.files);
+
+  // .md / .markdown / .txt 만 필터 (숨김 파일 제외)
+  const mdExt = /\.(md|markdown|txt)$/i;
+  const filtered = all.filter(f => {
+    const name = (f.name || '').toLowerCase();
+    if (!name || name.startsWith('.')) return false;
+    return mdExt.test(name);
+  });
+
+  if (filtered.length === 0) {
+    const zone = document.getElementById('srcZone_' + id);
+    if (zone) zone.innerHTML = '❌ 선택한 폴더에 .md / .markdown / .txt 파일이 없습니다 (' + all.length + '개 파일 중 0개 매칭)';
+    return;
   }
+
+  // 파일명 기준 정렬 (쪽대본 번호 순서 유지 도움 — 01_spec, 02_spec ...)
+  filtered.sort((a, b) => {
+    const an = (a.webkitRelativePath || a.name).toLowerCase();
+    const bn = (b.webkitRelativePath || b.name).toLowerCase();
+    return an.localeCompare(bn);
+  });
+
+  // 50개 초과 시 경고 확인
+  if (filtered.length > 50) {
+    const msg = `📁 폴더에서 ${filtered.length}개의 마크다운 파일을 발견했습니다.\n\n모두 업로드하시겠습니까?\n\n(권장: 50개 이하 · 파일이 너무 많으면 TC 생성 시간이 오래 걸리거나 실패할 수 있습니다)`;
+    if (!confirm(msg)) {
+      const zone = document.getElementById('srcZone_' + id);
+      if (zone) zone.innerHTML = '❌ 사용자가 업로드를 취소했습니다 (' + filtered.length + '개 파일).';
+      return;
+    }
+  }
+
+  // 폴더 구조 정보 — 상위 경로 보여주기
+  const folderName = (filtered[0].webkitRelativePath || '').split('/')[0] || '(폴더)';
+  showToast('📁 "' + folderName + '" 폴더에서 ' + filtered.length + '개 .md 파일 발견 — 업로드 시작');
+
+  await _uploadMdFilesToSources(id, filtered);
 }
 
 function renderSources() {
@@ -7324,10 +7428,19 @@ function renderSources() {
       body = '<input type="text" id="srcUrl_' + src.id + '" class="form-input" placeholder="https://example.com 또는 https://app.vercel.app" value="' + src.content + '" oninput="updateSourceContent(' + src.id + ', this.value)">';
       body += '<div class="input-hint">웹 서비스, 랜딩 페이지, Vercel 배포 URL 등 — HTML을 크롤링하여 분석합니다</div>';
     } else if (src.type === 'md') {
-      body = src.content
-        ? '<span class="src-file-name">✅ ' + src.content + '</span>'
-        : '<div class="src-dropzone" id="srcZone_' + src.id + '" onclick="document.getElementById(&#39;srcFile_' + src.id + '&#39;).click()">클릭하여 마크다운 파일 선택<br><span style="font-size:11px;color:var(--muted)">.md 파일</span></div>';
-      body += '<input type="file" id="srcFile_' + src.id + '" accept=".md,.markdown,.txt" style="display:none" onchange="onMdFileChange(' + src.id + ', this)">';
+      if (src.content) {
+        body = '<span class="src-file-name">✅ ' + src.content + '</span>';
+      } else {
+        body = '<div class="src-dropzone" id="srcZone_' + src.id + '" style="padding:16px;">'
+             + '<div style="font-size:13px;color:var(--text);margin-bottom:8px;">📝 마크다운 파일 또는 폴더 업로드</div>'
+             + '<div style="font-size:11px;color:var(--muted);margin-bottom:10px;">여러 .md 파일 선택 가능 · 폴더 선택 시 내부 .md만 자동 필터</div>'
+             + '<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">'
+             + '<button type="button" class="btn" style="padding:6px 14px;font-size:12px;" onclick="document.getElementById(&#39;srcFile_' + src.id + '&#39;).click()">📄 파일 선택</button>'
+             + '<button type="button" class="btn" style="padding:6px 14px;font-size:12px;" onclick="document.getElementById(&#39;srcDir_' + src.id + '&#39;).click()">📁 폴더 선택</button>'
+             + '</div></div>';
+      }
+      body += '<input type="file" id="srcFile_' + src.id + '" accept=".md,.markdown,.txt" multiple style="display:none" onchange="onMdFileChange(' + src.id + ', this)">';
+      body += '<input type="file" id="srcDir_' + src.id + '" webkitdirectory directory multiple style="display:none" onchange="onMdFolderChange(' + src.id + ', this)">';
     } else {
       body = '<textarea id="srcText_' + src.id + '" class="form-input text-input-area" placeholder="기획서 내용, 슬랙 메시지 등 자유롭게 붙여넣으세요..." oninput="updateSourceContent(' + src.id + ', this.value)">' + src.content + '</textarea>';
     }
