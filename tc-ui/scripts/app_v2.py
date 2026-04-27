@@ -7687,7 +7687,7 @@ function removeSource(id) {
 function clearAllSources() {
   if (sources.length === 0) return;
   const n = sources.length;
-  if (!confirm('입력 소스 ' + n + '개를 모두 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.')) return;
+  if (!confirm('입력 소스 ' + n + '개를 모두 삭제하시겠습니까?\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
   sources = [];
   renderSources();
   onInputsChanged();  // 전체 삭제 감지
@@ -9140,13 +9140,13 @@ async function restartServer() {
   } catch (_) {}
 
   // 2) confirm 다이얼로그 (활성 세션 있으면 강한 경고)
-  let msg = '서버를 재시작하시겠습니까?\n\n';
-  msg += '• 코드 변경사항이 반영됩니다.\n';
-  msg += '• 진행 중인 SSE 연결이 모두 끊깁니다.\n';
+  let msg = '서버를 재시작하시겠습니까?\\n\\n';
+  msg += '• 코드 변경사항이 반영됩니다.\\n';
+  msg += '• 진행 중인 SSE 연결이 모두 끊깁니다.\\n';
   if (activeSessions > 0) {
-    msg = '⚠️ 진행 중인 작업이 ' + activeSessions + '개 있습니다!\n\n';
-    msg += '재시작하면 진행 중인 TC 생성이 모두 중단되며,\n';
-    msg += '복원이 어려울 수 있습니다.\n\n';
+    msg = '⚠️ 진행 중인 작업이 ' + activeSessions + '개 있습니다!\\n\\n';
+    msg += '재시작하면 진행 중인 TC 생성이 모두 중단되며,\\n';
+    msg += '복원이 어려울 수 있습니다.\\n\\n';
     msg += '정말 재시작하시겠습니까?';
   }
   if (!confirm(msg)) return;
