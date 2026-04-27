@@ -53,16 +53,15 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8f"
+APP_VERSION         = "v0.9.8g"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "card1 누수 fix — 단계 전환 시 입력 카드도 숨김"
+APP_VERSION_TAGLINE = "파이프라인 중단 후 갈 곳 명확화"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 Step 1 입력 카드(card1) 가 모든 단계에서 visible 로 남아있던 문제 근본 fix",
-    "🛡 startPipeline / resumePipeline / startModify / gate / done 등 7곳에서 card1 명시적 hide 추가",
-    "🛡 Step 1 복귀 시점(restartFromScratch / startNextIteration / 입력 변경) 4곳에서 card1 명시적 show 추가",
-    "📐 페이지 길이 정상화 → 메인 채팅창이 viewport 밖에 있을 확률 감소 → Sticky bar 가 의미있는 시점에만 노출",
-    "🔁 v0.9.8e Sticky AI 가드 / v0.9.8d 분류 요약 표 가독성 / v0.9.8b 헤더 재시작 모두 포함",
+    "🐛 파이프라인 중단 후 사용자가 갈 곳을 잃던 문제 fix — 중단 시 card1(입력) 자동 노출",
+    "🆕 중단 배너에 '🏠 처음부터 시작' / '🔄 이어서 재시작' 두 개 버튼 직접 제공",
+    "💡 이전엔 '위 버튼을 눌러주세요' 안내했지만 실제 버튼이 있는 card1 이 숨겨져 있어 막다른 길",
+    "🔁 v0.9.8f card1 누수 fix / v0.9.8e Sticky AI 가드 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -8180,12 +8179,23 @@ function handleEvent(evt) {
       if (!card.classList.contains('hidden')) {
         const banner = document.createElement('div');
         banner.className = 'stopped-banner';
-        banner.innerHTML = '<div class="stopped-icon">⏹</div><div><div class="stopped-msg">파이프라인이 중단되었습니다.</div><div class="stopped-sub">새 작업을 시작하려면 위 버튼을 눌러주세요.</div></div>';
+        banner.innerHTML = '<div class="stopped-icon">⏹</div>' +
+          '<div style="flex:1;">' +
+            '<div class="stopped-msg">파이프라인이 중단되었습니다.</div>' +
+            '<div class="stopped-sub">아래 버튼으로 다음 작업을 선택하세요.</div>' +
+          '</div>' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+            '<button onclick="restartFromScratch()" style="padding:8px 16px;background:#2563EB;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;">🏠 처음부터 시작</button>' +
+            '<button onclick="retryPipeline()" style="padding:8px 14px;background:#fff;color:#1D4ED8;border:1.5px solid #93C5FD;border-radius:8px;font-size:12px;cursor:pointer;white-space:nowrap;">🔄 이어서 재시작</button>' +
+          '</div>';
+        banner.style.cssText = 'display:flex;align-items:center;gap:14px;flex-wrap:wrap;';
         card.appendChild(banner);
       }
     });
     document.getElementById('startBtn').disabled = false;
     document.getElementById('startModifyBtn').disabled = false;
+    // card1 (입력 카드) 도 함께 노출 — 사용자가 처음부터 시작 / 입력 변경 등 옵션 갖도록
+    document.getElementById('card1').classList.remove('hidden');
     setStepBar(1);
     showToast('⏹ 파이프라인이 중단되었습니다.', 'error');
     if (eventSource) eventSource.close();

@@ -9,6 +9,50 @@
 
 ---
 
+## v0.9.8g — 2026-04-27 (파이프라인 중단 후 갈 곳 명확화)
+
+> **요약**: v0.9.8f 의 부작용 — 파이프라인 중단 후 card1 이 숨겨진 채로 남아 사용자가 다음 작업을 시작할 수 없던 문제 fix.
+
+### 🐛 버그 (사용자 보고)
+
+> "파이프라인 중단하고 다시 시작하려고 하니까.. card1 이 없어서 어디로 가야 할지 방향을 잃었어"
+
+**증상** (스크린샷):
+- 사용자가 Step 2 (분석 및 분류) 도중 `■ 파이프라인 중단` 클릭
+- 로그에 `[중단] 사용자가 파이프라인을 중단했습니다.` 표시
+- 화면에는 Step 2 카드만 보이고 어떤 액션 버튼도 없음
+- v0.9.8f 부터 card1 이 숨겨져 있어 "처음부터 시작" 버튼도 접근 불가
+
+### 🔍 원인
+
+`stopped` SSE 이벤트 핸들러 (line 8175):
+- 중단 배너에 "새 작업을 시작하려면 **위 버튼**을 눌러주세요" 안내
+- 하지만 그 "위 버튼"이 있는 card1 이 v0.9.8f 부터 숨겨져 있음
+- → 사용자가 갈 곳 없음 (막다른 길)
+
+### 🛡 해결
+
+1. **`stopped` 이벤트 시 card1 명시적 unhide** — 사용자가 입력 영역으로 돌아갈 수 있게
+2. **중단 배너에 액션 버튼 직접 추가**:
+   - **🏠 처음부터 시작** (primary): `restartFromScratch()` 호출 → card1 보임 + Step 1
+   - **🔄 이어서 재시작** (secondary): `retryPipeline()` 호출 → 체크포인트에서 재개
+
+```js
+banner.innerHTML = '...' +
+  '<button onclick="restartFromScratch()">🏠 처음부터 시작</button>' +
+  '<button onclick="retryPipeline()">🔄 이어서 재시작</button>';
+document.getElementById('card1').classList.remove('hidden');
+```
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.8g, `stopped` 이벤트 핸들러에 액션 버튼 + card1 unhide |
+| `CHANGELOG.md` | v0.9.8g 섹션 추가 |
+
+---
+
 ## v0.9.8f — 2026-04-27 (card1 누수 fix — 단계 전환 시 입력 카드도 숨김)
 
 > **요약**: card1(Step 1 입력 카드)이 모든 단계에서 visible 로 남아있던 누수 fix. v0.9.8e 의 stepBar3 가드와 함께 Sticky AI bar 노출 조건도 명확해짐.
