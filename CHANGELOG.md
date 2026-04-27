@@ -9,6 +9,48 @@
 
 ---
 
+## v0.9.8e — 2026-04-27 (Sticky AI bar 누수 근본 fix)
+
+> **요약**: v0.9.8c 에서 추가한 가드가 일부 케이스를 못 막던 문제 — 진짜 원인 파악 후 근본 fix.
+
+### 🐛 버그 (사용자 보고)
+
+**증상**: Step 1 입력 화면에 Sticky AI bar 가 노출됨
+- 화면 상단: "이전 작업이 있습니다 — 분류표 검토 대기 단계까지 완료" 배너
+- 사용자는 "이어서 작업" 클릭 안 한 상태에서 Step 1 만 보고 있음
+- 하지만 Sticky bar 가 하단에 떠 있음
+
+### 🔍 진짜 원인
+
+이전 세션이 `gate_waiting` 단계까지 진행된 상태에서 페이지 reload 시:
+1. 페이지가 다시 로드되어 Step 1 화면 (card1) 표시
+2. **SSE 자동 재연결** 으로 backend 가 `gate_waiting` 이벤트 재전송
+3. 클라이언트가 이를 받아 `card3.classList.remove('hidden')` 실행 (line 8115)
+4. **card3 가 DOM 에서 unhidden 됨 → `:has(#card3.hidden)` 가드 무효화**
+5. Sticky bar 의 `updateVisibility()` 가 card3 visible 로 판정 → 노출
+
+핵심: **card3 가 DOM 에서 unhidden 되어도, 사용자가 실제 보는 화면(stepBar 의 active step)이 Step 3 가 아닐 수 있음** — 우리는 후자를 봐야 했음.
+
+### 🛡 근본 해결
+
+**조건 강화**: `card3.hidden 아님` AND `stepBar3.active` 둘 다 만족할 때만 노출
+
+| 레벨 | 변경 |
+|------|------|
+| **CSS** | `body:has(#stepBar3:not(.active)) .floating-ai-bar { display: none !important; }` 추가 |
+| **JS updateVisibility** | `stepBar3.classList.contains('active')` 체크 추가 → 1차 가드에서 차단 |
+| **JS MutationObserver** | stepBar3 의 class 변경도 추가 감시 (SSE 재연결로 card3 만 unhidden 되는 케이스 잡기) |
+| **안내 토스트** | `card3 visible AND stepBar3 active` 시점에만 노출 |
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.8e, CSS `:has(#stepBar3:not(.active))` 가드, `updateVisibility` 에 stepBar3Active 체크, stepBar3 MutationObserver 추가, 토스트 조건 보강 |
+| `CHANGELOG.md` | v0.9.8e 섹션 추가 |
+
+---
+
 ## v0.9.8d — 2026-04-27 (TC 분류 요약 — 소분류 종속 행 + 토글)
 
 > **요약**: 분류 요약 표의 가독성 대폭 개선 — 소분류가 다른 셀보다 압도적으로 길어 시선이 분산되던 문제 해결.

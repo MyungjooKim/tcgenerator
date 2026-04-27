@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8d"
+APP_VERSION         = "v0.9.8e"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "TC 분류 요약 — 소분류 종속 행 + 토글"
+APP_VERSION_TAGLINE = "Sticky AI bar 누수 근본 fix (stepBar3 기반)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 TC 분류 요약 표 가독성 개선 — 메인 행(시트/Suite/TC ID/대분류/중분류) + 종속 행(소분류 상세)으로 분리",
-    "🆕 각 중분류 행마다 '▼ N개' 토글 — 소분류 클릭 시 펼치기/접기",
-    "🆕 표 상단에 '전체 펼치기 / 전체 접기' 버튼",
-    "🎨 종속 행은 옅은 배경 + 들여쓰기 + ↳ 마커로 부모-자식 관계 시각화",
-    "🔁 v0.9.8c의 Sticky AI 가시성 가드 + UX 개선 / v0.9.8b 헤더 서버 재시작 모두 포함",
+    "🐛 Step 1 화면에서 Sticky AI bar 가 떠 있던 문제 근본 fix — SSE 재연결로 card3 만 DOM 에서 unhidden 되는 케이스 방어",
+    "🛡 가드 강화: card3.hidden + stepBar3.active 둘 다 검증 → 진짜 Step 3 화면일 때만 노출",
+    "🛡 CSS :has() 가드도 stepBar3:not(.active) 추가 — JS race 와 무관하게 차단",
+    "💡 안내 토스트도 stepBar3 active 시점에만 노출 (이전엔 SSE 재연결 시 잘못 노출 가능)",
+    "🔁 v0.9.8d의 분류 요약 표 가독성 개선 / v0.9.8c Sticky AI UX 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5723,8 +5723,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     50% { box-shadow: 0 -8px 24px rgba(0,0,0,0.18), 0 0 0 4px rgba(20, 184, 166, 0.55); }
   }
   .floating-ai-bar.minimized { transform: translateY(calc(100% - 42px)); }
-  /* 🛡 안전망: card3 가 hidden 일 때는 절대 안 보이게 (JS race 방지) */
+  /* 🛡 안전망: card3 가 hidden 이거나 stepBar3 가 active 가 아닐 때는 절대 안 보이게 */
   body:has(#card3.hidden) .floating-ai-bar { display: none !important; }
+  body:has(#stepBar3:not(.active)) .floating-ai-bar { display: none !important; }
   .floating-ai-inner {
     max-width: 1100px; margin: 0 auto;
     display: flex; align-items: center; gap: 12px;
@@ -9364,13 +9365,16 @@ async function pollServerAlive() {
     toggleBtn.textContent = bar.classList.contains('minimized') ? '▴' : '▾';
   });
 
-  // 가시성 제어: card3 보이고 + 메인 채팅 입력창이 viewport 밖일 때만 표시
+  // 가시성 제어: card3 보이고 + stepBar3 active + 메인 채팅 입력창이 viewport 밖일 때만 표시
   function updateVisibility() {
     const card3 = document.getElementById('card3');
     const mainInput = document.getElementById('gateChatInput');
+    const stepBar3 = document.getElementById('stepBar3');
     const card3Visible = card3 && !card3.classList.contains('hidden');
-    // 1차 가드: card3 자체가 hidden 이거나 메인 입력창 자체가 없으면 무조건 hide
-    if (!card3Visible || !mainInput) {
+    // stepBar3 가 active 인지 — SSE 재연결 등으로 card3 가 DOM 에서만 unhidden 된 경우 차단
+    const stepBar3Active = stepBar3 && stepBar3.classList.contains('active');
+    // 1차 가드: card3 hidden / mainInput 없음 / stepBar3 비활성 중 하나라도면 무조건 hide
+    if (!card3Visible || !mainInput || !stepBar3Active) {
       bar.classList.remove('visible');
       document.body.classList.remove('has-floating-ai');
       return;
@@ -9383,9 +9387,6 @@ async function pollServerAlive() {
       return;
     }
     // 3차 판정: 메인 입력창이 viewport 안에 있는지
-    // - rect.top < vh : 메인 입력창의 상단이 viewport 안에 있음 (위로 스크롤됨)
-    // - rect.bottom > 0 : 메인 입력창의 하단이 viewport 안에 있음 (아래로 스크롤됨)
-    // 둘 다 만족하면 = 일부라도 보임 = sticky 숨김
     const vh = window.innerHeight || document.documentElement.clientHeight;
     const mainVisible = rect.bottom > 0 && rect.top < vh;
     if (mainVisible) {
@@ -9409,18 +9410,19 @@ async function pollServerAlive() {
   window.addEventListener('scroll', onScrollOrResize, { passive: true });
   window.addEventListener('resize', onScrollOrResize);
 
-  // card3 클래스 변경 감지 (hidden 토글) + 첫 진입 안내 토스트
+  // card3 + stepBar3 클래스 변경 감지 (hidden / active 토글) + 첫 진입 안내 토스트
   const card3Watch = document.getElementById('card3');
+  const stepBar3Watch = document.getElementById('stepBar3');
   if (card3Watch) {
     new MutationObserver(function() {
       updateVisibility();
-      // card3 가 처음 보이게 되는 순간 — sticky bar 안내 1회 노출
-      const isVisibleNow = !card3Watch.classList.contains('hidden');
-      if (isVisibleNow) {
+      // 진짜 Step 3 진입 — card3 보이고 + stepBar3 active 일 때만 안내 토스트
+      const isCard3Visible = !card3Watch.classList.contains('hidden');
+      const isStep3Active = stepBar3Watch && stepBar3Watch.classList.contains('active');
+      if (isCard3Visible && isStep3Active) {
         try {
           if (localStorage.getItem('tc_sticky_ai_hint_v098c') !== '1') {
             localStorage.setItem('tc_sticky_ai_hint_v098c', '1');
-            // showToast 가 정의되어 있는 경우에만 사용 (안전)
             if (typeof showToast === 'function') {
               setTimeout(function() {
                 showToast('💡 분류표를 스크롤하면 하단에 AI 입력바가 자동으로 떠요', 'success');
@@ -9430,6 +9432,12 @@ async function pollServerAlive() {
         } catch (_) {}
       }
     }).observe(card3Watch, {
+      attributes: true, attributeFilter: ['class']
+    });
+  }
+  // stepBar3 의 active 클래스 변경도 감지 (SSE 재연결 등으로 card3 만 unhidden 되는 경우 방어)
+  if (stepBar3Watch) {
+    new MutationObserver(updateVisibility).observe(stepBar3Watch, {
       attributes: true, attributeFilter: ['class']
     });
   }
