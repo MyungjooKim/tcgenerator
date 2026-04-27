@@ -2,6 +2,48 @@
 
 릴리즈 간 주요 변경사항을 기록합니다. 동료가 `git pull` 받은 후 이 파일을 먼저 읽으면 변경 내용을 빠르게 파악할 수 있습니다.
 
+> **유지보수 메모 — 버전 업데이트 시**
+> `tc-ui/scripts/app_v2.py` 상단의 `APP_VERSION`, `APP_VERSION_DATE`, `APP_VERSION_TAGLINE`,
+> `APP_VERSION_HIGHLIGHTS` 4개 상수만 수정하면 UI 배지·What's New 배너·모달·JS 상수가 모두 자동 반영됩니다.
+> 추가로 이 `CHANGELOG.md`에 새 섹션을 추가하고 `git tag -a vX.Y.Z` 만 진행하면 끝입니다.
+
+---
+
+## v0.9.7c — 2026-04-27 (소분류 중복 차별화 + 버전 SSOT)
+
+> **요약**: 같은 화면에서 동일 소분류가 여러 번 등장할 때 자동 차별화 + 버전 정보 단일 소스화
+
+### ✨ 신규 기능
+
+- **소분류 자동 차별화 (`disambiguate_duplicate_minors`)** — 같은 `(대분류, 중분류, 소분류)` 그룹에 TC가 2개 이상일 때, 각 TC의 `title`에서 차별화 키워드를 추출하여 `소분류 — 키워드` 형태로 자동 부여. 테스터가 TC ID 대신 소분류 이름으로 케이스를 구분할 때 가독성 대폭 향상.
+  - 예시: `Splash 화면 진입` × 4개 → `Splash 화면 진입 — UI 요소 표시`, `— Get Started 버튼 탭`, `— 뒤로가기 동작`, `— 로딩 시간`
+  - 그룹 TC 1개일 땐 변형하지 않음 (불필요한 노이즈 회피)
+  - 한국어 조사/접속어 자동 정리 (`시 키보드 표시` → `키보드 표시`)
+
+- **TC 작성 프롬프트 강화 (예방)** — "같은 중분류 안에서 소분류 이름이 동일하면 안 됨"을 명시. 사후 처리 + 사전 예방의 이중 방어.
+
+- **MD ↔ Excel 일관성 유지** — 후처리는 `step_build_excel` 진입 직후 `tc_content` 자체를 갱신. `tc_final.md` / `tc_files/{project}.md` / Excel 모두 동일한 변형본 사용 → 「기존 TC 수정」 플로우 재실행 시에도 문제 없음.
+
+### 🛠 유지보수성 개선 (SSOT)
+
+- **버전 단일 소스화** — `APP_VERSION`, `APP_VERSION_DATE`, `APP_VERSION_TAGLINE`, `APP_VERSION_HIGHLIGHTS` 4개 상수만 수정하면:
+  - UI 헤더 배지 → 자동 반영
+  - 첫 방문 What's New 배너 → 자동 반영
+  - 자세히 보기 모달 → 자동 반영
+  - localStorage dismiss 키 (`_WHATS_NEW_VERSION`) → 자동 반영 (새 배너 자동 노출)
+- 이전에는 5곳 수동 업데이트 → 이제 **1곳만** 수정. 동료가 git pull 받은 뒤 옛 버전을 보는 문제 재발 방지.
+
+### 🐛 버그 수정
+
+- 동료 PC에서 git pull 후에도 UI 배지가 옛 버전으로 보이던 문제 — 위 SSOT 도입으로 근본 해결.
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` 상수 도입 + Jinja 변수 주입, `disambiguate_duplicate_minors` + 헬퍼 함수, 후처리 호출 (3곳), TC 작성 프롬프트 강화 |
+| `CHANGELOG.md` | v0.9.7c 섹션 추가 + 유지보수 메모 |
+
 ---
 
 ## v0.9.7b — 2026-04-27 (UI/UX 정비 + 다수 버그 수정)

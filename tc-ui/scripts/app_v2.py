@@ -52,6 +52,18 @@ DRIVE_TOKEN_FILE = BASE_DIR / ".drive_token.json"
 PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
+# ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
+APP_VERSION         = "v0.9.7c"
+APP_VERSION_DATE    = "2026-04-27"
+APP_VERSION_TAGLINE = "소분류 중복 자동 차별화 + 버전 SSOT"
+# 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
+APP_VERSION_HIGHLIGHTS = [
+    "🆕 같은 화면에 동일 소분류가 여러 개일 때 TC title 키워드를 자동 부여 (테스터 가독성↑)",
+    "🆕 TC 작성 프롬프트에 '소분류 이름 유일성' 규칙 추가 (예방)",
+    "🔧 버전 단일 소스(SSOT) 도입 — 코드 한 곳 수정하면 UI 배지·배너·모달 자동 반영",
+    "🔁 v0.9.7b의 UI 통합 / ScreenCode 규칙 / **SM 마크업 잔여 버그 수정 모두 포함",
+]
+
 WORKSPACE_ROOT.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
 SPECS_DIR.mkdir(exist_ok=True)
@@ -1854,6 +1866,149 @@ def resolve_screen_navigation(middle_name: str, screen_map: dict) -> str:
     return ""
 
 
+def disambiguate_duplicate_minors(tc_md: str) -> str:
+    """같은 (대분류, 중분류) 안에서 동일한 소분류 이름이 여러 TC에 쓰인 경우,
+    각 TC의 제목(### 헤더 뒤 — 이후 부분)에서 핵심 키워드를 추출하여
+    소분류 뒤에 ` — {키워드}` 형태로 자동 부여한다.
+
+    예: 같은 중분류 'Splash'에 소분류 'Splash 화면 진입' × 4개
+        TC들의 제목이 'UI 요소 표시', 'Get Started 버튼 탭', '뒤로가기 동작', '로딩 시간' 이라면
+        → 각각 'Splash 화면 진입 — UI 요소 표시', '... — Get Started 버튼 탭' ...
+
+    원칙:
+    - 같은 (대,중,소) 그룹의 TC가 1개뿐이면 변경하지 않음 (불필요한 변형 회피)
+    - 이미 다른 소분류 이름이면 변경하지 않음
+    - 변형 결과의 길이는 60자 이내로 제한 (Excel 가독성)
+    - title이 비어있거나 추출 실패 시 (1), (2) 같은 일련번호 fallback
+    """
+    if not tc_md:
+        return tc_md
+
+    # 1단계: TC 블록 단위로 분리 + 각 블록에서 (major, middle, minor, title) 추출
+    blocks = re.split(r"(?m)^(?=###\s)", tc_md)
+    parsed = []  # [(idx, block_text, major, middle, minor, title), ...]
+    for idx, block in enumerate(blocks):
+        if not block.lstrip().startswith("###"):
+            parsed.append((idx, block, None, None, None, None))
+            continue
+        first_line = block.split("\n", 1)[0]
+        # 카테고리/대중소분류 헤더 등 제외
+        if re.match(r"^###\s*(카테고리|대분류|중분류|소분류|Category)\s*[:：\d]", first_line, re.IGNORECASE):
+            parsed.append((idx, block, None, None, None, None))
+            continue
+        # 제목 추출 (— 뒤)
+        cleaned = re.sub(r"\*\*", "", first_line)
+        m = re.match(r"^###\s+\S+\s+—\s+(.+?)\s*$", cleaned)
+        title = m.group(1).strip() if m else ""
+        # 메타 테이블 필드
+        major = _extract_md_field(block, "대분류")
+        middle = _extract_md_field(block, "중분류")
+        minor = _extract_md_field(block, "소분류")
+        parsed.append((idx, block, major, middle, minor, title))
+
+    # 2단계: (major, middle, minor) 그룹별 등장 인덱스 수집
+    from collections import defaultdict as _dd
+    groups = _dd(list)
+    for idx, block, major, middle, minor, title in parsed:
+        if major and middle and minor:
+            groups[(major, middle, minor)].append((idx, title))
+
+    # 3단계: 그룹 크기 >= 2인 경우만 변형 적용
+    new_minors_per_idx: dict[int, str] = {}
+    for (major, middle, minor), entries in groups.items():
+        if len(entries) < 2:
+            continue
+        # 각 TC의 차별화 키워드 추출
+        used_variants: set[str] = set()
+        for ord_n, (idx, title) in enumerate(entries, 1):
+            variant = _extract_minor_variant(title, minor)
+            if not variant:
+                # title에서 추출 불가 → 일련번호 폴백
+                variant = f"({ord_n})"
+            # 길이 제한 (소분류 + " — " + variant 합계 60자 이내)
+            max_var_len = max(8, 60 - len(minor) - 3)
+            if len(variant) > max_var_len:
+                variant = variant[:max_var_len].rstrip()
+            # 같은 그룹 내 variant 충돌 방지
+            base_variant = variant
+            n = 2
+            while variant in used_variants:
+                variant = f"{base_variant} ({n})"
+                n += 1
+            used_variants.add(variant)
+            new_minors_per_idx[idx] = f"{minor} — {variant}"
+
+    if not new_minors_per_idx:
+        return tc_md  # 변형 없음
+
+    # 4단계: 각 블록의 `| 소분류 | ... |` 라인을 새 값으로 치환
+    out_blocks = []
+    for idx, block, major, middle, minor, title in parsed:
+        if idx in new_minors_per_idx and minor:
+            new_minor = new_minors_per_idx[idx]
+            # `| 소분류 | <기존> |` 첫 번째 매칭만 치환
+            block = re.sub(
+                r"(\|\s*소분류\s*\|\s*)" + re.escape(minor) + r"(\s*\|)",
+                r"\g<1>" + new_minor.replace("\\", "\\\\") + r"\g<2>",
+                block, count=1
+            )
+        out_blocks.append(block)
+    return "".join(out_blocks)
+
+
+def _extract_md_field(block: str, field: str) -> str:
+    """TC 블록의 마크다운 테이블에서 특정 필드 값 추출."""
+    m = re.search(rf"\|\s*{re.escape(field)}\s*\|\s*([^|]+?)\s*\|", block)
+    return m.group(1).strip() if m else ""
+
+
+def _extract_minor_variant(title: str, minor: str) -> str:
+    """TC title에서 소분류와 차별화되는 키워드 추출.
+
+    전략:
+    1. title이 minor를 prefix/suffix로 이미 포함하면 그 부분만 잘라낸 나머지 사용
+    2. minor의 핵심 단어와 겹치는 부분 제거 후 남은 핵심 부분
+    3. 결과가 너무 짧거나 어색하면 title 그대로 사용 (단, 길이 제한)
+    """
+    if not title:
+        return ""
+    cleaned = re.sub(r"\s+", " ", title).strip()
+    norm_title = cleaned
+    norm_minor = minor.strip()
+
+    # 1) prefix/suffix 일치 — minor가 그대로 포함되면 잘라내기
+    if norm_minor and norm_title.startswith(norm_minor):
+        leftover = norm_title[len(norm_minor):].strip(" -—:")
+        if len(leftover) >= 4:
+            return _trim_leading_function_words(leftover)[:40]
+    if norm_minor and norm_title.endswith(norm_minor):
+        leftover = norm_title[:-len(norm_minor)].strip(" -—:")
+        if len(leftover) >= 4:
+            return _trim_leading_function_words(leftover)[:40]
+
+    # 2) minor의 단어와 title이 부분 일치 — title 자체가 더 구체적인 표현이면 그대로 사용
+    minor_set = set(re.split(r"[\s\-—:_/()]+", norm_minor))
+    title_words = re.split(r"[\s\-—:_/()]+", norm_title)
+    # title 단어가 minor 단어보다 많으면 (= 더 구체적) title 사용
+    if len([w for w in title_words if w not in minor_set and len(w) >= 2]) >= 2:
+        return norm_title[:40]
+
+    # 3) 마지막 폴백 — title 앞부분
+    return norm_title[:40]
+
+
+def _trim_leading_function_words(s: str) -> str:
+    """문장 시작의 어색한 조사/접속어 제거 (예: '시 키보드 표시' → '키보드 표시')."""
+    # 한국어 조사/접속어 + 영어 의미 없는 시작 단어
+    pattern = r"^(시|에|의|에서|으로|로|가|이|는|은|을|를|와|과|the|a|an)\s+"
+    while True:
+        new_s = re.sub(pattern, "", s, flags=re.IGNORECASE)
+        if new_s == s:
+            break
+        s = new_s
+    return s.strip(" -—:")
+
+
 def renumber_tc_ids(tc_md: str, project_code: str, suite_code: str, starting_seq: int) -> tuple[str, int]:
     """Markdown 내 TC ID(`{PC}-{SC}-NNN`)를 starting_seq부터 연속 재번호.
 
@@ -2040,6 +2195,14 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 ⚠️ 카테고리 3(예외)과 4(에러)를 반드시 포함하세요. Positive만으로 구성하지 마세요.
 ⚠️ 이미 다른 TC에서 검증되는 내용은 중복 작성하지 마세요.
 ⚠️ 중분류당 TC는 5~15개가 적정합니다. 유의미한 TC만 작성하고 양을 채우기 위한 TC는 만들지 마세요.
+
+⚠️ **소분류 이름 유일성** (테스터 가독성 핵심):
+- 같은 중분류 안에서 **여러 TC의 소분류 이름이 동일하면 안 됩니다**.
+- 테스터는 TC ID보다 소분류 이름으로 케이스를 구분하므로, 소분류는 **그 자체로 무엇을 검증하는지 명확히** 표현해야 합니다.
+- 같은 화면의 다른 시나리오라면 소분류에 **차별화 키워드**를 포함하세요.
+  예시 ❌: "Splash 화면 진입" × 4개 (UI 표시/버튼 탭/뒤로가기/로딩)
+  예시 ✅: "Splash 화면 UI 표시", "Splash Get Started 버튼 탭", "Splash 뒤로가기 차단", "Splash 로딩 시간"
+- 소분류 길이는 30자 이내로 짧고 구체적으로.
 - 사전 조건은 반드시 번호 개조식으로 작성
 - **각 TC의 메타 테이블에 `| 연관 화면 |` 필드를 반드시 포함**하세요 (위 📱 섹션 참고)
 
@@ -2376,6 +2539,19 @@ TC 초안 (처음 5000자):
 # ── 8단계: tc_final.md 생성 및 Excel 빌드 ─────────────────────────────────────
 def step_build_excel(sess: dict, tc_content: str, project_name: str,
                      total_tc: int, min_tc: int) -> Path:
+    # 후처리: 같은 (대,중,소) 그룹에 TC가 여러 개면 소분류에 차별화 키워드 자동 부여
+    # MD ↔ Excel 일관성을 위해 tc_content 자체를 갱신 (이후 tc_files에도 변형 적용된 형태로 저장됨)
+    sess.pop("_tc_content_disambiguated", None)  # 이전 호출 잔여 제거
+    try:
+        new_content = disambiguate_duplicate_minors(tc_content)
+        if new_content != tc_content:
+            tc_content = new_content
+            # 세션에도 보관 — 호출부에서 tc_files에 저장 시 이 변형본 사용
+            sess["_tc_content_disambiguated"] = tc_content
+            push_log(sess, "[빌드] 소분류 중복 자동 구분 적용 — 같은 화면의 다른 시나리오에 차별화 키워드 부여")
+    except Exception as e:
+        push_log(sess, f"[빌드] 소분류 후처리 스킵: {e}")
+
     push_log(sess, "[빌드] tc_final.md 생성 중...")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -3271,6 +3447,9 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         excel_path = step_build_excel(sess, tc_content, project_name, total_tc, min_tc)
         push_stage(sess, 5, "Excel 빌드 완료 · 마무리 중", 98, eta_sec=3)
 
+        # 후처리(소분류 중복 차별화)가 적용된 tc_content를 마스터로 채택 (MD ↔ Excel 일치)
+        tc_content = sess.get("_tc_content_disambiguated", tc_content)
+
         # TC 마크다운을 tc_files/에 저장 (수정 모드에서 재사용)
         today = datetime.now().strftime("%Y%m%d")
         safe_name = re.sub(r"[^\w\-_]", "_", project_name)[:30]
@@ -3451,6 +3630,8 @@ TC 형식 규칙:
         sess["status"] = "building"
         push_stage(sess, 5, "Excel 빌드", 90)
         excel_path = step_build_excel(sess, modified_tc, project_name, total_tc, min_tc)
+        # 후처리 적용본 채택 (MD ↔ Excel 일치)
+        modified_tc = sess.get("_tc_content_disambiguated", modified_tc)
 
         # TC 파일 저장 (수정본으로 덮어쓰기)
         today = datetime.now().strftime("%Y%m%d")
@@ -3508,7 +3689,14 @@ TC 형식 규칙:
 def index():
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     api_warning = not api_key or api_key == "sk-ant-..."
-    return render_template_string(HTML_TEMPLATE, api_warning=api_warning)
+    return render_template_string(
+        HTML_TEMPLATE,
+        api_warning=api_warning,
+        app_version=APP_VERSION,
+        app_version_date=APP_VERSION_DATE,
+        app_version_tagline=APP_VERSION_TAGLINE,
+        app_version_highlights=APP_VERSION_HIGHLIGHTS,
+    )
 
 
 @app.route("/upload", methods=["POST"])
@@ -4317,6 +4505,8 @@ def update_tc():
             excel_path = step_build_excel(sess, final_md, project_name,
                                            total_tc=len(existing_tcs),
                                            min_tc=max(1, round(len(existing_tcs) * 0.35)))
+            # 후처리 적용본 채택 (MD ↔ Excel 일치)
+            final_md = sess.get("_tc_content_disambiguated", final_md)
 
             # tc_files에 저장
             today = datetime.now().strftime("%Y%m%d")
@@ -5550,22 +5740,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.7b 릴리즈 노트 보기">v0.9.7b</span>
+    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="{{ app_version }} 릴리즈 노트 보기">{{ app_version }}</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
 
-<!-- What's new 배너 (v0.9.7b 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
+<!-- What's new 배너 ({{ app_version }} 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
 <div id="whatsNewBanner" style="display:none; margin:12px 0; padding:12px 16px; background:linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%); border:1px solid #93C5FD; border-radius:10px;">
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div style="flex:1; font-size:13px; color:#1E40AF;">
-      🎨 <strong>v0.9.7b — UI/UX 정비 + 다수 버그 수정</strong>
+      🎨 <strong>{{ app_version }} — {{ app_version_tagline }}</strong>
       <div style="margin-top:6px; font-size:12px; color:#374151; line-height:1.6;">
-        • Gate 화면 통합: 분류표·TC 매핑 표 한 곳에서 보고 편집<br>
-        • 파이프라인 카드 통합 (Step 2~5 단일 카드, 단계별 색상/체크/펄스)<br>
-        • Excel 컬럼 순서 재배치 + "대상 거래소" 라벨 명확화<br>
-        • ScreenCode 자동 파생 규칙 개선 (단어별 2자 + 충돌 시 마지막 단어 확장)<br>
-        • <code>**SM</code> 같은 마크업 잔여 버그 + SSE 재연결 안내 + 도메인별→화면별 라벨
+        {% for line in app_version_highlights %}• {{ line | safe }}<br>{% endfor %}
       </div>
     </div>
     <div style="display:flex; flex-direction:column; gap:6px;">
@@ -5579,34 +5765,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div id="whatsNewModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
   <div style="background:#FFFFFF; border-radius:12px; max-width:720px; width:92%; max-height:84vh; overflow:hidden; display:flex; flex-direction:column;">
     <div style="padding:16px 20px; border-bottom:1px solid #E5E7EB; display:flex; justify-content:space-between; align-items:center;">
-      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.7b 릴리즈 노트</strong></div>
+      <div><strong style="font-size:15px; color:#1E40AF;">📖 {{ app_version }} 릴리즈 노트</strong></div>
       <button onclick="document.getElementById('whatsNewModal').style.display='none'" style="border:none; background:none; font-size:20px; cursor:pointer; color:#6B7280;">✕</button>
     </div>
     <div style="padding:16px 20px; overflow:auto; font-size:13px; line-height:1.7; color:#374151;">
-      <h3 style="margin:0 0 8px; color:#1E40AF;">🎨 v0.9.7b — 2026-04-27 (UI/UX 정비 + 버그 수정)</h3>
-      <p><strong>화면 일관성 정리 · ScreenCode 규칙 개선 · 다수 잔여 버그 수정</strong></p>
-      <h4 style="color:#065F46; margin-top:16px;">✨ UI/UX 개선</h4>
+      <h3 style="margin:0 0 8px; color:#1E40AF;">🎨 {{ app_version }} — {{ app_version_date }} ({{ app_version_tagline }})</h3>
+      <h4 style="color:#065F46; margin-top:16px;">✨ 이번 변경 요약</h4>
       <ul>
-        <li><strong>Gate 화면 통합</strong>: 문서 Viewer + TC 분류 요약을 하나의 표 중심 화면으로 통합. 원본 마크다운은 펼침/접힘 토글로 선택 노출.</li>
-        <li><strong>파이프라인 카드 통합</strong>: 기존 card2 + card4 중복 → card2 하나로 통합. 단계별 제목/배지 동적 전환.</li>
-        <li><strong>Substep 시인성 강화</strong>: 6단계 파싱 → 정책·기능 → 분류 → 검토 → TC 생성 → Excel. 진행 중(파란 펄스), 완료(초록 ✓), 대기(회색)로 명확히 구분.</li>
-        <li><strong>분류 요약 표 재구성</strong>: 중분류별 행 분리 (A안), 같은 대분류는 첫 행에만 시트명/SuiteCode + 이후 ↳ 동일 시트 표기.</li>
-        <li>Excel 컬럼 순서 재배치 (TC ID → 대분류 → 중분류 → 소분류 → 사전조건 → 테스트 스텝 → 기대결과 → 중요도 → 대상 거래소 → Smoke → 화면 코드).</li>
-        <li>"도메인별 구성" → <strong>"화면별 TC 수"</strong> + ScreenCode · 중분류 이름 형태로 변경.</li>
+        {% for line in app_version_highlights %}<li>{{ line | safe }}</li>{% endfor %}
       </ul>
-      <h4 style="color:#B45309; margin-top:16px;">🐛 버그 수정</h4>
+      <h4 style="color:#6B7280; margin-top:16px;">💡 전체 변경 이력</h4>
       <ul>
-        <li><strong><code>**SM · **SM</code> 잔여 버그</strong>: bold 마크업이 라인 전체를 감쌀 때 parser가 ID로 오인식하던 문제 — ** 제거 후 통일 매칭으로 해결.</li>
-        <li><strong>ScreenCode 충돌</strong>: <code>GOO/GOO2/GOO3</code> 같은 의미 없는 접미사 → <code>GOWE/GOLOC/GOOAS</code> 등 의미 있는 단어 기반 코드.</li>
-        <li><strong>SSE 세션 소멸 시</strong>: 무한 재연결 시도 → 404 감지 후 명확한 안내 배너 + 새로고침 버튼.</li>
-        <li><strong>대분류 체크리스트 제거</strong>: 의미 없던 "TC 생성 범위 선택" 영역 삭제. 범위 지정은 Step 1 focus_area로 일원화.</li>
-        <li>"중분류별" 통계 섹션 중복 제거 (화면별 TC 수와 동일 정보).</li>
-      </ul>
-      <h4 style="color:#6B7280; margin-top:16px;">💡 참고</h4>
-      <ul>
-        <li>v0.9.7a의 마크다운 다중·폴더 업로드 그대로 유지</li>
-        <li>v0.9.7의 Windows 호환성 수정 그대로 포함</li>
-        <li>실행 방법 변경 없음. 전체 이력: <code>CHANGELOG.md</code></li>
+        <li>버전별 상세 내역은 프로젝트 루트의 <code>CHANGELOG.md</code> 참고</li>
+        <li>이전 버전 기능 모두 유지 — 실행 방법 변경 없음</li>
       </ul>
     </div>
     <div style="padding:12px 20px; border-top:1px solid #E5E7EB; text-align:right;">
@@ -7290,7 +7461,7 @@ if (typeof document !== 'undefined') {
 }
 
 // v0.9.6 What's New 배너 표시 — localStorage에 dismiss 기록이 없으면 자동 표시
-const _WHATS_NEW_VERSION = 'v0.9.7b';
+const _WHATS_NEW_VERSION = '{{ app_version }}';
 const _WHATS_NEW_KEY = 'tc_whatsnew_dismissed_' + _WHATS_NEW_VERSION;
 
 function checkWhatsNewBanner() {
