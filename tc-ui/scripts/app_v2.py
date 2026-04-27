@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8c"
+APP_VERSION         = "v0.9.8d"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "Sticky AI 가시성 가드 + UX 디자인 개선"
+APP_VERSION_TAGLINE = "TC 분류 요약 — 소분류 종속 행 + 토글"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 Step 1 입력 화면에서 Sticky AI 입력바가 잘못 노출되던 버그 수정 — CSS :has() 가드 + JS rect 0/0 처리 이중 안전망",
-    "🎨 Sticky AI 입력바 UX 전면 개선 — 네이비/틸 그라데이션, slideUp 애니메이션, 펄스 강조, focus ring",
-    "💡 Step 3 첫 진입 시 안내 토스트 1회 노출 — '분류표를 스크롤하면 하단에 AI 입력바가 자동으로 떠요'",
-    "📱 모바일 좁은 화면에서 보조 텍스트 자동 숨김",
-    "🔁 v0.9.8b의 헤더 서버 재시작 버튼 + 안전장치 모두 포함",
+    "🆕 TC 분류 요약 표 가독성 개선 — 메인 행(시트/Suite/TC ID/대분류/중분류) + 종속 행(소분류 상세)으로 분리",
+    "🆕 각 중분류 행마다 '▼ N개' 토글 — 소분류 클릭 시 펼치기/접기",
+    "🆕 표 상단에 '전체 펼치기 / 전체 접기' 버튼",
+    "🎨 종속 행은 옅은 배경 + 들여쓰기 + ↳ 마커로 부모-자식 관계 시각화",
+    "🔁 v0.9.8c의 Sticky AI 가시성 가드 + UX 개선 / v0.9.8b 헤더 서버 재시작 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5826,6 +5826,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   /* 숨김 */
   .hidden { display: none !important; }
 
+  /* TC 분류 요약 표 — 옵션 E (메인 행 + 종속 행) */
+  .tc-summary-table .tc-summary-row-main:hover { background: #EFF6FF !important; }
+  .tc-summary-table .tc-summary-row-main td:last-child:hover { background: #DBEAFE; }
+  .tc-summary-table .tc-summary-row-nested { transition: opacity 0.15s ease; }
+  .tc-summary-table .tc-summary-row-nested td { border-top: 0 !important; }
+
   /* 안내 */
   .info-box {
     background: #EBF2FF; border-left: 4px solid var(--blue);
@@ -8626,6 +8632,29 @@ function setTcIdMode(systemGenerated) {
   if (helpAuto) helpAuto.style.display = systemGenerated ? '' : 'none';
 }
 
+// ─ 분류 요약 표 — 소분류 행 개별/전체 토글 ─
+function toggleMinorRow(idx) {
+  var row = document.getElementById('minorRow_' + idx);
+  var icon = document.getElementById('minorToggleIcon_' + idx);
+  if (!row) return;
+  var isHidden = row.style.display === 'none';
+  row.style.display = isHidden ? '' : 'none';
+  if (icon) icon.textContent = isHidden ? '▼' : '▶';
+}
+
+function toggleAllMinors(open) {
+  // 모든 종속 행 일괄 토글
+  var rows = document.querySelectorAll('.tc-summary-row-nested');
+  rows.forEach(function(row) {
+    row.style.display = open ? '' : 'none';
+  });
+  // 모든 토글 아이콘도 동기화
+  var icons = document.querySelectorAll('[id^="minorToggleIcon_"]');
+  icons.forEach(function(icon) {
+    icon.textContent = open ? '▼' : '▶';
+  });
+}
+
 // 기존 호환: 테이블 내 체크박스가 호출하는 함수 → 상단 토글과 동기화
 function toggleAutoScreenCode(checkbox) {
   var topToggle = document.getElementById('tcIdModeToggle');
@@ -8704,15 +8733,26 @@ function renderGateViewer(mdText) {
     // 도움말 — 모드별 2종 (display toggle)
     summaryHtml += '<div id="suiteCodeHelpNormal" style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code> ...</div>';
     summaryHtml += '<div id="suiteCodeHelpAuto" style="display:none;font-size:12px;color:#4B5563;margin-bottom:10px;">🤖 <strong>시스템 규칙 자동 적용</strong> — 각 중분류(화면)가 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">screen_code_map.md</code>에 등록된 ScreenCode로 자동 매핑됩니다.<br>예: Splash → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-SPL-001</code>, Login Options → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-LGI-001</code> ... (화면별 독립 001~)</div>';
-    summaryHtml += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-    summaryHtml += '<tr style="background:#DBEAFE;"><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">시트명 (Excel)</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">SuiteCode</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">TC ID 미리보기</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류 (화면)</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">소분류</th></tr>';
-    // A안: 중분류별 행 분리 — Excel은 대분류별 시트로 묶이지만 표는 각 중분류 단위로 명시
-    // 같은 대분류 내에서 첫 행만 시트명/대분류 셀 표시 (rowspan), 그 외는 비워서 그룹 시각화
+    // 표 상단 컨트롤 — 전체 펼치기/접기
+    summaryHtml += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap;">';
+    summaryHtml += '<div style="font-size:11px;color:#6B7280;">💡 각 중분류 행의 <strong>▼ 소분류</strong> 를 클릭하면 상세 항목이 펼쳐집니다.</div>';
+    summaryHtml += '<div style="display:flex;gap:6px;">';
+    summaryHtml += '<button type="button" onclick="toggleAllMinors(true)" style="padding:4px 10px;font-size:11px;background:#FFFFFF;color:#1E3A5F;border:1px solid #93C5FD;border-radius:6px;cursor:pointer;font-weight:600;">▼ 전체 펼치기</button>';
+    summaryHtml += '<button type="button" onclick="toggleAllMinors(false)" style="padding:4px 10px;font-size:11px;background:#FFFFFF;color:#1E3A5F;border:1px solid #93C5FD;border-radius:6px;cursor:pointer;font-weight:600;">▶ 전체 접기</button>';
+    summaryHtml += '</div></div>';
+    summaryHtml += '<table class="tc-summary-table" style="width:100%;border-collapse:collapse;font-size:12px;">';
+    summaryHtml += '<tr style="background:#DBEAFE;">';
+    summaryHtml += '<th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">시트명 (Excel)</th>';
+    summaryHtml += '<th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">SuiteCode</th>';
+    summaryHtml += '<th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">TC ID 미리보기</th>';
+    summaryHtml += '<th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th>';
+    summaryHtml += '<th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류 (화면)</th>';
+    summaryHtml += '<th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;width:130px;">소분류</th>';
+    summaryHtml += '</tr>';
+    // 옵션 E: 메인 행(시트/Suite/TC ID/대분류/중분류 + 소분류 토글) + 종속 행(소분류 상세, colspan=6)
     var prevMajor = null;
     var groupCount = 0;
     var totalMiddles = cats.length;
-    // 대분류별로 같은 시트 → SuiteCode는 대분류 단위 한 번만 입력 가능. 표에서 input은 첫 행에만.
-    // domain index는 대분류 인덱스 (시트 그룹) 기준
     var majorIndex = -1;
     var seenMajors = {};
     for (var ci = 0; ci < cats.length; ci++) {
@@ -8720,9 +8760,7 @@ function renderGateViewer(mdText) {
       var majorClean = c.major;
       var midClean = (c.middle || '').trim();
       var minorList = (c.minors || []).filter(function(m){ return m && m.trim(); });
-      var minorText = minorList.length > 0
-        ? minorList.map(function(m){ return '• ' + m; }).join('<br>')
-        : '<span style="color:#9CA3AF;">(소분류 없음)</span>';
+      var minorCount = minorList.length;
 
       var isFirstOfMajor = !(majorClean in seenMajors);
       if (isFirstOfMajor) {
@@ -8731,19 +8769,15 @@ function renderGateViewer(mdText) {
       }
       var domIdx = seenMajors[majorClean];
 
-      // 시트명: 대분류 = Excel 시트 단위
       var sheetName = majorClean;
-      // SuiteCode 자동값: 대분류 영문 4자
       var autoCode = majorClean.replace(/[^A-Za-z]/g, '').toUpperCase().substring(0, 4);
-      // TC ID 미리보기: ScreenCode 모드 → resolveScreenCodeFE(중분류명)
-      //                  Suite 모드 → SuiteCode 입력값 사용 (대분류 단위)
-      // 우선 기본 (ScreenCode 자동) 미리보기 표시
       var screenCode = resolveScreenCodeFE(midClean, {});
       var previewId = _pcode + '-' + screenCode + '-001';
 
       var bg = ci % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
-      summaryHtml += '<tr style="background:' + bg + ';">';
-      // 시트명 — 같은 대분류의 첫 행에만 표시 (rowspan 비슷한 효과)
+      var nestedBg = ci % 2 === 0 ? '#F1F5F9' : '#F8FAFC';  // 종속 행은 살짝 더 어둡게
+      // ─ 메인 행 (기본 정보) ─
+      summaryHtml += '<tr class="tc-summary-row-main" style="background:' + bg + ';">';
       if (isFirstOfMajor) {
         summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:700;color:#1E3A5F;">' + _escapeHtml(sheetName) + '</td>';
         summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;"><input type="text" class="suite-code-input" data-domain="' + domIdx + '" data-pcode="' + _pcode + '" value="' + autoCode + '" placeholder="예: GNBF" oninput="updateTcIdPreview(this)" style="width:80px;padding:4px 6px;border:1.5px solid #93C5FD;border-radius:4px;font-size:12px;font-weight:700;text-transform:uppercase;font-family:monospace;"></td>';
@@ -8754,8 +8788,28 @@ function renderGateViewer(mdText) {
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-family:monospace;font-size:11px;color:#1D4ED8;" id="tcIdPreview_' + ci + '" data-pcode="' + _pcode + '" data-middle="' + _escapeHtml(midClean) + '">' + previewId + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + (isFirstOfMajor ? _escapeHtml(majorClean) : '<span style="color:#9CA3AF;">↳</span>') + '</td>';
       summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:600;">' + _escapeHtml(midClean) + '</td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#374151;line-height:1.5;">' + minorText + '</td>';
+      // 소분류 토글 셀
+      if (minorCount > 0) {
+        summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;text-align:center;cursor:pointer;user-select:none;" onclick="toggleMinorRow(' + ci + ')" title="클릭하여 소분류 펼치기/접기">';
+        summaryHtml += '<span id="minorToggleIcon_' + ci + '" style="color:#3B82F6;font-weight:700;">▼</span> ';
+        summaryHtml += '<span style="color:#1E3A5F;font-weight:600;font-size:11px;">' + minorCount + '개</span>';
+        summaryHtml += '</td>';
+      } else {
+        summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;text-align:center;color:#9CA3AF;font-size:11px;">없음</td>';
+      }
       summaryHtml += '</tr>';
+      // ─ 종속 행 (소분류 상세) — 펼침 상태로 시작 (open) ─
+      if (minorCount > 0) {
+        var minorText = minorList.map(function(m){
+          return '<li style="margin-bottom:4px;">' + _escapeHtml(m) + '</li>';
+        }).join('');
+        summaryHtml += '<tr class="tc-summary-row-nested" id="minorRow_' + ci + '" style="background:' + nestedBg + ';">';
+        summaryHtml += '<td colspan="6" style="padding:0;border:1px solid #D1D5DB;border-top:none;">';
+        summaryHtml += '<div style="padding:8px 12px 10px 28px;color:#374151;line-height:1.6;">';
+        summaryHtml += '<div style="font-size:10.5px;color:#6B7280;font-weight:600;margin-bottom:4px;letter-spacing:0.3px;">↳ 소분류 (' + minorCount + ')</div>';
+        summaryHtml += '<ul style="margin:0;padding:0 0 0 14px;list-style:disc;">' + minorText + '</ul>';
+        summaryHtml += '</div></td></tr>';
+      }
     }
     summaryHtml += '</table>';
     var estMin = totalMiddles * 5;
