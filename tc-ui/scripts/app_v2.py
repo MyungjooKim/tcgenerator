@@ -53,15 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.7c"
+APP_VERSION         = "v0.9.8a"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "소분류 중복 자동 차별화 + 버전 SSOT"
+APP_VERSION_TAGLINE = "입력 소스 일괄 삭제 + Sticky AI 입력바 + TC 분류 요약 접기"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 같은 화면에 동일 소분류가 여러 개일 때 TC title 키워드를 자동 부여 (테스터 가독성↑)",
-    "🆕 TC 작성 프롬프트에 '소분류 이름 유일성' 규칙 추가 (예방)",
-    "🔧 버전 단일 소스(SSOT) 도입 — 코드 한 곳 수정하면 UI 배지·배너·모달 자동 반영",
-    "🔁 v0.9.7b의 UI 통합 / ScreenCode 규칙 / **SM 마크업 잔여 버그 수정 모두 포함",
+    "🆕 입력 소스 2개 이상일 때 '🗑 전체 삭제' 버튼 노출 — 한 번에 정리 가능",
+    "🆕 분류 검토(Step 3) 화면에서 표를 길게 스크롤해도 하단에 떠 있는 'AI 수정 요청' 입력바로 즉시 요청 가능",
+    "🆕 TC 분류 요약 표 접기/펼치기 기능 — 헤더 클릭 시 토글 (기본 펼침). 분류표 원본 마크다운 토글과 동일 패턴",
+    "🪟 Floating 입력바는 메인 채팅창이 화면 밖일 때만 노출되며, ▾ 버튼으로 최소화 가능",
+    "🔁 v0.9.7c의 소분류 중복 자동 차별화 / 버전 SSOT 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5421,6 +5422,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     cursor: pointer; transition: all 0.15s;
   }
   .btn-add-source:hover { border-color: var(--blue); color: var(--blue); background: #EBF2FF; }
+  .btn-clear-sources {
+    padding: 7px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
+    background: #FEF2F2; color: #B91C1C; border: 1.5px solid #FCA5A5;
+    cursor: pointer; transition: all 0.15s; margin-left: auto;
+  }
+  .btn-clear-sources:hover { background: #FEE2E2; border-color: #EF4444; color: #991B1B; }
   .source-card {
     border: 1.5px solid var(--border); border-radius: 10px;
     margin-bottom: 10px; overflow: hidden; background: var(--white);
@@ -5589,6 +5596,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     cursor: pointer; white-space: nowrap; align-self: flex-end;
   }
   .gate-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* ── Sticky Floating AI 입력바 (긴 분류 요약 표 스크롤 시 항상 접근) ── */
+  .floating-ai-bar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    z-index: 9000; background: #FFFFFF;
+    border-top: 2px solid var(--blue);
+    box-shadow: 0 -4px 16px rgba(0,0,0,0.10);
+    padding: 10px 16px; display: none;
+    transform: translateY(0); transition: transform 0.18s ease;
+  }
+  .floating-ai-bar.visible { display: block; }
+  .floating-ai-bar.minimized { transform: translateY(calc(100% - 38px)); }
+  .floating-ai-inner {
+    max-width: 1100px; margin: 0 auto;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .floating-ai-label {
+    font-size: 12px; font-weight: 700; color: var(--navy);
+    white-space: nowrap; display: flex; align-items: center; gap: 6px;
+  }
+  .floating-ai-input {
+    flex: 1; border: 1.5px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; outline: none;
+    font-family: inherit; min-height: 36px; max-height: 90px;
+    line-height: 1.5; color: var(--text); resize: none;
+  }
+  .floating-ai-input:focus { border-color: var(--blue); }
+  .floating-ai-send {
+    padding: 8px 18px; background: var(--teal); color: #fff;
+    border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+    cursor: pointer; white-space: nowrap;
+  }
+  .floating-ai-send:disabled { opacity: 0.5; cursor: not-allowed; }
+  .floating-ai-toggle {
+    padding: 4px 10px; background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-size: 11px; cursor: pointer; white-space: nowrap;
+  }
+  .floating-ai-toggle:hover { background: var(--bg); color: var(--text); }
+  body.has-floating-ai { padding-bottom: 70px; }
+  /* details/summary 기본 마커 제거 (Safari/WebKit 포함) */
+  #tcSummaryDetails > summary::-webkit-details-marker { display: none; }
+  #tcSummaryDetails > summary { list-style: none; }
+  #tcSummaryDetails > summary:hover { background: rgba(59, 130, 246, 0.06); border-radius: 10px; }
   .gate-viewer-panel {
     display: flex; flex-direction: column;
     border: 1.5px solid var(--border); border-radius: 10px; overflow: hidden;
@@ -5868,6 +5918,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button type="button" class="btn-add-source" onclick="addSource('web')">🌐 웹 URL 추가</button>
           <button type="button" class="btn-add-source" onclick="addSource('md')">📝 마크다운 파일 추가</button>
           <button type="button" class="btn-add-source" onclick="addSource('text')">✏️ 텍스트 추가</button>
+          <button type="button" class="btn-clear-sources" id="btnClearAllSources" onclick="clearAllSources()" style="display:none;">🗑 전체 삭제</button>
         </div>
         <div id="sourceList"></div>
         <div id="sourceEmpty" class="source-empty">
@@ -6091,14 +6142,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </details>
     <script>
-      // details 펼치기/접기 시 ▶ ↔ ▼ 화살표 전환
+      // details 펼치기/접기 시 ▶ ↔ ▼ 화살표 + 라벨 전환
+      // (분류표 원본 + TC 분류 요약 모두 처리)
       (function() {
         document.addEventListener('toggle', function(e) {
-          if (e.target && e.target.tagName === 'DETAILS') {
-            var icon = e.target.querySelector('#rawDocToggleIcon');
-            if (icon) icon.textContent = e.target.open ? '▼' : '▶';
+          if (!e.target || e.target.tagName !== 'DETAILS') return;
+          // 1) 원본 마크다운 보기 토글
+          var rawIcon = e.target.querySelector('#rawDocToggleIcon');
+          if (rawIcon) {
+            rawIcon.textContent = e.target.open ? '▼' : '▶';
             var sumText = e.target.querySelector('summary span:last-child');
             if (sumText) sumText.textContent = e.target.open ? '📄 분류표 원본 마크다운 보기 (접기)' : '📄 분류표 원본 마크다운 보기 (펼치기)';
+            return;
+          }
+          // 2) TC 분류 요약 토글 (renderGateViewer 가 동적 생성)
+          if (e.target.id === 'tcSummaryDetails') {
+            var sIcon = e.target.querySelector('#tcSummaryToggleIcon');
+            if (sIcon) sIcon.textContent = e.target.open ? '▼' : '▶';
+            var hint = e.target.querySelector('#tcSummaryFoldHint');
+            if (hint) hint.textContent = e.target.open ? '(클릭하여 접기)' : '(클릭하여 펼치기)';
           }
         }, true);
       })();
@@ -7511,6 +7573,15 @@ function removeSource(id) {
   onInputsChanged();  // 소스 삭제 감지
 }
 
+function clearAllSources() {
+  if (sources.length === 0) return;
+  const n = sources.length;
+  if (!confirm('입력 소스 ' + n + '개를 모두 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.')) return;
+  sources = [];
+  renderSources();
+  onInputsChanged();  // 전체 삭제 감지
+}
+
 function updateSourceContent(id, value) {
   const s = sources.find(s => s.id === id);
   if (s) s.content = value;
@@ -7646,7 +7717,10 @@ async function onMdFolderChange(id, input) {
 function renderSources() {
   const list  = document.getElementById('sourceList');
   const empty = document.getElementById('sourceEmpty');
+  const clearBtn = document.getElementById('btnClearAllSources');
   if (!list) return;
+  // 전체 삭제 버튼: 2개 이상일 때만 노출
+  if (clearBtn) clearBtn.style.display = (sources.length >= 2) ? '' : 'none';
   if (sources.length === 0) {
     list.innerHTML = '';
     empty && empty.classList.remove('hidden');
@@ -8450,15 +8524,22 @@ function renderGateViewer(mdText) {
       }
     });
 
-    summaryHtml = '<div style="background:#F0F9FF;border:1.5px solid #93C5FD;border-radius:10px;padding:14px 16px;margin-bottom:16px;">';
-    summaryHtml += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
-    summaryHtml += '<div style="font-size:14px;font-weight:700;color:#1E3A5F;">TC 분류 요약</div>';
-    // 자동 적용 토글 (우측)
-    summaryHtml += '<label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#1E3A5F;cursor:pointer;user-select:none;background:#FFFFFF;padding:5px 10px;border:1.5px solid #93C5FD;border-radius:6px;">';
-    summaryHtml += '<input type="checkbox" id="autoScreenCodeToggle" onchange="toggleAutoScreenCode(this)" style="margin:0;cursor:pointer;">';
+    summaryHtml = '<details id="tcSummaryDetails" open style="background:#F0F9FF;border:1.5px solid #93C5FD;border-radius:10px;margin-bottom:16px;">';
+    // <summary> 자체가 헤더 역할 — 클릭 시 펼침/접힘. list-style:none 으로 기본 마커 제거.
+    summaryHtml += '<summary id="tcSummaryHeader" style="cursor:pointer;padding:14px 16px;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:10px;user-select:none;">';
+    summaryHtml += '<div style="font-size:14px;font-weight:700;color:#1E3A5F;display:flex;align-items:center;gap:8px;">';
+    summaryHtml += '<span id="tcSummaryToggleIcon" style="font-size:12px;color:#3B82F6;">▼</span>';
+    summaryHtml += '<span>TC 분류 요약</span>';
+    summaryHtml += '<span id="tcSummaryFoldHint" style="font-size:11px;color:#6B7280;font-weight:400;">(클릭하여 접기)</span>';
+    summaryHtml += '</div>';
+    // 자동 적용 토글 (우측) — summary 내부에서 클릭 시 details 토글되지 않도록 stopPropagation 추가
+    summaryHtml += '<label onclick="event.stopPropagation();" style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#1E3A5F;cursor:pointer;user-select:none;background:#FFFFFF;padding:5px 10px;border:1.5px solid #93C5FD;border-radius:6px;">';
+    summaryHtml += '<input type="checkbox" id="autoScreenCodeToggle" onchange="toggleAutoScreenCode(this)" onclick="event.stopPropagation();" style="margin:0;cursor:pointer;">';
     summaryHtml += '<span>🤖 <strong>시스템 규칙 자동 적용</strong></span>';
     summaryHtml += '</label>';
-    summaryHtml += '</div>';
+    summaryHtml += '</summary>';
+    // 본문 영역 (접히는 부분)
+    summaryHtml += '<div style="padding:0 16px 14px 16px;">';
     // 도움말 — 모드별 2종 (display toggle)
     summaryHtml += '<div id="suiteCodeHelpNormal" style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code> ...</div>';
     summaryHtml += '<div id="suiteCodeHelpAuto" style="display:none;font-size:12px;color:#4B5563;margin-bottom:10px;">🤖 <strong>시스템 규칙 자동 적용</strong> — 각 중분류(화면)가 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">screen_code_map.md</code>에 등록된 ScreenCode로 자동 매핑됩니다.<br>예: Splash → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-SPL-001</code>, Login Options → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-LGI-001</code> ... (화면별 독립 001~)</div>';
@@ -8522,7 +8603,8 @@ function renderGateViewer(mdText) {
     summaryHtml += '<span style="font-size:16px;">📊</span>';
     summaryHtml += '<span>예상 TC 수량: <strong>' + estMin + '~' + estMax + '개</strong> (중분류 ' + totalMiddles + '개 × 5~15개)</span>';
     summaryHtml += '</div>';
-    summaryHtml += '</div>';
+    summaryHtml += '</div>';   // 본문 div close
+    summaryHtml += '</details>';  // 외부 details close
   }
   // 메인 영역(Viewer = gateViewer)에는 통합 표 + 분류표 헤더 표시 (옵션 A — 표 중심)
   var headerLine = '<div style="font-size:13px;color:var(--muted);margin-bottom:10px;">📋 분류표 결과 — 채팅으로 수정하거나 SuiteCode를 입력한 후 승인하세요.</div>';
@@ -8931,6 +9013,101 @@ function showToast(msg, type = 'success') {
   t.textContent = msg; t.className = type; t.style.display = 'block';
   setTimeout(() => t.style.display = 'none', 3000);
 }
+
+// ── Sticky Floating AI 입력바: card3 노출 + 메인 입력창이 화면 밖일 때만 표시 ──
+(function() {
+  // 동적으로 floating bar DOM 삽입
+  const bar = document.createElement('div');
+  bar.id = 'floatingAiBar';
+  bar.className = 'floating-ai-bar';
+  bar.innerHTML =
+    '<div class="floating-ai-inner">' +
+      '<span class="floating-ai-label">💬 AI 수정 요청</span>' +
+      '<textarea class="floating-ai-input" id="floatingAiInput" rows="1" ' +
+        'placeholder="예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈"></textarea>' +
+      '<button class="floating-ai-send" id="floatingAiSend">전송</button>' +
+      '<button class="floating-ai-toggle" id="floatingAiToggle" title="최소화/펼치기">▾</button>' +
+    '</div>';
+  document.body.appendChild(bar);
+
+  const input = document.getElementById('floatingAiInput');
+  const sendBtn = document.getElementById('floatingAiSend');
+  const toggleBtn = document.getElementById('floatingAiToggle');
+
+  // 메인 입력창과 동기화하여 sendGateChat() 재사용
+  async function submitFloating() {
+    const msg = input.value.trim();
+    if (!msg) return;
+    const mainInput = document.getElementById('gateChatInput');
+    if (!mainInput) return;
+    mainInput.value = msg;
+    input.value = '';
+    sendBtn.disabled = true;
+    try {
+      await sendGateChat();
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+  sendBtn.addEventListener('click', submitFloating);
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitFloating();
+    }
+  });
+
+  // 최소화 토글
+  toggleBtn.addEventListener('click', function() {
+    bar.classList.toggle('minimized');
+    toggleBtn.textContent = bar.classList.contains('minimized') ? '▴' : '▾';
+  });
+
+  // 가시성 제어: card3 보이고 + 메인 채팅 입력창이 viewport 밖일 때만 표시
+  function updateVisibility() {
+    const card3 = document.getElementById('card3');
+    const mainInput = document.getElementById('gateChatInput');
+    const card3Visible = card3 && !card3.classList.contains('hidden');
+    if (!card3Visible || !mainInput) {
+      bar.classList.remove('visible');
+      document.body.classList.remove('has-floating-ai');
+      return;
+    }
+    const rect = mainInput.getBoundingClientRect();
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    // 메인 입력창이 화면에 보이지 않을 때만 floating bar 노출
+    const mainVisible = rect.bottom > 0 && rect.top < vh;
+    if (mainVisible) {
+      bar.classList.remove('visible');
+      document.body.classList.remove('has-floating-ai');
+    } else {
+      bar.classList.add('visible');
+      document.body.classList.add('has-floating-ai');
+    }
+  }
+
+  // 스크롤/리사이즈/카드 토글에 반응
+  let scrollRaf = null;
+  function onScrollOrResize() {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(function() {
+      updateVisibility();
+      scrollRaf = null;
+    });
+  }
+  window.addEventListener('scroll', onScrollOrResize, { passive: true });
+  window.addEventListener('resize', onScrollOrResize);
+
+  // card3 클래스 변경 감지 (hidden 토글)
+  const card3Watch = document.getElementById('card3');
+  if (card3Watch) {
+    new MutationObserver(updateVisibility).observe(card3Watch, {
+      attributes: true, attributeFilter: ['class']
+    });
+  }
+  // 초기 1회
+  setTimeout(updateVisibility, 100);
+})();
 </script>
 </body>
 </html>
