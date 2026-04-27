@@ -9,6 +9,50 @@
 
 ---
 
+## v0.9.8c — 2026-04-27 (Sticky AI 가시성 가드 + UX 개선)
+
+> **요약**: v0.9.8 에 추가한 Sticky AI 입력바가 Step 1 입력 화면에서 잘못 노출되던 문제 수정 + 디자인 전면 개선.
+
+### 🐛 버그 수정
+
+- **Step 1 에서 Sticky AI bar 가 떠 있던 문제** — 사용자 보고: "분류표 하단으로 스크롤해서 나타나고, 다시 상단으로 올라가면 떠 있는 채로 안 사라짐"
+  - **원인**: `getBoundingClientRect()` 가 hidden 부모(card3) 안에서 0/0 반환 + scroll 방향 전환 시 가시성 재판정이 부정확
+  - **해결 (이중 안전망)**:
+    1. **CSS `:has()` 가드** — `body:has(#card3.hidden) .floating-ai-bar { display: none !important }` 한 줄로 JS race 와 무관하게 표시 차단 (Safari 13+/Chrome 105+)
+    2. **JS `rect.width===0 && rect.height===0` 명시 처리** — hidden 부모 안의 입력창은 명시적으로 hide
+
+### 🎨 UI/UX 개선
+
+| 요소 | Before | After |
+|------|--------|-------|
+| 배경 | 흰색 (`#FFFFFF`) | 네이비/틸 그라데이션 + backdrop-filter blur(8px) |
+| 윗 테두리 | 2px solid blue | 3px solid teal (`#14B8A6`) |
+| 그림자 | 약함 (`0 -4px 16px ... 0.10`) | 강조 (`0 -8px 24px ... 0.18`) |
+| 첫 등장 | 즉시 display | slideUp 0.32s + 1회 펄스 (border 강조) |
+| 라벨 | 작은 한 줄 텍스트 | 굵은 메인 + 작은 보조 ("표 검토 중에도 바로 요청하세요") |
+| 입력창 | 평범 회색 보더 | 그림자 + focus 시 teal ring |
+| 전송 버튼 | 단색 teal | 그라데이션 + hover lift |
+| 토글 (▾) | 작은 회색 버튼 | 둥근 칩 (흰 텍스트, 반투명 배경) |
+| 모바일 | 동일 | `<small>` 보조 텍스트 자동 숨김 |
+
+### 💡 발견성(Discoverability) 향상
+
+- **Step 3 첫 진입 시 안내 토스트** 1회 노출:
+  ```
+  💡 분류표를 스크롤하면 하단에 AI 입력바가 자동으로 떠요
+  ```
+- `localStorage` 키 `tc_sticky_ai_hint_v098c` 로 dismiss 기억
+- 1.2초 지연 후 자동 노출 → 사용자가 화면 인지 후 자연스럽게 보임
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.8c 갱신, CSS `:has()` 가드 + 디자인 전면 개편, `updateVisibility()` 에 rect 0/0 가드 추가, MutationObserver 안에 첫 진입 토스트 |
+| `CHANGELOG.md` | v0.9.8c 섹션 추가 |
+
+---
+
 ## v0.9.8b — 2026-04-27 (헤더 서버 재시작 버튼)
 
 > **요약**: 코드 변경 후 매번 터미널로 가서 Ctrl+C → 재실행하던 번거로움 해소. 헤더에서 클릭 한 번으로 서버 재시작 + 자동 새로고침.

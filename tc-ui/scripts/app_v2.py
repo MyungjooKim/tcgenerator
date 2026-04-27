@@ -53,15 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8b"
+APP_VERSION         = "v0.9.8c"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "헤더 서버 재시작 버튼 + 안전장치"
+APP_VERSION_TAGLINE = "Sticky AI 가시성 가드 + UX 디자인 개선"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 헤더 우측에 '🔄 서버 재시작' 버튼 — 코드 변경 후 클릭 한 번으로 재시작 + 자동 새로고침",
-    "🛡 보안: localhost 요청만 허용 (LAN 차단), 활성 세션 있으면 강한 경고 후 force=1 필요",
-    "🪟 재시작 진행 중 전체화면 오버레이 + 서버 살아남 자동 폴링 (최대 30초)",
-    "🔁 v0.9.8a의 입력 소스 전체 삭제 / Sticky AI 입력바 / TC 분류 요약 접기 모두 포함",
+    "🐛 Step 1 입력 화면에서 Sticky AI 입력바가 잘못 노출되던 버그 수정 — CSS :has() 가드 + JS rect 0/0 처리 이중 안전망",
+    "🎨 Sticky AI 입력바 UX 전면 개선 — 네이비/틸 그라데이션, slideUp 애니메이션, 펄스 강조, focus ring",
+    "💡 Step 3 첫 진입 시 안내 토스트 1회 노출 — '분류표를 스크롤하면 하단에 AI 입력바가 자동으로 떠요'",
+    "📱 모바일 좁은 화면에서 보조 텍스트 자동 숨김",
+    "🔁 v0.9.8b의 헤더 서버 재시작 버튼 + 안전장치 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5699,45 +5700,86 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     cursor: pointer; white-space: nowrap; align-self: flex-end;
   }
   .gate-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
-  /* ── Sticky Floating AI 입력바 (긴 분류 요약 표 스크롤 시 항상 접근) ── */
+  /* ── Sticky Floating AI 입력바 (Step 3 분류 검토 화면 전용) ── */
   .floating-ai-bar {
     position: fixed; left: 0; right: 0; bottom: 0;
-    z-index: 9000; background: #FFFFFF;
-    border-top: 2px solid var(--blue);
-    box-shadow: 0 -4px 16px rgba(0,0,0,0.10);
-    padding: 10px 16px; display: none;
-    transform: translateY(0); transition: transform 0.18s ease;
+    z-index: 9000;
+    background: linear-gradient(135deg, rgba(30, 58, 95, 0.97) 0%, rgba(45, 91, 110, 0.97) 100%);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border-top: 3px solid #14B8A6;
+    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.18);
+    padding: 12px 20px; color: #FFFFFF;
+    display: none;
+    transform: translateY(100%);
+    transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1);
   }
-  .floating-ai-bar.visible { display: block; }
-  .floating-ai-bar.minimized { transform: translateY(calc(100% - 38px)); }
+  .floating-ai-bar.visible {
+    display: block;
+    transform: translateY(0);
+    animation: floatingAiPulse 1.4s ease-out 0.32s 1;
+  }
+  @keyframes floatingAiPulse {
+    0%, 100% { box-shadow: 0 -8px 24px rgba(0,0,0,0.18); }
+    50% { box-shadow: 0 -8px 24px rgba(0,0,0,0.18), 0 0 0 4px rgba(20, 184, 166, 0.55); }
+  }
+  .floating-ai-bar.minimized { transform: translateY(calc(100% - 42px)); }
+  /* 🛡 안전망: card3 가 hidden 일 때는 절대 안 보이게 (JS race 방지) */
+  body:has(#card3.hidden) .floating-ai-bar { display: none !important; }
   .floating-ai-inner {
     max-width: 1100px; margin: 0 auto;
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; gap: 12px;
   }
   .floating-ai-label {
-    font-size: 12px; font-weight: 700; color: var(--navy);
-    white-space: nowrap; display: flex; align-items: center; gap: 6px;
+    font-size: 13px; font-weight: 700; color: #FFFFFF;
+    white-space: nowrap; display: flex; flex-direction: column; gap: 1px;
+  }
+  .floating-ai-label small {
+    font-size: 10px; font-weight: 400; opacity: 0.78; letter-spacing: 0.2px;
   }
   .floating-ai-input {
-    flex: 1; border: 1.5px solid var(--border); border-radius: 8px;
-    padding: 8px 12px; font-size: 13px; outline: none;
-    font-family: inherit; min-height: 36px; max-height: 90px;
+    flex: 1; border: 1.5px solid rgba(255, 255, 255, 0.25); border-radius: 10px;
+    background: rgba(255, 255, 255, 0.96);
+    padding: 10px 14px; font-size: 13px; outline: none;
+    font-family: inherit; min-height: 38px; max-height: 100px;
     line-height: 1.5; color: var(--text); resize: none;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+    transition: box-shadow 0.18s ease, border-color 0.18s ease;
   }
-  .floating-ai-input:focus { border-color: var(--blue); }
+  .floating-ai-input:focus {
+    border-color: #14B8A6;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12), 0 0 0 3px rgba(20, 184, 166, 0.32);
+  }
   .floating-ai-send {
-    padding: 8px 18px; background: var(--teal); color: #fff;
-    border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+    padding: 9px 20px;
+    background: linear-gradient(135deg, #14B8A6 0%, #0D9488 100%);
+    color: #fff; border: none; border-radius: 10px;
+    font-size: 13px; font-weight: 700;
     cursor: pointer; white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(20, 184, 166, 0.42);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
   }
-  .floating-ai-send:disabled { opacity: 0.5; cursor: not-allowed; }
+  .floating-ai-send:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(20, 184, 166, 0.55);
+  }
+  .floating-ai-send:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
   .floating-ai-toggle {
-    padding: 4px 10px; background: transparent; color: var(--muted);
-    border: 1px solid var(--border); border-radius: 6px;
-    font-size: 11px; cursor: pointer; white-space: nowrap;
+    padding: 5px 12px; background: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF; border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 999px;
+    font-size: 11px; font-weight: 600;
+    cursor: pointer; white-space: nowrap;
+    transition: background 0.15s ease;
   }
-  .floating-ai-toggle:hover { background: var(--bg); color: var(--text); }
-  body.has-floating-ai { padding-bottom: 70px; }
+  .floating-ai-toggle:hover { background: rgba(255, 255, 255, 0.22); }
+  body.has-floating-ai { padding-bottom: 78px; }
+  /* 좁은 화면 (모바일) — 라벨 보조 텍스트 숨김, 패딩 축소 */
+  @media (max-width: 640px) {
+    .floating-ai-bar { padding: 10px 14px; }
+    .floating-ai-label small { display: none; }
+    .floating-ai-inner { gap: 8px; }
+    .floating-ai-send { padding: 8px 14px; }
+  }
   /* details/summary 기본 마커 제거 (Safari/WebKit 포함) */
   #tcSummaryDetails > summary::-webkit-details-marker { display: none; }
   #tcSummaryDetails > summary { list-style: none; }
@@ -9224,7 +9266,10 @@ async function pollServerAlive() {
   bar.className = 'floating-ai-bar';
   bar.innerHTML =
     '<div class="floating-ai-inner">' +
-      '<span class="floating-ai-label">💬 AI 수정 요청</span>' +
+      '<span class="floating-ai-label">' +
+        '<span>💬 AI 도우미</span>' +
+        '<small>표 검토 중에도 바로 요청하세요</small>' +
+      '</span>' +
       '<textarea class="floating-ai-input" id="floatingAiInput" rows="1" ' +
         'placeholder="예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈"></textarea>' +
       '<button class="floating-ai-send" id="floatingAiSend">전송</button>' +
@@ -9270,14 +9315,24 @@ async function pollServerAlive() {
     const card3 = document.getElementById('card3');
     const mainInput = document.getElementById('gateChatInput');
     const card3Visible = card3 && !card3.classList.contains('hidden');
+    // 1차 가드: card3 자체가 hidden 이거나 메인 입력창 자체가 없으면 무조건 hide
     if (!card3Visible || !mainInput) {
       bar.classList.remove('visible');
       document.body.classList.remove('has-floating-ai');
       return;
     }
+    // 2차 가드: 부모가 display:none 이면 rect 가 모두 0 → 안전하게 hide
     const rect = mainInput.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      bar.classList.remove('visible');
+      document.body.classList.remove('has-floating-ai');
+      return;
+    }
+    // 3차 판정: 메인 입력창이 viewport 안에 있는지
+    // - rect.top < vh : 메인 입력창의 상단이 viewport 안에 있음 (위로 스크롤됨)
+    // - rect.bottom > 0 : 메인 입력창의 하단이 viewport 안에 있음 (아래로 스크롤됨)
+    // 둘 다 만족하면 = 일부라도 보임 = sticky 숨김
     const vh = window.innerHeight || document.documentElement.clientHeight;
-    // 메인 입력창이 화면에 보이지 않을 때만 floating bar 노출
     const mainVisible = rect.bottom > 0 && rect.top < vh;
     if (mainVisible) {
       bar.classList.remove('visible');
@@ -9300,10 +9355,27 @@ async function pollServerAlive() {
   window.addEventListener('scroll', onScrollOrResize, { passive: true });
   window.addEventListener('resize', onScrollOrResize);
 
-  // card3 클래스 변경 감지 (hidden 토글)
+  // card3 클래스 변경 감지 (hidden 토글) + 첫 진입 안내 토스트
   const card3Watch = document.getElementById('card3');
   if (card3Watch) {
-    new MutationObserver(updateVisibility).observe(card3Watch, {
+    new MutationObserver(function() {
+      updateVisibility();
+      // card3 가 처음 보이게 되는 순간 — sticky bar 안내 1회 노출
+      const isVisibleNow = !card3Watch.classList.contains('hidden');
+      if (isVisibleNow) {
+        try {
+          if (localStorage.getItem('tc_sticky_ai_hint_v098c') !== '1') {
+            localStorage.setItem('tc_sticky_ai_hint_v098c', '1');
+            // showToast 가 정의되어 있는 경우에만 사용 (안전)
+            if (typeof showToast === 'function') {
+              setTimeout(function() {
+                showToast('💡 분류표를 스크롤하면 하단에 AI 입력바가 자동으로 떠요', 'success');
+              }, 1200);
+            }
+          }
+        } catch (_) {}
+      }
+    }).observe(card3Watch, {
       attributes: true, attributeFilter: ['class']
     });
   }
