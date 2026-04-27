@@ -9,6 +9,49 @@
 
 ---
 
+## v0.9.12 — 2026-04-27 (메인 채팅 정리 + 다국어 + 모달 리사이즈)
+
+> **요약**: v0.9.11 의 미니 채팅 패널 후속 — 중복 UI 정리 + 다국어 + 사용자 모달 리사이즈.
+
+### ✨ 변경
+
+**1) 상단 메인 채팅 패널 시각적 제거**
+- 미니 채팅 + 모달 만으로 충분 → 상단 메인 패널 (`💬 AI와 대화하여 수정`) 시각적으로 숨김
+- DOM 은 유지 (`display:none`) — `sendGateChat()` / `addGateChatMsg()` 가 `#gateChatInput` / `#gateChatMessages` 직접 참조하므로 단일 진실 소스 보존
+- 미니 채팅 가시성 로직도 단순화: viewport 기반 → Step 3 진입 시 항상 표시
+
+**2) 다국어 Placeholder 자동 감지**
+
+지원 언어 4개:
+
+| 언어 | placeholder 예시 |
+|------|----------------|
+| 한국어 (ko) | 예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈 |
+| English (en) | e.g. Delete AUTH domain case #3 — Enter to send, Shift+Enter for newline |
+| 日本語 (ja) | 例) AUTH ドメインのケース3を削除して — Enter で送信、Shift+Enter で改行 |
+| 中文 (zh) | 例) 删除 AUTH 域名案例 #3 — Enter 发送, Shift+Enter 换行 |
+
+- `navigator.language` 기반 자동 감지
+- `localStorage.tc_ui_lang` 우선 (사용자 수동 설정)
+- 콘솔에서 `setStickyAiLang('en')` 호출로 수동 변경 + 페이지 자동 새로고침
+- 라벨, 힌트, 버튼 라벨, 모달 제목 등 모두 번역됨
+
+**3) 모달 사용자 리사이즈**
+- CSS `resize: both` 네이티브 — 우측 하단 모서리 드래그
+- 시각 강화: 모달 우측 하단에 작은 줄무늬 표시
+- 사용자가 드래그 → ResizeObserver 가 0.3초 후 자동으로 `localStorage.tc_modal_size` 저장
+- 다음 모달 오픈 시 저장된 크기 자동 복원
+- 최소 크기 360x320, 최대 96vh
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.12, 메인 채팅 패널 `display:none` 적용, IIFE 에 `I18N` 객체 + `detectLang()` + `setStickyAiLang()` + 모든 라벨/placeholder 다국어, 모달 리사이즈 CSS + ResizeObserver 영속 |
+| `CHANGELOG.md` | v0.9.12 섹션 추가 |
+
+---
+
 ## v0.9.11 — 2026-04-27 (Sticky AI → 미니 채팅 패널)
 
 > **요약**: 하단 Sticky AI 입력바가 입력만 가능했던 한계 해소 — 미니 채팅 패널로 확장하여 응답도 하단에서 즉시 확인 가능.

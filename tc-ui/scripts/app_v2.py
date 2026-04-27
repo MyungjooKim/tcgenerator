@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.11"
+APP_VERSION         = "v0.9.12"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "Sticky AI 미니 채팅 패널로 확장"
+APP_VERSION_TAGLINE = "메인 채팅 정리 + 다국어 + 모달 리사이즈"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 하단 Sticky AI 입력바를 미니 채팅 패널로 확장 — 응답을 하단에서 즉시 확인 (스크롤 불필요)",
-    "🆕 메인 채팅 패널과 양방향 메시지 미러링 — 어느 쪽에서 입력해도 양쪽에 반영",
-    "🆕 ⛶ 크게 보기 모달 — 화면 중앙에 큰 채팅창으로 깊게 대화 가능",
-    "🪟 3가지 상태: 접힘(입력만) / 펼침(메시지+입력) / 모달(전체화면). 헤더 클릭으로 토글",
-    "🔁 v0.9.10 tc-rules.md 컷오프 제거 / v0.9.9 Excel 출력 옵션 모두 포함",
+    "🆕 상단 메인 채팅 패널 시각적 제거 — 미니/모달 채팅이 단일 UI (DOM 은 단일 진실 소스로 유지)",
+    "🌍 다국어 placeholder 자동 감지 — 한/영/일/중 4개 언어 (브라우저 언어 기반)",
+    "🛠 setStickyAiLang('en') 등으로 수동 변경 가능 (localStorage 영속)",
+    "📐 모달 사용자 리사이즈 — 우측 하단 모서리 드래그 (CSS resize 네이티브, 크기 자동 저장)",
+    "🔁 v0.9.11 미니 채팅 패널 / v0.9.10 tc-rules.md 컷오프 제거 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5866,9 +5866,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .floating-ai-modal-box {
     background: #FFFFFF; color: var(--text);
     border-radius: 14px;
-    width: 100%; max-width: 720px; height: 78vh; max-height: 800px;
-    display: flex; flex-direction: column; overflow: hidden;
+    width: 100%; max-width: 720px; height: 78vh;
+    min-width: 360px; min-height: 320px;
+    max-height: 96vh;
+    display: flex; flex-direction: column;
+    overflow: hidden; position: relative;
     box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    resize: both;  /* native 리사이즈 — 우측 하단 모서리 드래그 */
+  }
+  /* native resize 핸들 시각 강화 (브라우저 기본 핸들이 작아서 보이게) */
+  .floating-ai-modal-resize {
+    position: absolute; bottom: 0; right: 0;
+    width: 18px; height: 18px;
+    background:
+      linear-gradient(135deg, transparent 50%, var(--muted) 50%, var(--muted) 60%, transparent 60%, transparent 70%, var(--muted) 70%, var(--muted) 80%, transparent 80%);
+    pointer-events: none;  /* native resize 가 잡음 */
+    border-bottom-right-radius: 14px;
+    opacity: 0.5;
   }
   .floating-ai-modal-header {
     padding: 14px 20px; background: var(--navy); color: #FFFFFF;
@@ -6388,8 +6402,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- AI 채팅 영역 (단독 폭) -->
-    <div class="gate-chat-panel" style="margin-bottom:16px;">
+    <!-- AI 채팅 영역 (단독 폭) — v0.9.12: 시각적으로 숨김. 미니 채팅 패널이 UI 담당.
+         단, sendGateChat() / addGateChatMsg() 가 #gateChatInput / #gateChatMessages 를
+         참조하므로 DOM 자체는 유지 (단일 진실 소스). 미니/모달 채팅이 미러링하여 사용. -->
+    <div class="gate-chat-panel" style="display:none;">
       <div class="gate-chat-header">
         💬 AI와 대화하여 수정
       </div>
@@ -9637,7 +9653,71 @@ async function pollServerAlive() {
 // ── Sticky Mini AI 채팅 패널 (Step 3 분류 검토 전용) ──
 // - 메인 #gateChatMessages 에서 메시지를 미러링하여 하단에서도 응답 즉시 확인 가능
 // - 3가지 상태: collapsed(입력만) / expanded(메시지+입력) / modal(확대)
+// - v0.9.12: 다국어 placeholder + 모달 리사이즈 지원
 (function() {
+  // ─ 다국어 placeholder ─
+  // localStorage 'tc_ui_lang' 우선, 없으면 navigator.language 자동 감지
+  const I18N = {
+    ko: {
+      placeholder: '예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈',
+      placeholderModal: '예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈',
+      labelMain: '💬 AI 도우미',
+      labelHint: '표 검토 중에도 바로 대화하세요',
+      btnLarge: '⛶ 크게',
+      btnClose: '✕ 닫기',
+      modalTitle: '💬 AI 도우미 — 분류표 검토',
+      empty: '아직 대화가 없어요. 아래에서 요청을 입력해보세요.',
+    },
+    en: {
+      placeholder: 'e.g. Delete AUTH domain case #3 — Enter to send, Shift+Enter for newline',
+      placeholderModal: 'e.g. Delete AUTH domain case #3 — Enter to send, Shift+Enter for newline',
+      labelMain: '💬 AI Helper',
+      labelHint: 'Chat anytime while reviewing the table',
+      btnLarge: '⛶ Expand',
+      btnClose: '✕ Close',
+      modalTitle: '💬 AI Helper — Classification Review',
+      empty: 'No conversation yet. Type a request below to start.',
+    },
+    ja: {
+      placeholder: '例) AUTH ドメインのケース3を削除して — Enter で送信、Shift+Enter で改行',
+      placeholderModal: '例) AUTH ドメインのケース3を削除して — Enter で送信、Shift+Enter で改行',
+      labelMain: '💬 AI アシスタント',
+      labelHint: '表を確認しながらいつでも対話',
+      btnLarge: '⛶ 拡大',
+      btnClose: '✕ 閉じる',
+      modalTitle: '💬 AI アシスタント — 分類表レビュー',
+      empty: 'まだ会話がありません。下に要求を入力してください。',
+    },
+    zh: {
+      placeholder: '例) 删除 AUTH 域名案例 #3 — Enter 发送, Shift+Enter 换行',
+      placeholderModal: '例) 删除 AUTH 域名案例 #3 — Enter 发送, Shift+Enter 换行',
+      labelMain: '💬 AI 助手',
+      labelHint: '审阅表格时随时对话',
+      btnLarge: '⛶ 放大',
+      btnClose: '✕ 关闭',
+      modalTitle: '💬 AI 助手 — 分类表审阅',
+      empty: '尚无对话。在下方输入请求开始。',
+    },
+  };
+  function detectLang() {
+    try {
+      const saved = localStorage.getItem('tc_ui_lang');
+      if (saved && I18N[saved]) return saved;
+    } catch (_) {}
+    const nav = (navigator.language || 'ko').toLowerCase();
+    if (nav.startsWith('en')) return 'en';
+    if (nav.startsWith('ja')) return 'ja';
+    if (nav.startsWith('zh')) return 'zh';
+    return 'ko';  // 기본값
+  }
+  const T = I18N[detectLang()];
+  // 전역에 노출 — 다른 코드에서 언어 변경 시 호출 가능
+  window.setStickyAiLang = function(lang) {
+    if (!I18N[lang]) return false;
+    try { localStorage.setItem('tc_ui_lang', lang); } catch(_) {}
+    location.reload();
+    return true;
+  };
   // ─ DOM 구성 ─
   const bar = document.createElement('div');
   bar.id = 'floatingAiBar';
@@ -9645,20 +9725,20 @@ async function pollServerAlive() {
   bar.innerHTML =
     '<div class="floating-ai-header" id="floatingAiHeader">' +
       '<div class="floating-ai-header-label">' +
-        '<span>💬 AI 도우미</span>' +
+        '<span>' + T.labelMain + '</span>' +
         '<span class="floating-ai-msg-badge" id="floatingAiMsgBadge" style="display:none;">0</span>' +
-        '<small>표 검토 중에도 바로 대화하세요</small>' +
+        '<small>' + T.labelHint + '</small>' +
       '</div>' +
-      '<button class="floating-ai-ctrl" id="floatingAiExpandBtn" title="크게 보기">⛶ 크게</button>' +
-      '<button class="floating-ai-ctrl" id="floatingAiCollapseBtn" title="펼치기/접기">▾</button>' +
+      '<button class="floating-ai-ctrl" id="floatingAiExpandBtn" title="' + T.btnLarge + '">' + T.btnLarge + '</button>' +
+      '<button class="floating-ai-ctrl" id="floatingAiCollapseBtn" title="▾">▾</button>' +
     '</div>' +
     '<div class="floating-ai-messages" id="floatingAiMessages">' +
-      '<div class="floating-ai-empty" id="floatingAiEmpty">아직 대화가 없어요. 아래에서 요청을 입력해보세요.</div>' +
+      '<div class="floating-ai-empty" id="floatingAiEmpty">' + T.empty + '</div>' +
     '</div>' +
     '<div class="floating-ai-inner">' +
       '<textarea class="floating-ai-input" id="floatingAiInput" rows="1" ' +
-        'placeholder="예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈"></textarea>' +
-      '<button class="floating-ai-send" id="floatingAiSend">전송</button>' +
+        'placeholder="' + T.placeholder + '"></textarea>' +
+      '<button class="floating-ai-send" id="floatingAiSend">' + (detectLang() === 'ko' ? '전송' : detectLang() === 'en' ? 'Send' : detectLang() === 'ja' ? '送信' : '发送') + '</button>' +
     '</div>';
   document.body.appendChild(bar);
 
@@ -9666,19 +9746,21 @@ async function pollServerAlive() {
   const modal = document.createElement('div');
   modal.id = 'floatingAiModal';
   modal.className = 'floating-ai-modal';
+  const sendLabel = detectLang() === 'ko' ? '전송' : detectLang() === 'en' ? 'Send' : detectLang() === 'ja' ? '送信' : '发送';
   modal.innerHTML =
-    '<div class="floating-ai-modal-box">' +
+    '<div class="floating-ai-modal-box" id="floatingAiModalBox">' +
       '<div class="floating-ai-modal-header">' +
-        '<div class="floating-ai-modal-title">💬 AI 도우미 — 분류표 검토</div>' +
-        '<button class="floating-ai-modal-close" id="floatingAiModalClose">✕ 닫기</button>' +
+        '<div class="floating-ai-modal-title">' + T.modalTitle + '</div>' +
+        '<button class="floating-ai-modal-close" id="floatingAiModalClose">' + T.btnClose + '</button>' +
       '</div>' +
       '<div class="floating-ai-modal-messages" id="floatingAiModalMessages"></div>' +
       '<div class="floating-ai-modal-input-row">' +
         '<textarea class="floating-ai-input" id="floatingAiModalInput" rows="2" ' +
-          'placeholder="예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈" ' +
+          'placeholder="' + T.placeholderModal + '" ' +
           'style="border-color:var(--border);"></textarea>' +
-        '<button class="floating-ai-send" id="floatingAiModalSend">전송</button>' +
+        '<button class="floating-ai-send" id="floatingAiModalSend">' + sendLabel + '</button>' +
       '</div>' +
+      '<div class="floating-ai-modal-resize" id="floatingAiModalResize" title="크기 조절"></div>' +
     '</div>';
   document.body.appendChild(modal);
 
@@ -9757,9 +9839,39 @@ async function pollServerAlive() {
     toggleCollapsed();
   });
 
-  // ─ 모달 열기/닫기 ─
+  // ─ 모달 열기/닫기 + 크기 영속 ─
+  const modalBox = document.getElementById('floatingAiModalBox');
+  function applySavedModalSize() {
+    try {
+      const saved = JSON.parse(localStorage.getItem('tc_modal_size') || 'null');
+      if (saved && saved.w && saved.h) {
+        modalBox.style.width = saved.w + 'px';
+        modalBox.style.height = saved.h + 'px';
+        modalBox.style.maxWidth = 'none';  // saved size 가 max 보다 클 수 있게
+      }
+    } catch (_) {}
+  }
+  function saveModalSize() {
+    try {
+      const w = modalBox.offsetWidth;
+      const h = modalBox.offsetHeight;
+      if (w > 100 && h > 100) {
+        localStorage.setItem('tc_modal_size', JSON.stringify({ w, h }));
+      }
+    } catch (_) {}
+  }
+  // ResizeObserver 로 사용자가 드래그 종료한 후 자동 저장
+  if (window.ResizeObserver) {
+    let resizeTimer = null;
+    new ResizeObserver(function() {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(saveModalSize, 300);  // 드래그 멈춘 후 0.3초
+    }).observe(modalBox);
+  }
+
   function openModal() {
     syncMessages();  // 최신 동기화
+    applySavedModalSize();
     modal.classList.add('open');
     setTimeout(() => modalInput.focus(), 60);
     setTimeout(() => { modalMessages.scrollTop = modalMessages.scrollHeight; }, 60);
@@ -9839,37 +9951,21 @@ async function pollServerAlive() {
     setTimeout(syncMessages, 200);
   }
 
-  // 가시성 제어: card3 보이고 + stepBar3 active + 메인 채팅 입력창이 viewport 밖일 때만 표시
+  // 가시성 제어: Step 3 (분류표 검토) 화면일 때 항상 표시
+  // v0.9.12: 메인 채팅 패널이 숨겨졌으므로 viewport 위치 기반 판정 제거.
+  //          Step 3 진입 = 미니 채팅 항상 노출 (사용자가 항상 접근 가능)
   function updateVisibility() {
     const card3 = document.getElementById('card3');
-    const mainInput = document.getElementById('gateChatInput');
     const stepBar3 = document.getElementById('stepBar3');
     const card3Visible = card3 && !card3.classList.contains('hidden');
-    // stepBar3 가 active 인지 — SSE 재연결 등으로 card3 가 DOM 에서만 unhidden 된 경우 차단
     const stepBar3Active = stepBar3 && stepBar3.classList.contains('active');
-    // 1차 가드: card3 hidden / mainInput 없음 / stepBar3 비활성 중 하나라도면 무조건 hide
-    if (!card3Visible || !mainInput || !stepBar3Active) {
+    if (!card3Visible || !stepBar3Active) {
       bar.classList.remove('visible');
       document.body.classList.remove('has-floating-ai');
       return;
     }
-    // 2차 가드: 부모가 display:none 이면 rect 가 모두 0 → 안전하게 hide
-    const rect = mainInput.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) {
-      bar.classList.remove('visible');
-      document.body.classList.remove('has-floating-ai');
-      return;
-    }
-    // 3차 판정: 메인 입력창이 viewport 안에 있는지
-    const vh = window.innerHeight || document.documentElement.clientHeight;
-    const mainVisible = rect.bottom > 0 && rect.top < vh;
-    if (mainVisible) {
-      bar.classList.remove('visible');
-      document.body.classList.remove('has-floating-ai');
-    } else {
-      bar.classList.add('visible');
-      document.body.classList.add('has-floating-ai');
-    }
+    bar.classList.add('visible');
+    document.body.classList.add('has-floating-ai');
   }
 
   // 스크롤/리사이즈/카드 토글에 반응
