@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.10"
+APP_VERSION         = "v0.9.11"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "tc-rules.md 컷오프 제거 — TC 품질 개선"
+APP_VERSION_TAGLINE = "Sticky AI 미니 채팅 패널로 확장"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 tc-rules.md (28,540자) 가 AI 에게 첫 8,000자 (28%) 만 전달되던 문제 fix",
-    "🆕 원칙 D (시각 속성 통합) / Splash 10개 이상 금지 / TC 카테고리 비율 등이 이제 AI에게 전달됨",
-    "🆕 단일 화면 입력 시 디자인 TC 폭주 (예: email 만 입력 → 30~50개 TC) 방지 효과 기대",
-    "📐 신규 TC 작성(8000→전체) + 수정 영향도 분석(4000→전체) + TC 수정 적용(4000→전체) 3곳 fix",
-    "🔁 v0.9.9 Excel 출력 옵션 / v0.9.8g 파이프라인 중단 fix 모두 포함",
+    "🆕 하단 Sticky AI 입력바를 미니 채팅 패널로 확장 — 응답을 하단에서 즉시 확인 (스크롤 불필요)",
+    "🆕 메인 채팅 패널과 양방향 메시지 미러링 — 어느 쪽에서 입력해도 양쪽에 반영",
+    "🆕 ⛶ 크게 보기 모달 — 화면 중앙에 큰 채팅창으로 깊게 대화 가능",
+    "🪟 3가지 상태: 접힘(입력만) / 펼침(메시지+입력) / 모달(전체화면). 헤더 클릭으로 토글",
+    "🔁 v0.9.10 tc-rules.md 컷오프 제거 / v0.9.9 Excel 출력 옵션 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5711,7 +5711,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     cursor: pointer; white-space: nowrap; align-self: flex-end;
   }
   .gate-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
-  /* ── Sticky Floating AI 입력바 (Step 3 분류 검토 화면 전용) ── */
+  /* ── Sticky Mini AI 채팅 패널 (Step 3 분류 검토 전용) ── */
+  /* 3가지 상태: collapsed(입력만, 약 60px) / expanded(메시지+입력, ~280px) / modal(전체화면) */
   .floating-ai-bar {
     position: fixed; left: 0; right: 0; bottom: 0;
     z-index: 9000;
@@ -5719,13 +5720,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
     border-top: 3px solid #14B8A6;
     box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.18);
-    padding: 12px 20px; color: #FFFFFF;
+    color: #FFFFFF;
     display: none;
     transform: translateY(100%);
     transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .floating-ai-bar.visible {
-    display: block;
+    display: flex; flex-direction: column;
     transform: translateY(0);
     animation: floatingAiPulse 1.4s ease-out 0.32s 1;
   }
@@ -5733,20 +5734,85 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     0%, 100% { box-shadow: 0 -8px 24px rgba(0,0,0,0.18); }
     50% { box-shadow: 0 -8px 24px rgba(0,0,0,0.18), 0 0 0 4px rgba(20, 184, 166, 0.55); }
   }
-  .floating-ai-bar.minimized { transform: translateY(calc(100% - 42px)); }
-  /* 🛡 안전망: card3 가 hidden 이거나 stepBar3 가 active 가 아닐 때는 절대 안 보이게 */
+  /* 안전망: card3 hidden / stepBar3 비활성 시 절대 숨김 */
   body:has(#card3.hidden) .floating-ai-bar { display: none !important; }
   body:has(#stepBar3:not(.active)) .floating-ai-bar { display: none !important; }
+
+  /* 헤더 — 라벨 + 메시지 개수 + 컨트롤 버튼 */
+  .floating-ai-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 20px; border-bottom: 1px solid rgba(255,255,255,0.12);
+    background: rgba(0,0,0,0.10);
+    cursor: pointer; user-select: none;
+  }
+  .floating-ai-bar.collapsed .floating-ai-header { border-bottom: none; }
+  .floating-ai-header-label {
+    flex: 1; font-size: 13px; font-weight: 700; color: #FFFFFF;
+    display: flex; align-items: center; gap: 8px; white-space: nowrap;
+  }
+  .floating-ai-header-label small {
+    font-weight: 400; opacity: 0.7; font-size: 11px;
+  }
+  .floating-ai-msg-badge {
+    font-size: 10px; font-weight: 700;
+    padding: 2px 8px; border-radius: 999px;
+    background: rgba(20, 184, 166, 0.32); color: #A7F3D0;
+  }
+  .floating-ai-ctrl {
+    background: rgba(255,255,255,0.10);
+    color: #FFFFFF; border: 1px solid rgba(255,255,255,0.22);
+    border-radius: 6px;
+    padding: 4px 10px; font-size: 11px; font-weight: 600;
+    cursor: pointer; white-space: nowrap;
+    transition: background 0.15s ease;
+  }
+  .floating-ai-ctrl:hover { background: rgba(255,255,255,0.20); }
+
+  /* 메시지 영역 (collapsed 상태에서 숨김) */
+  .floating-ai-messages {
+    overflow-y: auto; padding: 12px 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    max-height: 220px; min-height: 80px;
+    background: rgba(255,255,255,0.04);
+    transition: max-height 0.25s ease, padding 0.25s ease, opacity 0.2s ease;
+  }
+  .floating-ai-bar.collapsed .floating-ai-messages {
+    max-height: 0; min-height: 0; padding: 0 20px;
+    opacity: 0; pointer-events: none; overflow: hidden;
+  }
+  .floating-ai-msg {
+    max-width: 88%; padding: 8px 12px; border-radius: 10px;
+    font-size: 12.5px; line-height: 1.55;
+    word-wrap: break-word; word-break: break-word;
+  }
+  .floating-ai-msg.assistant {
+    align-self: flex-start;
+    background: rgba(255,255,255,0.94); color: #1E3A5F;
+    border-bottom-left-radius: 3px;
+  }
+  .floating-ai-msg.user {
+    align-self: flex-end;
+    background: linear-gradient(135deg, #14B8A6 0%, #0D9488 100%);
+    color: #FFFFFF;
+    border-bottom-right-radius: 3px;
+  }
+  .floating-ai-msg.system {
+    align-self: center;
+    background: rgba(34, 197, 94, 0.18); color: #BBF7D0;
+    font-size: 11px;
+    border: 1px solid rgba(34, 197, 94, 0.32);
+    border-radius: 8px; max-width: 96%;
+  }
+  .floating-ai-empty {
+    align-self: center; color: rgba(255,255,255,0.55);
+    font-size: 11.5px; padding: 14px 0;
+  }
+
+  /* 입력 영역 */
   .floating-ai-inner {
-    max-width: 1100px; margin: 0 auto;
-    display: flex; align-items: center; gap: 12px;
-  }
-  .floating-ai-label {
-    font-size: 13px; font-weight: 700; color: #FFFFFF;
-    white-space: nowrap; display: flex; flex-direction: column; gap: 1px;
-  }
-  .floating-ai-label small {
-    font-size: 10px; font-weight: 400; opacity: 0.78; letter-spacing: 0.2px;
+    max-width: 1100px; margin: 0 auto; width: 100%;
+    display: flex; align-items: flex-end; gap: 10px;
+    padding: 10px 20px 12px 20px;
   }
   .floating-ai-input {
     flex: 1; border: 1.5px solid rgba(255, 255, 255, 0.25); border-radius: 10px;
@@ -5775,22 +5841,58 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     box-shadow: 0 4px 12px rgba(20, 184, 166, 0.55);
   }
   .floating-ai-send:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-  .floating-ai-toggle {
-    padding: 5px 12px; background: rgba(255, 255, 255, 0.12);
-    color: #FFFFFF; border: 1px solid rgba(255, 255, 255, 0.25);
-    border-radius: 999px;
-    font-size: 11px; font-weight: 600;
-    cursor: pointer; white-space: nowrap;
-    transition: background 0.15s ease;
-  }
-  .floating-ai-toggle:hover { background: rgba(255, 255, 255, 0.22); }
-  body.has-floating-ai { padding-bottom: 78px; }
-  /* 좁은 화면 (모바일) — 라벨 보조 텍스트 숨김, 패딩 축소 */
+
+  /* body padding — collapsed 56px / expanded 약 340px (헤더+메시지+입력) */
+  body.has-floating-ai { padding-bottom: 340px; }
+  body.has-floating-ai.has-floating-ai-collapsed { padding-bottom: 64px; }
+
+  /* 좁은 화면 */
   @media (max-width: 640px) {
-    .floating-ai-bar { padding: 10px 14px; }
-    .floating-ai-label small { display: none; }
-    .floating-ai-inner { gap: 8px; }
+    .floating-ai-header { padding: 8px 14px; }
+    .floating-ai-messages { padding: 10px 14px; max-height: 180px; }
+    .floating-ai-inner { padding: 8px 14px 10px 14px; gap: 8px; }
     .floating-ai-send { padding: 8px 14px; }
+    body.has-floating-ai { padding-bottom: 300px; }
+  }
+
+  /* ── Mini Chat 확대 모달 (full-size view) ── */
+  .floating-ai-modal {
+    position: fixed; inset: 0; z-index: 10000;
+    background: rgba(15, 23, 42, 0.72);
+    display: none; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .floating-ai-modal.open { display: flex; }
+  .floating-ai-modal-box {
+    background: #FFFFFF; color: var(--text);
+    border-radius: 14px;
+    width: 100%; max-width: 720px; height: 78vh; max-height: 800px;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  .floating-ai-modal-header {
+    padding: 14px 20px; background: var(--navy); color: #FFFFFF;
+    display: flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.10);
+  }
+  .floating-ai-modal-title {
+    flex: 1; font-size: 15px; font-weight: 700;
+  }
+  .floating-ai-modal-close {
+    background: rgba(255,255,255,0.12); color: #FFFFFF;
+    border: 1px solid rgba(255,255,255,0.22);
+    border-radius: 6px; padding: 5px 12px;
+    font-size: 12px; cursor: pointer;
+  }
+  .floating-ai-modal-close:hover { background: rgba(255,255,255,0.22); }
+  .floating-ai-modal-messages {
+    flex: 1; overflow-y: auto; padding: 18px 22px;
+    display: flex; flex-direction: column; gap: 10px;
+    background: #F8FAFC;
+  }
+  .floating-ai-modal-input-row {
+    display: flex; gap: 10px; padding: 14px 20px;
+    border-top: 1px solid var(--border); background: #FFFFFF;
   }
   /* details/summary 기본 마커 제거 (Safari/WebKit 포함) */
   #tcSummaryDetails > summary::-webkit-details-marker { display: none; }
@@ -9532,57 +9634,210 @@ async function pollServerAlive() {
   status.textContent = '⚠️ 30초 동안 응답 없음. 직접 새로고침해 주세요.';
 }
 
-// ── Sticky Floating AI 입력바: card3 노출 + 메인 입력창이 화면 밖일 때만 표시 ──
+// ── Sticky Mini AI 채팅 패널 (Step 3 분류 검토 전용) ──
+// - 메인 #gateChatMessages 에서 메시지를 미러링하여 하단에서도 응답 즉시 확인 가능
+// - 3가지 상태: collapsed(입력만) / expanded(메시지+입력) / modal(확대)
 (function() {
-  // 동적으로 floating bar DOM 삽입
+  // ─ DOM 구성 ─
   const bar = document.createElement('div');
   bar.id = 'floatingAiBar';
   bar.className = 'floating-ai-bar';
   bar.innerHTML =
-    '<div class="floating-ai-inner">' +
-      '<span class="floating-ai-label">' +
+    '<div class="floating-ai-header" id="floatingAiHeader">' +
+      '<div class="floating-ai-header-label">' +
         '<span>💬 AI 도우미</span>' +
-        '<small>표 검토 중에도 바로 요청하세요</small>' +
-      '</span>' +
+        '<span class="floating-ai-msg-badge" id="floatingAiMsgBadge" style="display:none;">0</span>' +
+        '<small>표 검토 중에도 바로 대화하세요</small>' +
+      '</div>' +
+      '<button class="floating-ai-ctrl" id="floatingAiExpandBtn" title="크게 보기">⛶ 크게</button>' +
+      '<button class="floating-ai-ctrl" id="floatingAiCollapseBtn" title="펼치기/접기">▾</button>' +
+    '</div>' +
+    '<div class="floating-ai-messages" id="floatingAiMessages">' +
+      '<div class="floating-ai-empty" id="floatingAiEmpty">아직 대화가 없어요. 아래에서 요청을 입력해보세요.</div>' +
+    '</div>' +
+    '<div class="floating-ai-inner">' +
       '<textarea class="floating-ai-input" id="floatingAiInput" rows="1" ' +
         'placeholder="예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈"></textarea>' +
       '<button class="floating-ai-send" id="floatingAiSend">전송</button>' +
-      '<button class="floating-ai-toggle" id="floatingAiToggle" title="최소화/펼치기">▾</button>' +
     '</div>';
   document.body.appendChild(bar);
 
+  // ─ 확대 모달 DOM ─
+  const modal = document.createElement('div');
+  modal.id = 'floatingAiModal';
+  modal.className = 'floating-ai-modal';
+  modal.innerHTML =
+    '<div class="floating-ai-modal-box">' +
+      '<div class="floating-ai-modal-header">' +
+        '<div class="floating-ai-modal-title">💬 AI 도우미 — 분류표 검토</div>' +
+        '<button class="floating-ai-modal-close" id="floatingAiModalClose">✕ 닫기</button>' +
+      '</div>' +
+      '<div class="floating-ai-modal-messages" id="floatingAiModalMessages"></div>' +
+      '<div class="floating-ai-modal-input-row">' +
+        '<textarea class="floating-ai-input" id="floatingAiModalInput" rows="2" ' +
+          'placeholder="예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈" ' +
+          'style="border-color:var(--border);"></textarea>' +
+        '<button class="floating-ai-send" id="floatingAiModalSend">전송</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+
   const input = document.getElementById('floatingAiInput');
   const sendBtn = document.getElementById('floatingAiSend');
-  const toggleBtn = document.getElementById('floatingAiToggle');
+  const collapseBtn = document.getElementById('floatingAiCollapseBtn');
+  const expandBtn = document.getElementById('floatingAiExpandBtn');
+  const header = document.getElementById('floatingAiHeader');
+  const miniMessages = document.getElementById('floatingAiMessages');
+  const emptyMsg = document.getElementById('floatingAiEmpty');
+  const msgBadge = document.getElementById('floatingAiMsgBadge');
+  const modalMessages = document.getElementById('floatingAiModalMessages');
+  const modalInput = document.getElementById('floatingAiModalInput');
+  const modalSend = document.getElementById('floatingAiModalSend');
+  const modalClose = document.getElementById('floatingAiModalClose');
+
+  // 기본은 접힘 상태 — 사용자가 자주 쓰는 입력만 보임 (메시지는 헤더 클릭하면 펼침)
+  bar.classList.add('collapsed');
+  document.body.classList.add('has-floating-ai-collapsed');
 
   // 메인 입력창과 동기화하여 sendGateChat() 재사용
-  async function submitFloating() {
-    const msg = input.value.trim();
+  async function submitFromInput(srcInput) {
+    const msg = srcInput.value.trim();
     if (!msg) return;
     const mainInput = document.getElementById('gateChatInput');
     if (!mainInput) return;
     mainInput.value = msg;
-    input.value = '';
+    srcInput.value = '';
     sendBtn.disabled = true;
+    modalSend.disabled = true;
+    // 메시지를 보내는 순간 펼침 상태로 자동 전환 → 응답 보일 수 있게
+    if (bar.classList.contains('collapsed')) toggleCollapsed(false);
     try {
       await sendGateChat();
     } finally {
       sendBtn.disabled = false;
+      modalSend.disabled = false;
     }
   }
-  sendBtn.addEventListener('click', submitFloating);
+  sendBtn.addEventListener('click', () => submitFromInput(input));
   input.addEventListener('keydown', function(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      submitFloating();
+      submitFromInput(input);
+    }
+  });
+  modalSend.addEventListener('click', () => submitFromInput(modalInput));
+  modalInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitFromInput(modalInput);
     }
   });
 
-  // 최소화 토글
-  toggleBtn.addEventListener('click', function() {
-    bar.classList.toggle('minimized');
-    toggleBtn.textContent = bar.classList.contains('minimized') ? '▴' : '▾';
+  // ─ collapse / expand 토글 ─
+  function toggleCollapsed(forceCollapsed) {
+    const willCollapse = (typeof forceCollapsed === 'boolean')
+      ? forceCollapsed
+      : !bar.classList.contains('collapsed');
+    bar.classList.toggle('collapsed', willCollapse);
+    document.body.classList.toggle('has-floating-ai-collapsed', willCollapse);
+    collapseBtn.textContent = willCollapse ? '▴' : '▾';
+    collapseBtn.title = willCollapse ? '펼치기' : '접기';
+    if (!willCollapse) {
+      // 펼쳤으니 메시지 영역 스크롤 맨 아래로
+      setTimeout(() => { miniMessages.scrollTop = miniMessages.scrollHeight; }, 60);
+    }
+  }
+  // 헤더 전체 클릭 → 토글 (단, 버튼 클릭 시는 무시)
+  header.addEventListener('click', function(e) {
+    if (e.target.closest('button')) return;
+    toggleCollapsed();
   });
+  collapseBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    toggleCollapsed();
+  });
+
+  // ─ 모달 열기/닫기 ─
+  function openModal() {
+    syncMessages();  // 최신 동기화
+    modal.classList.add('open');
+    setTimeout(() => modalInput.focus(), 60);
+    setTimeout(() => { modalMessages.scrollTop = modalMessages.scrollHeight; }, 60);
+  }
+  function closeModal() { modal.classList.remove('open'); }
+  expandBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    openModal();
+  });
+  modalClose.addEventListener('click', closeModal);
+  modal.addEventListener('click', function(e) {
+    if (e.target === modal) closeModal();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && modal.classList.contains('open')) closeModal();
+  });
+
+  // ─ 메시지 동기화: 메인 #gateChatMessages → mini + modal ─
+  // 메인 채팅 패널의 메시지를 그대로 미러링 (단방향 — 메인이 단일 진실 소스)
+  function syncMessages() {
+    const main = document.getElementById('gateChatMessages');
+    if (!main) return;
+    const mainNodes = Array.from(main.querySelectorAll('.gate-msg'));
+    // 미러 클래스 매핑
+    function buildClone(node, prefix) {
+      const div = document.createElement('div');
+      let role = 'assistant';
+      if (node.classList.contains('user')) role = 'user';
+      else if (node.classList.contains('system')) role = 'system';
+      div.className = prefix + ' ' + prefix + '-' + role;
+      // mini-chat 클래스명 매핑
+      if (prefix === 'floating-ai-msg') {
+        div.className = 'floating-ai-msg ' + role;
+      } else {
+        // 모달은 메인 gate-msg 와 동일 스타일 그대로 활용
+        div.className = 'gate-msg ' + role;
+      }
+      div.textContent = node.textContent;
+      return div;
+    }
+
+    // mini 갱신 (innerHTML 한 번에 교체 — 단순)
+    miniMessages.innerHTML = '';
+    if (mainNodes.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'floating-ai-empty';
+      empty.textContent = '아직 대화가 없어요. 아래에서 요청을 입력해보세요.';
+      miniMessages.appendChild(empty);
+    } else {
+      mainNodes.forEach(n => miniMessages.appendChild(buildClone(n, 'floating-ai-msg')));
+    }
+    // modal 갱신
+    modalMessages.innerHTML = '';
+    mainNodes.forEach(n => modalMessages.appendChild(buildClone(n, 'gate-msg')));
+
+    // 메시지 개수 뱃지
+    if (mainNodes.length > 0) {
+      msgBadge.style.display = '';
+      msgBadge.textContent = String(mainNodes.length);
+    } else {
+      msgBadge.style.display = 'none';
+    }
+    // 자동 스크롤 — 항상 최신 메시지 보이게
+    setTimeout(() => {
+      miniMessages.scrollTop = miniMessages.scrollHeight;
+      modalMessages.scrollTop = modalMessages.scrollHeight;
+    }, 30);
+  }
+
+  // 메인 채팅 패널 변경 감지
+  const mainMessages = document.getElementById('gateChatMessages');
+  if (mainMessages) {
+    new MutationObserver(syncMessages).observe(mainMessages, {
+      childList: true, subtree: true, characterData: true,
+    });
+    // 초기 동기화
+    setTimeout(syncMessages, 200);
+  }
 
   // 가시성 제어: card3 보이고 + stepBar3 active + 메인 채팅 입력창이 viewport 밖일 때만 표시
   function updateVisibility() {
