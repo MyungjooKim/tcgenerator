@@ -1023,7 +1023,8 @@ def _sheet_title_for_major(major_name: str, existing: list) -> str:
 
 def run_build(phase: str, tc_path, output_dir,
               verbose: bool = True,
-              include_change_columns: bool = False) -> dict:
+              include_change_columns: bool = False,
+              sheets: dict | None = None) -> dict:
     """재사용 가능한 Excel 빌드 엔트리 포인트.
 
     Args:
@@ -1034,6 +1035,16 @@ def run_build(phase: str, tc_path, output_dir,
         include_change_columns: True면 상태/수정 사유 컬럼 + 🔄 변경 이력 시트 포함.
             기본 False — 신규 TC 생성에는 이 정보가 없으므로 생략.
             「기존 TC 수정」 플로우(/update-tc)에서만 True로 호출.
+        sheets:     포함할 시트 선택 dict. None 이면 전체(Full Set) 생성.
+            Keys (모두 bool):
+              - "cover":          📋 표지
+              - "stats":          📊 TC 통계
+              - "smoke":          🔥 Smoke Test
+              - "traceability":   🔗 Traceability Matrix
+              - "tc_list":        📌 TC 전체 목록 (필수 — False여도 항상 True 처리)
+              - "change_history": 🔄 변경 이력 (include_change_columns 와 AND 조건)
+            예) Light 모드: {"cover":False, "stats":False, "smoke":False,
+                            "traceability":False, "tc_list":True, "change_history":False}
 
     Returns:
         {
@@ -1047,6 +1058,19 @@ def run_build(phase: str, tc_path, output_dir,
           "changed_tc":  int,
         }
     """
+    # sheets 파라미터 기본값(Full Set) 처리 — TC 목록은 항상 True로 강제
+    DEFAULT_SHEETS = {
+        "cover": True, "stats": True, "smoke": True,
+        "traceability": True, "tc_list": True, "change_history": True,
+    }
+    if sheets is None:
+        sheets = DEFAULT_SHEETS.copy()
+    else:
+        # 누락된 키는 기본값 채움 + tc_list 는 항상 True 보장
+        merged = DEFAULT_SHEETS.copy()
+        merged.update({k: bool(v) for k, v in sheets.items()})
+        merged["tc_list"] = True
+        sheets = merged
     tc_path = Path(tc_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1068,26 +1092,41 @@ def run_build(phase: str, tc_path, output_dir,
     # Smoke 마킹을 먼저 수행 — 모든 시트 빌더가 smoke 속성 참조 가능
     _mark_smoke(tcs)
 
-    # 공통 시트: 표지 / 통계 / Smoke Test / Traceability Matrix
-    ws_cover  = wb.active;                ws_cover.title = "📋 표지"
-    ws_stats  = wb.create_sheet("📊 TC 통계")
-    ws_smoke  = wb.create_sheet("🔥 Smoke Test")
-    ws_trace  = wb.create_sheet("🔗 Traceability")
+    # ── 공통 시트: 사용자 옵션(sheets) 에 따라 선택적 생성 ──
+    # 첫 시트는 wb.active (자동 생성된 'Sheet') — 표지가 꺼져있으면 임시 보관 후 마지막에 제거
+    placeholder_ws = wb.active
+    placeholder_ws.title = "_placeholder"
 
-    build_cover(ws_cover, tcs, config, date_str, version)
-    build_stats(ws_stats, tcs, version)
-    build_smoke(ws_smoke, tcs, config, include_change_columns=include_change_columns)
-    scr_count = build_traceability(ws_trace, tcs)
-    if verbose:
-        if scr_count > 0:
-            print(f"  → Traceability Matrix 생성 — 유니크 화면 코드 {scr_count}개")
-        else:
-            print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
+    # 📋 표지
+    if sheets.get("cover"):
+        ws_cover = wb.create_sheet("📋 표지", 0)  # 항상 첫 번째 위치
+        build_cover(ws_cover, tcs, config, date_str, version)
 
-    # 변경 이력 시트: include_change_columns=True이고 상태가 있는 TC가 하나라도 있으면 추가
-    # 신규 TC 생성 플로우(include_change_columns=False)에서는 아예 생성하지 않음
+    # 📊 TC 통계
+    if sheets.get("stats"):
+        ws_stats = wb.create_sheet("📊 TC 통계")
+        build_stats(ws_stats, tcs, version)
+
+    # 🔥 Smoke Test
+    if sheets.get("smoke"):
+        ws_smoke = wb.create_sheet("🔥 Smoke Test")
+        build_smoke(ws_smoke, tcs, config, include_change_columns=include_change_columns)
+
+    # 🔗 Traceability Matrix
+    scr_count = 0
+    if sheets.get("traceability"):
+        ws_trace = wb.create_sheet("🔗 Traceability")
+        scr_count = build_traceability(ws_trace, tcs)
+        if verbose:
+            if scr_count > 0:
+                print(f"  → Traceability Matrix 생성 — 유니크 화면 코드 {scr_count}개")
+            else:
+                print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
+
+    # 🔄 변경 이력 시트: 사용자가 켰고 + include_change_columns=True 이고 + 변경된 TC 가 있어야 생성
     changed_tc = 0
-    if include_change_columns and any((t.get("status") or "").strip() for t in tcs):
+    if (sheets.get("change_history") and include_change_columns
+            and any((t.get("status") or "").strip() for t in tcs)):
         ws_changes = wb.create_sheet("🔄 변경 이력")
         changed_tc = build_change_history(ws_changes, tcs)
         if verbose:
@@ -1112,6 +1151,15 @@ def run_build(phase: str, tc_path, output_dir,
 
     if verbose:
         print(f"  → 대분류별 시트 {len(major_order)}개 생성")
+
+    # 임시 placeholder 시트 제거 (표지가 꺼졌을 때 첫 시트가 비어있는 상태 방지)
+    if "_placeholder" in wb.sheetnames:
+        # 다른 시트가 1개 이상 있을 때만 제거 (워크북에는 최소 1개 시트 필요)
+        if len(wb.sheetnames) > 1:
+            del wb["_placeholder"]
+        else:
+            # 모든 시트가 꺼진 극한 케이스 — placeholder 를 TC 목록 폴백으로 변환
+            wb["_placeholder"].title = "📌 TC 목록 (폴백)"
 
     wb.save(out_path)
 

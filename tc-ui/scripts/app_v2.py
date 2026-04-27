@@ -53,15 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8g"
+APP_VERSION         = "v0.9.9"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "파이프라인 중단 후 갈 곳 명확화"
+APP_VERSION_TAGLINE = "Excel 출력 옵션 (Full / Light / Custom)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 파이프라인 중단 후 사용자가 갈 곳을 잃던 문제 fix — 중단 시 card1(입력) 자동 노출",
-    "🆕 중단 배너에 '🏠 처음부터 시작' / '🔄 이어서 재시작' 두 개 버튼 직접 제공",
-    "💡 이전엔 '위 버튼을 눌러주세요' 안내했지만 실제 버튼이 있는 card1 이 숨겨져 있어 막다른 길",
-    "🔁 v0.9.8f card1 누수 fix / v0.9.8e Sticky AI 가드 모두 포함",
+    "🆕 Human Gate에서 Excel 출력 옵션 선택 — 📦 Full Set / 🪶 Light / 🛠 Custom 3가지 프리셋",
+    "🪶 Light 모드 — TC 전체 목록만 (표지·통계·Smoke·Traceability 제외) 빠른 중간 산출물",
+    "🛠 Custom 모드 — 6개 시트 개별 체크박스로 정밀 제어 (TC 목록은 필수 고정)",
+    "💾 마지막 선택 localStorage에 자동 저장 → 다음 진입 시 복원",
+    "🔁 v0.9.8g 파이프라인 중단 fix / v0.9.8f card1 누수 fix 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -2592,8 +2593,11 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
             # 상태/수정 사유 컬럼 + 🔄 변경 이력 시트는 「기존 TC 수정」 플로우(update-tc)에서만 포함.
             # 신규 TC 생성 시에는 깨끗한 Excel을 위해 생략.
             include_change = bool(sess.get("_include_change_columns"))
+            # 사용자가 Human Gate에서 선택한 Excel 시트 옵션 (없으면 None=Full Set)
+            excel_sheets = sess.get("_excel_sheets")
             result = _be.run_build("P_WebApp", str(tc_final_path), str(out_dir),
-                                   verbose=False, include_change_columns=include_change)
+                                   verbose=False, include_change_columns=include_change,
+                                   sheets=excel_sheets)
             if result and result.get("ok"):
                 push_log(sess, f"[빌드] 모듈 호출 성공 — 총 {result['total_tc']} TC / Smoke {result['smoke_tc']} / 대분류 {result['major_count']}시트")
                 sess["smoke_tc"] = result["smoke_tc"]
@@ -4800,6 +4804,14 @@ def approve(sid):
     # True/False면 사용자 명시적 선택 우선.
     auto_flag = data.get("auto_screen_code")
     sess["auto_screen_code"] = auto_flag  # None / True / False
+    # ── Excel 시트 옵션 (Full/Light/Custom 프리셋 → 시트별 dict) ──
+    # 프론트가 보내는 형식:
+    #   {"cover": bool, "stats": bool, "smoke": bool,
+    #    "traceability": bool, "tc_list": bool, "change_history": bool}
+    # 누락/None 이면 step_build_excel 에서 Full Set 으로 폴백
+    excel_sheets = data.get("excel_sheets")
+    if isinstance(excel_sheets, dict):
+        sess["_excel_sheets"] = {k: bool(v) for k, v in excel_sheets.items()}
     sess["approved"] = content
     sess["gate_event"].set()
     return jsonify({"ok": True})
@@ -6336,6 +6348,64 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- SuiteCode 입력 테이블 (Viewer 밖 — 독립 영역) -->
     <div id="suiteCodeSection" style="display:none; margin-top:14px; margin-bottom:14px;"></div>
+
+    <!-- Excel 출력 옵션 (Full/Light/Custom) — 승인 시 step_build_excel로 전달됨 -->
+    <div id="excelOptionPanel" style="margin-top:18px;background:#F0F9FF;border:1.5px solid #93C5FD;border-radius:10px;padding:14px 16px;">
+      <div style="font-size:14px;font-weight:700;color:#1E3A5F;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+        <span>⚙</span><span>Excel 출력 옵션</span>
+        <span style="font-size:11px;color:#6B7280;font-weight:400;">— 승인 시 적용됩니다</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <label class="excel-preset-row" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 10px;border-radius:8px;background:#FFFFFF;border:1.5px solid #DBEAFE;">
+          <input type="radio" name="excelPreset" value="full" checked onchange="onExcelPresetChange()" style="margin-top:3px;">
+          <div style="flex:1;">
+            <div style="font-size:13px;font-weight:700;color:#1E3A5F;">📦 Full Set <span style="font-size:11px;color:#6B7280;font-weight:400;">(정식 산출물)</span></div>
+            <div style="font-size:11.5px;color:#4B5563;margin-top:2px;">표지 · 통계 · Smoke · Traceability · 변경 이력 · TC 전체 — 정식 배포·공유용</div>
+          </div>
+        </label>
+        <label class="excel-preset-row" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 10px;border-radius:8px;background:#FFFFFF;border:1.5px solid #DBEAFE;">
+          <input type="radio" name="excelPreset" value="light" onchange="onExcelPresetChange()" style="margin-top:3px;">
+          <div style="flex:1;">
+            <div style="font-size:13px;font-weight:700;color:#1E3A5F;">🪶 Light <span style="font-size:11px;color:#6B7280;font-weight:400;">(중간 산출물 · 반복 작업용)</span></div>
+            <div style="font-size:11.5px;color:#4B5563;margin-top:2px;">TC 전체 목록만 — 표지·통계 등 제외 (빠른 확인용)</div>
+          </div>
+        </label>
+        <label class="excel-preset-row" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 10px;border-radius:8px;background:#FFFFFF;border:1.5px solid #DBEAFE;">
+          <input type="radio" name="excelPreset" value="custom" onchange="onExcelPresetChange()" style="margin-top:3px;">
+          <div style="flex:1;">
+            <div style="font-size:13px;font-weight:700;color:#1E3A5F;">🛠 Custom <span style="font-size:11px;color:#6B7280;font-weight:400;">(시트별 직접 선택)</span></div>
+            <div style="font-size:11.5px;color:#4B5563;margin-top:2px;">아래에서 포함할 시트를 직접 체크하세요</div>
+          </div>
+        </label>
+      </div>
+      <!-- Custom 모드 — 시트별 체크박스 (기본 숨김) -->
+      <div id="excelCustomPanel" style="display:none;margin-top:10px;padding:12px;background:#FFFFFF;border:1px solid #DBEAFE;border-radius:8px;">
+        <div style="font-size:11.5px;color:#1E3A5F;font-weight:600;margin-bottom:8px;">포함할 시트 선택</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 14px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#374151;cursor:pointer;">
+            <input type="checkbox" class="excel-sheet-cb" data-sheet="cover" onchange="onExcelSheetCheckChange()" checked> 📋 표지
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#374151;cursor:pointer;">
+            <input type="checkbox" class="excel-sheet-cb" data-sheet="stats" onchange="onExcelSheetCheckChange()" checked> 📊 TC 통계
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#374151;cursor:pointer;">
+            <input type="checkbox" class="excel-sheet-cb" data-sheet="smoke" onchange="onExcelSheetCheckChange()" checked> 🔥 Smoke Test
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#374151;cursor:pointer;">
+            <input type="checkbox" class="excel-sheet-cb" data-sheet="traceability" onchange="onExcelSheetCheckChange()" checked> 🔗 Traceability
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#9CA3AF;cursor:not-allowed;" title="필수 시트 — 항상 포함">
+            <input type="checkbox" class="excel-sheet-cb" data-sheet="tc_list" checked disabled> 📌 TC 전체 목록 <span style="font-size:10px;">(필수)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#374151;cursor:pointer;" id="excelChangeHistoryLabel">
+            <input type="checkbox" class="excel-sheet-cb" data-sheet="change_history" onchange="onExcelSheetCheckChange()" checked> 🔄 변경 이력 <span style="font-size:10px;color:#6B7280;">(수정 모드 전용)</span>
+          </label>
+        </div>
+        <div id="excelSheetSummary" style="margin-top:10px;font-size:11.5px;color:#1E3A5F;background:#EFF6FF;padding:6px 10px;border-radius:6px;">
+          💡 요약: <strong>전체 시트 (6개)</strong>
+        </div>
+      </div>
+    </div>
 
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:18px;">
       <button class="btn btn-success" onclick="approveGate()">
@@ -8124,6 +8194,22 @@ function handleEvent(evt) {
     document.getElementById('card2').classList.add('hidden');
     document.getElementById('card3').classList.remove('hidden');
     setStepBar(3);
+    // Excel 옵션 — '🔄 변경 이력' 체크박스: 신규 모드면 disabled, 수정 모드면 enabled
+    var changeCb = document.querySelector('.excel-sheet-cb[data-sheet="change_history"]');
+    var changeLabel = document.getElementById('excelChangeHistoryLabel');
+    if (changeCb && changeLabel) {
+      if (isModify) {
+        changeCb.disabled = false;
+        changeLabel.style.color = '#374151';
+        changeLabel.style.cursor = 'pointer';
+      } else {
+        changeCb.disabled = true;
+        changeCb.checked = false;
+        changeLabel.style.color = '#9CA3AF';
+        changeLabel.style.cursor = 'not-allowed';
+      }
+      try { updateExcelSheetSummary(); } catch(_) {}
+    }
 
     // TC ID 모드 기본값 결정: 프로젝트가 SM/SA면 System Generated ON, 아니면 OFF
     // (screen_code_map 서버 응답으로 screen_based_default 확인)
@@ -8967,6 +9053,114 @@ async function regenerateClassification() {
   }
 }
 
+// ── Excel 출력 옵션 (Full / Light / Custom) ──
+const EXCEL_PRESETS = {
+  full:   { cover:true,  stats:true,  smoke:true,  traceability:true,  tc_list:true, change_history:true },
+  light:  { cover:false, stats:false, smoke:false, traceability:false, tc_list:true, change_history:false },
+  // custom 은 마지막 사용자 체크 상태 그대로 — localStorage 에서 복원
+};
+
+function onExcelPresetChange() {
+  const preset = document.querySelector('input[name="excelPreset"]:checked')?.value || 'full';
+  const customPanel = document.getElementById('excelCustomPanel');
+  if (preset === 'custom') {
+    customPanel.style.display = '';
+    // Custom 진입 시 마지막 저장된 체크 상태 복원
+    try {
+      const saved = JSON.parse(localStorage.getItem('tc_excel_custom_sheets') || 'null');
+      if (saved) applySheetChecks(saved);
+    } catch (_) {}
+  } else {
+    customPanel.style.display = 'none';
+    // 프리셋 → 체크박스 동기화 (시각화)
+    applySheetChecks(EXCEL_PRESETS[preset]);
+  }
+  updateExcelSheetSummary();
+  // 사용자 선택 저장
+  try { localStorage.setItem('tc_excel_preset', preset); } catch (_) {}
+}
+
+function onExcelSheetCheckChange() {
+  // 체크박스 직접 변경 시 — 자동으로 Custom 모드로 전환
+  const customRadio = document.querySelector('input[name="excelPreset"][value="custom"]');
+  if (customRadio && !customRadio.checked) {
+    customRadio.checked = true;
+    document.getElementById('excelCustomPanel').style.display = '';
+  }
+  updateExcelSheetSummary();
+  // Custom 체크 상태 저장
+  try {
+    localStorage.setItem('tc_excel_custom_sheets', JSON.stringify(collectExcelSheets()));
+    localStorage.setItem('tc_excel_preset', 'custom');
+  } catch (_) {}
+}
+
+function applySheetChecks(sheets) {
+  document.querySelectorAll('.excel-sheet-cb').forEach(function(cb) {
+    const key = cb.dataset.sheet;
+    if (key === 'tc_list') return;  // 필수 — 건드리지 않음
+    if (cb.disabled) return;
+    if (key in sheets) cb.checked = !!sheets[key];
+  });
+}
+
+function collectExcelSheets() {
+  const sheets = {};
+  document.querySelectorAll('.excel-sheet-cb').forEach(function(cb) {
+    sheets[cb.dataset.sheet] = !!cb.checked;
+  });
+  sheets.tc_list = true;  // 강제
+  return sheets;
+}
+
+function updateExcelSheetSummary() {
+  const sheets = collectExcelSheets();
+  const labels = {
+    cover:'표지', stats:'통계', smoke:'Smoke',
+    traceability:'Traceability', tc_list:'TC 목록', change_history:'변경 이력',
+  };
+  const enabled = Object.keys(sheets).filter(k => sheets[k]);
+  const el = document.getElementById('excelSheetSummary');
+  if (!el) return;
+  if (enabled.length === Object.keys(labels).length) {
+    el.innerHTML = '💡 요약: <strong>전체 시트 (' + enabled.length + '개)</strong>';
+  } else {
+    el.innerHTML = '💡 요약: <strong>' + enabled.map(k => labels[k]).join(' + ') + ' = ' + enabled.length + '개 시트</strong>';
+  }
+}
+
+function getSelectedExcelSheets() {
+  // approveGate 가 호출 — 현재 선택된 sheets dict 반환
+  const preset = document.querySelector('input[name="excelPreset"]:checked')?.value || 'full';
+  if (preset === 'full' || preset === 'light') {
+    return { ...EXCEL_PRESETS[preset] };
+  }
+  return collectExcelSheets();
+}
+
+// 페이지 로드 시 — localStorage 에서 마지막 선택 복원
+function restoreExcelOption() {
+  try {
+    const lastPreset = localStorage.getItem('tc_excel_preset') || 'full';
+    const r = document.querySelector('input[name="excelPreset"][value="' + lastPreset + '"]');
+    if (r) { r.checked = true; }
+    if (lastPreset === 'custom') {
+      const saved = JSON.parse(localStorage.getItem('tc_excel_custom_sheets') || 'null');
+      if (saved) applySheetChecks(saved);
+      document.getElementById('excelCustomPanel').style.display = '';
+    } else {
+      applySheetChecks(EXCEL_PRESETS[lastPreset] || EXCEL_PRESETS.full);
+    }
+    updateExcelSheetSummary();
+  } catch (_) {}
+}
+// DOM ready 후 1회 복원
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', function() {
+    try { restoreExcelOption(); } catch(e) {}
+  });
+}
+
 async function approveGate() {
   if (!currentSid) return;
   const content = document.getElementById('gateContent').value.trim();
@@ -9023,7 +9217,8 @@ async function approveGate() {
         content,
         selected_domains: selectedDomains,
         suite_codes: suiteCodeList,
-        auto_screen_code: autoScreenCode
+        auto_screen_code: autoScreenCode,
+        excel_sheets: getSelectedExcelSheets()
       })
     });
     const data = await resp.json();

@@ -9,6 +9,61 @@
 
 ---
 
+## v0.9.9 — 2026-04-27 (Excel 출력 옵션 — Full / Light / Custom)
+
+> **요약**: Human Gate 승인 시 Excel 출력 시트를 사용자가 선택할 수 있게 — 중간 산출물(빠른 확인용) vs 정식 산출물(배포용) 시나리오 분리.
+
+### ✨ 신규 기능
+
+**🆕 Human Gate에 Excel 출력 옵션 패널 추가** — 승인 버튼 위에 표시:
+
+```
+⚙ Excel 출력 옵션
+  ◉ 📦 Full Set    — 표지·통계·Smoke·Traceability·변경이력·TC 전체 (정식)
+  ○ 🪶 Light       — TC 전체 목록만 (반복 작업용)
+  ○ 🛠 Custom      — 시트별 직접 선택
+```
+
+**Custom 모드** 선택 시 6개 시트 체크박스 펼침:
+- ☑ 📋 표지
+- ☑ 📊 TC 통계
+- ☑ 🔥 Smoke Test
+- ☑ 🔗 Traceability Matrix
+- ☑ 📌 TC 전체 목록 *(필수 — 항상 포함)*
+- ☑ 🔄 변경 이력 *(수정 모드 전용 — 신규 모드에서는 자동 비활성화)*
+
+실시간 요약 표시: `💡 요약: 표지 + Traceability + TC 목록 = 3개 시트`
+
+### 🛠 동작 디테일
+
+- **프리셋 ↔ Custom 전환**: 프리셋 클릭 시 체크박스 자동 동기화 (시각화)
+- **체크박스 직접 변경 시**: 자동으로 Custom 모드로 전환
+- **TC 전체 목록 보호**: 항상 ☑ 고정, disabled 처리 (회색)
+- **컨텍스트 인식**: 신규 모드면 `🔄 변경 이력` 비활성화, 수정 모드면 활성화
+- **localStorage 영속**:
+  - 키 `tc_excel_preset` → 마지막 선택 프리셋 (full/light/custom)
+  - 키 `tc_excel_custom_sheets` → Custom 체크 상태 JSON
+  - 다음 Gate 진입 시 자동 복원
+
+### 🔧 백엔드
+
+- **`build_excel.py` `run_build()`**: `sheets: dict | None` 파라미터 신설
+  - `None` 이면 Full Set (하위호환)
+  - `tc_list` 키는 항상 True 강제 (안전)
+  - 표지가 꺼져있을 때 첫 시트 자리 처리 위해 `_placeholder` 임시 시트 사용 후 제거
+- **`/approve/<sid>`**: `excel_sheets` 페이로드 받아 `sess["_excel_sheets"]` 에 저장
+- **`step_build_excel`**: `sess["_excel_sheets"]` 를 `run_build(sheets=...)` 로 전달
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-agent/scripts/build_excel.py` | `run_build()` 에 `sheets` 파라미터 추가 + 6개 시트 조건부 생성 + placeholder 처리 |
+| `tc-ui/scripts/app_v2.py` | Excel 옵션 UI (HTML+CSS), JS 5개 함수(`onExcelPresetChange`, `onExcelSheetCheckChange`, `applySheetChecks`, `collectExcelSheets`, `updateExcelSheetSummary`, `getSelectedExcelSheets`, `restoreExcelOption`), `/approve` 에서 페이로드 수신, `step_build_excel` wiring, gate 이벤트에서 신규/수정 모드별 변경이력 체크박스 토글 |
+| `CHANGELOG.md` | v0.9.9 섹션 추가 |
+
+---
+
 ## v0.9.8g — 2026-04-27 (파이프라인 중단 후 갈 곳 명확화)
 
 > **요약**: v0.9.8f 의 부작용 — 파이프라인 중단 후 card1 이 숨겨진 채로 남아 사용자가 다음 작업을 시작할 수 없던 문제 fix.
