@@ -164,35 +164,44 @@ def parse_tc_markdown(filepath):
         if re.match(r'###\s*(대분류|중분류|소분류|Category|Middle|Minor)\s*[:：]', first_line, re.IGNORECASE):
             continue
 
+        # TC ID 패턴 필수 검증 — AI가 ### 헤더로 설명문을 작성한 경우 차단
+        # 유효 TC ID 예:  SC-AUTH-001, SM-SPL-001, SA-TRD-ORDR-012
+        # 차단 예:        ### 화면 분석, ### 원칙 C 적용 결과, ### ⚠️ TC 생성 대상 제외
+        # 패턴: `[A-Z]{2,}-[A-Z0-9]+-\d+` 이 헤더 라인에 등장해야 함 (bold 또는 plain)
+        if not re.search(r'\b[A-Z]{2,}-[A-Z0-9]+-\d+\b', first_line):
+            continue
+
         tc = {}
 
-        # 최소 TC: ### **SC-XXX-YYY-001** — 제목
-        bold_header = re.match(r'###\s+\*\*(.+?)\*\*\s*—\s*(.+?)\s*$', first_line)
-        # 일반 TC:  ### SC-XXX-YYY-001 — 제목
-        norm_header = re.match(r'###\s+(.+?)\s+—\s+(.+?)\s*$', first_line)
+        # 헤더 패턴 — 다음 5가지 모두 지원:
+        #   1) ### **ID** — 제목      (Smoke 표준)
+        #   2) ### **ID — 제목**      (전체 bold — AI가 종종 만드는 변형)
+        #   3) ### ID — 제목          (일반)
+        #   4) ### **ID**             (제목 없음, bold)
+        #   5) ### ID                 (제목 없음, plain)
+        # 모두 처리하기 어려운 경우: ** 마크업을 라인 전체에서 우선 제거하고 통일된 패턴으로 매칭
+        cleaned_line = re.sub(r'\*\*', '', first_line).strip()
+        # cleaned_line 기준 매칭 (## prefix는 그대로 유지되어야 헤더로 인식)
+        # 예: "### SM-VCD-003 — 숫자 키패드 입력"
+        m_full = re.match(r'###\s+(.+?)\s+—\s+(.+?)\s*$', cleaned_line)
+        m_no_title = re.match(r'###\s+(.+?)\s*$', cleaned_line)
+        # 원본에서 bold가 있었는지 체크 (Smoke star 마킹용)
+        had_bold = '**' in first_line
 
-        if bold_header:
-            tc["star"]  = True
-            tc["id"]    = bold_header.group(1).strip()
-            tc["title"] = bold_header.group(2).strip()
-        elif norm_header:
-            tc["star"]  = False
-            tc["id"]    = norm_header.group(1).strip()
-            tc["title"] = norm_header.group(2).strip()
+        if m_full:
+            tc["star"]  = had_bold
+            tc["id"]    = m_full.group(1).strip()
+            tc["title"] = m_full.group(2).strip()
+        elif m_no_title:
+            tc["star"]  = had_bold
+            tc["id"]    = m_no_title.group(1).strip()
+            tc["title"] = tc["id"]
         else:
-            # — 구분자 없는 경우 폴백
-            plain = re.match(r'###\s+\*\*(.+?)\*\*\s*$', first_line)
-            if plain:
-                tc["star"]  = True
-                tc["id"]    = plain.group(1).strip()
-                tc["title"] = tc["id"]
-            else:
-                plain2 = re.match(r'###\s+(.+?)\s*$', first_line)
-                if not plain2:
-                    continue
-                tc["star"]  = False
-                tc["id"]    = plain2.group(1).strip()
-                tc["title"] = tc["id"]
+            continue
+
+        # 안전장치 — 혹시 잔여 마크업이 남았으면 제거
+        tc["id"] = re.sub(r'[`\*]', '', tc["id"]).strip()
+        tc["title"] = re.sub(r'^\*+|\*+$', '', tc["title"]).strip()
 
         tc["is_new"]  = "[신규]" in tc["title"]
         tc["title"]   = tc["title"].replace("[신규]", "").strip()
@@ -380,23 +389,49 @@ def build_cover(ws, tcs, config, date_str, version):
         set_cell(ws, i, 3, v, bold=False, bg=bg)
         ws.row_dimensions[i].height = 18
 
-    # 도메인별 TC 수
+    # 화면별 TC 수 — ScreenCode · 중분류 이름 형태로 표시 (옵션 B+C)
     row = 12 + len(stats) + 1
     ws.row_dimensions[row].height = 10
     row += 1
-    set_cell(ws, row, 2, "도메인별 구성", bold=True, bg=C_DARK, font_color=C_WHITE, size=11)
+    set_cell(ws, row, 2, "화면별 TC 수", bold=True, bg=C_DARK, font_color=C_WHITE, size=11)
     ws.merge_cells(f"B{row}:C{row}")
     ws.row_dimensions[row].height = 22
     row += 1
 
-    domain_counts = defaultdict(int)
+    # 도메인(ScreenCode)별 TC 수 + 대표 중분류 이름 수집
+    #   - 여러 중분류가 같은 ScreenCode를 공유하면 첫 등장 이름 사용 (보통 유일함)
+    domain_counts: dict[str, int] = defaultdict(int)
+    domain_labels_dyn: dict[str, str] = {}
     for tc in tcs:
-        domain_counts[tc["domain"]] += 1
+        d = (tc.get("domain") or "").strip()
+        if not d:
+            continue
+        # '**' 같은 마크업 잔여물 제거 (버그 방어)
+        d_clean = d.replace("*", "").strip()
+        if not d_clean:
+            continue
+        domain_counts[d_clean] += 1
+        if d_clean not in domain_labels_dyn:
+            # 중분류 이름 우선 → DOMAIN_LABELS 사전 → 없으면 도메인 코드
+            mid = (tc.get("middle") or "").strip()
+            mid = re.sub(r"^중분류[:\s]*", "", mid).strip()
+            mid = re.sub(r"\s*[\(\（][A-Z0-9\-]+[\)\）]", "", mid).strip()
+            if mid:
+                domain_labels_dyn[d_clean] = mid
+            elif d_clean in DOMAIN_LABELS:
+                domain_labels_dyn[d_clean] = DOMAIN_LABELS[d_clean]
+            else:
+                domain_labels_dyn[d_clean] = d_clean  # fallback
 
     for i, (domain, cnt) in enumerate(sorted(domain_counts.items())):
         color = DOMAIN_COLORS.get(domain, "636363")
-        label = DOMAIN_LABELS.get(domain, domain)
-        set_cell(ws, row, 2, f"{domain}  ·  {label}", bold=True,
+        label = domain_labels_dyn.get(domain, domain)
+        # 코드와 label이 같으면 단독 표시 (중복 방지)
+        if label == domain:
+            text = domain
+        else:
+            text = f"{domain}  ·  {label}"
+        set_cell(ws, row, 2, text, bold=True,
                  bg=color, font_color=C_WHITE)
         set_cell(ws, row, 3, f"{cnt}개", bold=False,
                  bg=C_BLUE2 if i % 2 == 0 else C_WHITE, align_h="center")
@@ -425,32 +460,37 @@ def build_cover(ws, tcs, config, date_str, version):
 
 # ── TC 전체목록 시트 ───────────────────────────────────────────────
 
-def _tc_list_columns(config):
-    """Phase에 따른 컬럼 정의 반환"""
+def _tc_list_columns(config, include_change_columns: bool = True):
+    """Phase에 따른 컬럼 정의 반환.
+    include_change_columns=False면 상태/수정 사유 컬럼 제외 (신규 TC 생성 시).
+
+    컬럼 순서 (v0.9.7b):
+      TC ID | 대분류 | 중분류 | 소분류 | 사전조건 | 테스트 스텝 | 기대결과 |
+      중요도 | 대상 거래소 | Smoke | 화면 코드
+      (변경 이력 모드: +상태, +수정 사유)
+    """
     exchanges = config["exchanges"]
 
-    # 분류표 사용 여부 감지: 첫 TC에 middle(중분류) 값이 있으면 신규 형식
-    has_classification = any(tc.get("middle") for tc in [])  # 동적으로 판단
-    # → build_tc_list 호출 시 tcs를 전달받아 판단
-
-    fixed = [
-        ("Smoke",          8),
-        ("상태",               11),
+    # 변경 이력 모드: TC ID 앞에 '상태' 추가, 끝에 '수정 사유' 추가
+    base = []
+    if include_change_columns:
+        base.append(("상태", 11))
+    base += [
         ("TC ID",              14),
-        ("화면 코드",           12),
-        ("우선순위",             9),
-        ("거래소",              10),
         ("대분류",              13),
         ("중분류",              13),
         ("소분류",              16),
-        ("사전 조건",           28),
-        ("스텝",               40),
-        ("기대 결과",           38),
-        ("수정 사유",           28),
+        ("사전조건",            28),
+        ("테스트 스텝",         40),
+        ("기대결과",            38),
+        ("중요도",              9),
+        ("대상 거래소",         12),
+        ("Smoke",               8),
+        ("화면 코드",           12),
     ]
-
-    all_cols = fixed
-    return all_cols
+    if include_change_columns:
+        base.append(("수정 사유", 28))
+    return base
 
 
 def _priority_to_kr(priority):
@@ -551,14 +591,15 @@ def _mark_smoke(tcs):
             domain_has[d] = True
 
 
-def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
+def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
+                  include_change_columns: bool = True):
     """TC 목록 시트 생성.
     group_by:
       - "domain": TC 코드(도메인) 변경 시 섹션 헤더 (기존 동작)
       - "middle": 중분류 변경 시 섹션 헤더 (대분류별 시트 내부 분할용)
     """
     _mark_smoke(tcs)
-    cols = _tc_list_columns(config)
+    cols = _tc_list_columns(config, include_change_columns=include_change_columns)
     col_names = [c[0] for c in cols]
 
     # Row 1: 헤더 (너비는 데이터 수집 후 설정)
@@ -653,18 +694,18 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
                 break
 
         col_data = {
-            "Smoke":    "Y" if tc.get("smoke") else "",
-            "상태":           tc.get("status", ""),  # 🆕/🔄/🗑️/빈값
+            "상태":           tc.get("status", ""),  # 🆕/🔄/🗑️/빈값 (변경 이력 모드에서만)
             "TC ID":         tc["id"],
-            "우선순위":       _priority_to_kr(tc["priority"]),
-            "거래소":         exchange_text,
             "대분류":         major_display,
             "중분류":         middle_display,
-            "화면 코드":      tc.get("screen_code", ""),
             "소분류":         minor_display,
-            "사전 조건":      tc["given"],
-            "스텝":          tc["when"],
-            "기대 결과":      tc["then"],
+            "사전조건":       tc["given"],
+            "테스트 스텝":    tc["when"],
+            "기대결과":       tc["then"],
+            "중요도":         _priority_to_kr(tc["priority"]),
+            "대상 거래소":    exchange_text,
+            "Smoke":         "Y" if tc.get("smoke") else "",
+            "화면 코드":      tc.get("screen_code", ""),
             "수정 사유":      tc.get("change_reason", ""),
         }
 
@@ -678,13 +719,13 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
             elif col_name == "TC ID":
                 cbg  = bg_base
                 bold = tc["star"]
-            elif col_name == "우선순위":
+            elif col_name == "중요도":
                 cbg  = PRIORITY_COLOR.get(tc["priority"], bg_base)
                 bold = True
             else:
                 cbg  = bg_base
                 bold = tc["star"]
-            align = "center" if col_name in ("Smoke", "상태", "우선순위", "거래소", "화면 코드") else "left"
+            align = "center" if col_name in ("Smoke", "상태", "중요도", "대상 거래소", "화면 코드") else "left"
             set_cell(ws, r, i, col_data.get(col_name, ""), bold=bold, bg=cbg, align_h=align)
 
         ws.row_dimensions[r].height = 80
@@ -692,7 +733,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain"):
         row_idx += 1
 
     # 컬럼 너비 자동 조정 (75퍼센타일 기준)
-    min_widths = {"Smoke": 8, "상태": 11, "TC ID": 18, "우선순위": 9, "거래소": 10, "화면 코드": 12, "수정 사유": 24}
+    min_widths = {"Smoke": 8, "상태": 11, "TC ID": 18, "중요도": 9, "대상 거래소": 12, "화면 코드": 12, "수정 사유": 24}
     widths = _calc_col_widths(col_names, all_row_data, min_widths=min_widths, max_width=55)
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -741,14 +782,30 @@ def build_stats(ws, tcs, version):
     stat_row(5,  "전체 TC 수",    total,  total, alt=True)
     stat_row(6,  "🔥 Smoke Test", smoke,  total, alt=False)
 
-    # ─ 도메인별
+    # ─ 화면별 TC 수 (ScreenCode · 중분류 이름)
     ws.row_dimensions[7].height = 8
-    sec_header(8, "─ 도메인별 ─")
+    sec_header(8, "─ 화면별 TC 수 ─")
     domain_counts = defaultdict(int)
+    domain_labels_dyn: dict[str, str] = {}
     for tc in tcs:
-        domain_counts[tc["domain"]] += 1
+        d = (tc.get("domain") or "").strip().replace("*", "")  # '**' 마크업 잔여 방어
+        if not d:
+            continue
+        domain_counts[d] += 1
+        if d not in domain_labels_dyn:
+            mid = (tc.get("middle") or "").strip()
+            mid = re.sub(r"^중분류[:\s]*", "", mid).strip()
+            mid = re.sub(r"\s*[\(\（][A-Z0-9\-]+[\)\）]", "", mid).strip()
+            if mid:
+                domain_labels_dyn[d] = mid
+            elif d in DOMAIN_LABELS:
+                domain_labels_dyn[d] = DOMAIN_LABELS[d]
+            else:
+                domain_labels_dyn[d] = d  # fallback — 아래에서 단독 표시
     for i, (domain, cnt) in enumerate(sorted(domain_counts.items())):
-        label = f"{domain}  ·  {DOMAIN_LABELS.get(domain, domain)}"
+        label_val = domain_labels_dyn.get(domain, domain)
+        # 코드와 label이 같으면 단독, 다르면 "코드 · 이름"
+        label = domain if label_val == domain else f"{domain}  ·  {label_val}"
         stat_row(9 + i, label, cnt, total, alt=(i % 2 == 0))
 
     # ─ 우선순위별
@@ -781,21 +838,8 @@ def build_stats(ws, tcs, version):
         ws.row_dimensions[row].height = 18
         row += 1
 
-    # ─ 중분류별 (분류표 있는 경우)
-    middle_counts = defaultdict(int)
-    for tc in tcs:
-        m = tc.get("middle", "")
-        if m:
-            middle_counts[m] += 1
-
-    if middle_counts:
-        ws.row_dimensions[row].height = 8
-        row += 1
-        sec_header(row, "─ 중분류별 ─")
-        row += 1
-        for i, (mid, cnt) in enumerate(sorted(middle_counts.items())):
-            stat_row(row, mid, cnt, total, alt=(i % 2 == 0))
-            row += 1
+    # NOTE: 이전에 있던 '─ 중분류별 ─' 섹션은 '─ 화면별 TC 수 ─' 와 중복되어 제거됨.
+    # (화면별 섹션이 이미 ScreenCode · 중분류 이름을 함께 표시)
 
     # ─ [미결] / [신규]
     ws.row_dimensions[row].height = 8
@@ -816,9 +860,9 @@ def build_stats(ws, tcs, version):
 
 # ── Smoke Test 시트 ─────────────────────────────────────────────────
 
-def build_smoke(ws, tcs, config):
+def build_smoke(ws, tcs, config, include_change_columns: bool = True):
     smoke_tcs = [t for t in tcs if t.get("smoke")]
-    build_tc_list(ws, smoke_tcs, config)
+    build_tc_list(ws, smoke_tcs, config, include_change_columns=include_change_columns)
 
 
 # ── Traceability Matrix 시트 ────────────────────────────────────────
@@ -978,7 +1022,8 @@ def _sheet_title_for_major(major_name: str, existing: list) -> str:
 # ── 메인 ───────────────────────────────────────────────────────────
 
 def run_build(phase: str, tc_path, output_dir,
-              verbose: bool = True) -> dict:
+              verbose: bool = True,
+              include_change_columns: bool = False) -> dict:
     """재사용 가능한 Excel 빌드 엔트리 포인트.
 
     Args:
@@ -986,6 +1031,9 @@ def run_build(phase: str, tc_path, output_dir,
         tc_path:    tc_final.md 파일 경로 (str | Path)
         output_dir: 출력 디렉토리 (str | Path). 없으면 생성.
         verbose:    True면 진행 메시지 print (subprocess 호출 시 유용)
+        include_change_columns: True면 상태/수정 사유 컬럼 + 🔄 변경 이력 시트 포함.
+            기본 False — 신규 TC 생성에는 이 정보가 없으므로 생략.
+            「기존 TC 수정」 플로우(/update-tc)에서만 True로 호출.
 
     Returns:
         {
@@ -1028,7 +1076,7 @@ def run_build(phase: str, tc_path, output_dir,
 
     build_cover(ws_cover, tcs, config, date_str, version)
     build_stats(ws_stats, tcs, version)
-    build_smoke(ws_smoke, tcs, config)
+    build_smoke(ws_smoke, tcs, config, include_change_columns=include_change_columns)
     scr_count = build_traceability(ws_trace, tcs)
     if verbose:
         if scr_count > 0:
@@ -1036,9 +1084,10 @@ def run_build(phase: str, tc_path, output_dir,
         else:
             print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
 
-    # 변경 이력 시트: 상태가 있는 TC가 하나라도 있으면 추가
+    # 변경 이력 시트: include_change_columns=True이고 상태가 있는 TC가 하나라도 있으면 추가
+    # 신규 TC 생성 플로우(include_change_columns=False)에서는 아예 생성하지 않음
     changed_tc = 0
-    if any((t.get("status") or "").strip() for t in tcs):
+    if include_change_columns and any((t.get("status") or "").strip() for t in tcs):
         ws_changes = wb.create_sheet("🔄 변경 이력")
         changed_tc = build_change_history(ws_changes, tcs)
         if verbose:
@@ -1058,7 +1107,8 @@ def run_build(phase: str, tc_path, output_dir,
         tcs_in_major = major_groups[major_name]
         sheet_title = _sheet_title_for_major(major_name, existing=wb.sheetnames)
         ws = wb.create_sheet(sheet_title)
-        build_tc_list(ws, tcs_in_major, config, group_by="middle")
+        build_tc_list(ws, tcs_in_major, config, group_by="middle",
+                      include_change_columns=include_change_columns)
 
     if verbose:
         print(f"  → 대분류별 시트 {len(major_order)}개 생성")

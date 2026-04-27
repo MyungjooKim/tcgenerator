@@ -1349,15 +1349,16 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
             screen_character = ""
             screen_navigation = ""
             if screen_based and middle != "전체":
-                raw_code = resolve_screen_code(middle, screen_map)
-                # 충돌 해소: 같은 코드가 이미 쓰였으면 2/3/... 접미사 부여
-                effective_code = raw_code
-                if raw_code in used_screen_codes:
+                # resolve_screen_code가 used_screen_codes를 참조해 충돌 시 마지막 단어를 1자씩 확장
+                # 예: GOWE 충돌 → GOWEB → GOWEBV → 그래도 충돌이면 GOWE2 숫자 폴백
+                effective_code = resolve_screen_code(middle, screen_map, used_screen_codes)
+                # 이론적으로 resolve_screen_code가 유일한 코드를 반환하지만, 매핑 파일이 중복된 극단 케이스를 방어
+                if effective_code in used_screen_codes:
                     for suffix in range(2, 100):
-                        cand = f"{raw_code}{suffix}"
+                        cand = f"{effective_code}{suffix}"
                         if cand not in used_screen_codes:
+                            push_log(sess, f"[TC 작성] ⚠️ ScreenCode 최종 충돌 — {effective_code} → {cand} ({middle})")
                             effective_code = cand
-                            push_log(sess, f"[TC 작성] ⚠️ ScreenCode 충돌 감지 — {raw_code} → {effective_code} ({middle})")
                             break
                 used_screen_codes.add(effective_code)
 
@@ -1746,25 +1747,85 @@ def load_screen_code_map(project_name: str) -> dict[str, dict[str, str]]:
     return mapping
 
 
-def resolve_screen_code(middle_name: str, screen_map: dict) -> str:
-    """Middle 이름을 ScreenCode로 변환.
+def resolve_screen_code(middle_name: str, screen_map: dict,
+                         used_codes: set | None = None) -> str:
+    """중분류 이름을 ScreenCode로 변환 (v0.9.7b 규칙).
 
-    1. screen_map 정확 일치 우선 (신규 구조 {code, character} 또는 구조 str)
-    2. 없으면 영문자 3자 uppercase 자동 파생
-    3. 영문자 부족 시 해시 기반 MID### 폴백
+    ┌─ 규칙 ────────────────────────────────────────────────────
+    │ 1. screen_map에 명시적 매핑이 있으면 그대로 사용 (최우선)
+    │ 2. 없으면 자동 파생:
+    │    - 1단어     → 앞 3자         (예: Splash → SPL)
+    │    - 2단어     → 각 단어 앞 2자  (예: Email Input → EMIN)
+    │    - 3단어 이상 → 앞 단어들 2자 + 마지막 단어 1자
+    │                  (예: Google OAuth Start → GOOAS)
+    │ 3. 최대 8자로 절단, 대문자화
+    │ 4. used_codes와 충돌하면 마지막 단어를 1자씩 확장
+    │    (예: GOOAC 충돌 → GOOACO → GOOACOM ...)
+    │ 5. 그래도 충돌하면 숫자 접미사 폴백 (GOOAC2)
+    │ 6. 영문자가 전혀 없으면 해시 기반 MID### 폴백
+    └────────────────────────────────────────────────────────────
     """
     if not middle_name:
         return "SCR"
+
+    # 1단계: screen_map 정확 일치
     if middle_name in screen_map:
         entry = screen_map[middle_name]
-        # 구 포맷(str) / 신 포맷(dict) 양쪽 호환
         if isinstance(entry, dict):
             return entry.get("code") or "SCR"
         return entry
-    alpha = re.sub(r"[^A-Za-z]", "", middle_name)
-    if len(alpha) >= 3:
-        return alpha[:3].upper()
-    return f"MID{abs(hash(middle_name)) % 1000:03d}"
+
+    # 2단계: 단어 분해 — 공백/하이픈/언더스코어 단위 + 영문자만 추출
+    words = [re.sub(r"[^A-Za-z]", "", w) for w in re.split(r"[\s\-_]+", middle_name) if w]
+    words = [w for w in words if w]
+    if not words:
+        return f"MID{abs(hash(middle_name)) % 1000:03d}"
+
+    # 2단계 계속: 단어 수별 기본 파생
+    if len(words) == 1:
+        base = words[0][:3].upper()
+    elif len(words) == 2:
+        base = (words[0][:2] + words[1][:2]).upper()
+    else:  # 3단어 이상
+        head = "".join(w[:2] for w in words[:-1])
+        tail = words[-1][:1]
+        base = (head + tail).upper()
+
+    # 3단계: 최대 8자 절단
+    base = base[:8]
+    if not base:
+        return f"MID{abs(hash(middle_name)) % 1000:03d}"
+
+    # 4단계: 충돌 없으면 반환
+    if used_codes is None or base not in used_codes:
+        return base
+
+    # 4단계 계속: 마지막 단어를 1자씩 확장 시도
+    # base는 "앞 단어들의 앞 N자" + "마지막 단어의 앞 1~2자" 구조
+    if len(words) >= 2:
+        last = words[-1]
+        # 마지막 단어 사용 자수: 2단어면 2자, 3단어 이상이면 1자
+        last_used_n = 2 if len(words) == 2 else 1
+        head_part = base[:-last_used_n]
+        # extra_len을 키우며 시도
+        for extra_len in range(last_used_n + 1, len(last) + 1):
+            cand = (head_part + last[:extra_len]).upper()[:8]
+            if cand not in used_codes:
+                return cand
+    else:
+        # 단일 단어: 글자 수 늘려가며 시도
+        w = words[0]
+        for extra_len in range(4, len(w) + 1):
+            cand = w[:extra_len].upper()[:8]
+            if cand not in used_codes:
+                return cand
+
+    # 5단계: 숫자 접미사 폴백
+    for n in range(2, 100):
+        cand = f"{base}{n}"[:8]
+        if cand not in used_codes:
+            return cand
+    return base  # 극단 케이스 — 호출부에서 추가 처리
 
 
 def resolve_screen_character(middle_name: str, screen_map: dict) -> str:
@@ -1981,6 +2042,12 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 ⚠️ 중분류당 TC는 5~15개가 적정합니다. 유의미한 TC만 작성하고 양을 채우기 위한 TC는 만들지 마세요.
 - 사전 조건은 반드시 번호 개조식으로 작성
 - **각 TC의 메타 테이블에 `| 연관 화면 |` 필드를 반드시 포함**하세요 (위 📱 섹션 참고)
+
+⛔ **출력 형식 절대 규칙**:
+- 모든 `### ...` 헤더는 반드시 TC ID로 시작해야 합니다 (예: `### SC-XXX-001 — 제목`)
+- **TC가 아닌 설명·분석·메모·원칙 적용 결과**를 `### 헤더`로 작성하지 마세요.
+- 이 중분류가 원칙 C(deferred/archived) 등에 의해 **TC 생성 제외 대상**이면, 아무것도 작성하지 말고 **완전히 빈 응답**을 반환하세요. 제외 이유 설명도 작성 금지.
+- 부가 설명이 꼭 필요하면 TC 블록 안의 `**비고**` 섹션 또는 `---` 구분선 앞의 본문에만 쓰세요. `### 헤더`로는 절대 금지.
 """
 
 
@@ -2346,7 +2413,11 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
             import importlib
             import build_excel as _be
             importlib.reload(_be)
-            result = _be.run_build("P_WebApp", str(tc_final_path), str(out_dir), verbose=False)
+            # 상태/수정 사유 컬럼 + 🔄 변경 이력 시트는 「기존 TC 수정」 플로우(update-tc)에서만 포함.
+            # 신규 TC 생성 시에는 깨끗한 Excel을 위해 생략.
+            include_change = bool(sess.get("_include_change_columns"))
+            result = _be.run_build("P_WebApp", str(tc_final_path), str(out_dir),
+                                   verbose=False, include_change_columns=include_change)
             if result and result.get("ok"):
                 push_log(sess, f"[빌드] 모듈 호출 성공 — 총 {result['total_tc']} TC / Smoke {result['smoke_tc']} / 대분류 {result['major_count']}시트")
                 sess["smoke_tc"] = result["smoke_tc"]
@@ -2615,19 +2686,28 @@ def parse_tc_excel(path: Path) -> list[dict]:
     tcs = []
     seen_ids = set()
 
-    # 한글 → 내부 키 매핑
+    # 한글 → 내부 키 매핑 (구·신 컬럼명 모두 인식 — 하위 호환)
     KEY_MAP = {
         "TC ID": "id",
         "Smoke": "smoke",
+        # 신규 컬럼명 (v0.9.7b)
+        "중요도": "priority",
+        "대상 거래소": "exchange",
+        "사전조건": "precondition",
+        "테스트 스텝": "steps",
+        "기대결과": "expected",
+        # 구 컬럼명 (하위 호환)
         "우선순위": "priority",
+        "관련 거래소": "exchange",
         "거래소": "exchange",
+        "사전 조건": "precondition",
+        "스텝": "steps",
+        "기대 결과": "expected",
+        # 공통
         "대분류": "major",
         "중분류": "middle",
         "소분류": "minor",
         "화면 코드": "screen_code",
-        "사전 조건": "precondition",
-        "스텝": "steps",
-        "기대 결과": "expected",
         "연관 화면": "screen",
         "상태": "status",
         "수정 사유": "change_reason",
@@ -3128,7 +3208,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
                 push_log(sess, f"[이어서] 정책·기능 복원됨 (정책 {len(policy_text):,}자, 기능 {len(features_text):,}자)")
             else:
                 sess["status"] = "policy_features"
-                push_stage(sess, 2, "정책·기능 통합 추출", 22)
+                push_stage(sess, 2, "정책·기능 통합 추출", 22, eta_sec=90)
                 policy_text, features_text = step_policy_features_combined(sess, raw_text, project_name, focus_area)
                 check_stop(sess)
                 save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "focus_area": focus_area, "sources_info": _sources_info})
@@ -4231,7 +4311,8 @@ def update_tc():
             tc_final_path = workspace / "tc_final.md"
             tc_final_path.write_text(final_md, encoding="utf-8")
 
-            # Excel 빌드 (build_excel.py는 기존 것 사용 — 변경 이력 정보는 TC 메타의 status/change_reason 필드)
+            # Excel 빌드 — 기존 TC 수정 플로우이므로 상태/수정 사유 컬럼 + 🔄 변경 이력 시트 포함
+            sess["_include_change_columns"] = True
             push_stage(sess, 5, "Excel 빌드 중", 92, eta_sec=60)
             excel_path = step_build_excel(sess, final_md, project_name,
                                            total_tc=len(existing_tcs),
@@ -5238,32 +5319,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .log-box .log-line { padding: 1px 0; }
   .log-box .log-line.error { color: #f87171; }
 
-  /* 서브스텝 아이콘 */
-  .substeps { display: flex; gap: 12px; margin: 14px 0; flex-wrap: wrap; }
+  /* 서브스텝 아이콘 — 3가지 명확한 상태: 대기(회색) · 진행 중(파랑 테두리) · 완료(초록 + ✓) */
+  .substeps { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
   .substep {
     display: flex; align-items: center; gap: 6px;
     padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
-    background: var(--bg); color: var(--muted); transition: all 0.3s;
+    background: #F3F4F6; color: #9CA3AF; border: 1.5px solid #E5E7EB;
+    transition: all 0.25s;
   }
-  .substep.active { background: #EBF2FF; color: var(--blue); }
-  .substep.done   { background: #D1FAE5; color: var(--success); }
+  .substep.active {
+    background: #DBEAFE; color: #1E40AF; border-color: #3B82F6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+    animation: pulse-active 1.6s ease-in-out infinite;
+  }
+  .substep.done {
+    background: #D1FAE5; color: #065F46; border-color: #10B981;
+  }
+  .substep.done::after {
+    content: ' ✓'; margin-left: 2px; font-weight: 800;
+  }
+  @keyframes pulse-active {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+    50%      { box-shadow: 0 0 0 5px rgba(59, 130, 246, 0.35); }
+  }
 
-  /* 도메인 체크박스 */
-  .domain-chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600;
-    cursor: pointer; border: 2px solid var(--border); background: var(--white);
-    color: var(--text); transition: all 0.15s; user-select: none;
-  }
-  .domain-chip.checked {
-    border-color: var(--teal); background: #E6F7F7; color: var(--teal);
-  }
-  .domain-chip input[type=checkbox] { display: none; }
-  .domain-chip .chip-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--border); transition: background 0.15s; flex-shrink: 0;
-  }
-  .domain-chip.checked .chip-dot { background: var(--teal); }
+  /* (제거됨) .domain-chip — 대분류 체크리스트 UI 삭제로 미사용 */
 
   /* Gate 채팅 UI */
   .gate-layout {
@@ -5286,7 +5366,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .gate-chat-messages {
     flex: 1; overflow-y: auto; padding: 12px; display: flex;
-    flex-direction: column; gap: 10px; min-height: 320px; max-height: 420px;
+    flex-direction: column; gap: 10px; min-height: 140px; max-height: 280px;
     background: #F8FAFC;
   }
   .gate-msg { max-width: 88%; padding: 9px 13px; border-radius: 10px; font-size: 13px; line-height: 1.55; }
@@ -5470,21 +5550,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div>
     <h1>🤖 TC 자동화 v2</h1>
-    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.7a 릴리즈 노트 보기">v0.9.7a</span>
+    <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="v0.9.7b 릴리즈 노트 보기">v0.9.7b</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
 </header>
 
-<!-- What's new 배너 (v0.9.7a 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
+<!-- What's new 배너 (v0.9.7b 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
 <div id="whatsNewBanner" style="display:none; margin:12px 0; padding:12px 16px; background:linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%); border:1px solid #93C5FD; border-radius:10px;">
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div style="flex:1; font-size:13px; color:#1E40AF;">
-      📦 <strong>v0.9.7a — 마크다운 다중·폴더 업로드 추가</strong>
+      🎨 <strong>v0.9.7b — UI/UX 정비 + 다수 버그 수정</strong>
       <div style="margin-top:6px; font-size:12px; color:#374151; line-height:1.6;">
-        • 📄 파일 선택: 여러 .md 파일 한 번에 업로드 (쪽대본 묶음 처리)<br>
-        • 📁 폴더 선택: 폴더 통째로 끌어와 내부 .md만 자동 필터링<br>
-        • 같은 이름 파일은 서버가 <code>_1</code>, <code>_2</code> 자동 접미사로 보존<br>
-        • Windows cp949 호환 수정(v0.9.7) 포함
+        • Gate 화면 통합: 분류표·TC 매핑 표 한 곳에서 보고 편집<br>
+        • 파이프라인 카드 통합 (Step 2~5 단일 카드, 단계별 색상/체크/펄스)<br>
+        • Excel 컬럼 순서 재배치 + "대상 거래소" 라벨 명확화<br>
+        • ScreenCode 자동 파생 규칙 개선 (단어별 2자 + 충돌 시 마지막 단어 확장)<br>
+        • <code>**SM</code> 같은 마크업 잔여 버그 + SSE 재연결 안내 + 도메인별→화면별 라벨
       </div>
     </div>
     <div style="display:flex; flex-direction:column; gap:6px;">
@@ -5498,30 +5579,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div id="whatsNewModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
   <div style="background:#FFFFFF; border-radius:12px; max-width:720px; width:92%; max-height:84vh; overflow:hidden; display:flex; flex-direction:column;">
     <div style="padding:16px 20px; border-bottom:1px solid #E5E7EB; display:flex; justify-content:space-between; align-items:center;">
-      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.7a 릴리즈 노트</strong></div>
+      <div><strong style="font-size:15px; color:#1E40AF;">📖 v0.9.7b 릴리즈 노트</strong></div>
       <button onclick="document.getElementById('whatsNewModal').style.display='none'" style="border:none; background:none; font-size:20px; cursor:pointer; color:#6B7280;">✕</button>
     </div>
     <div style="padding:16px 20px; overflow:auto; font-size:13px; line-height:1.7; color:#374151;">
-      <h3 style="margin:0 0 8px; color:#1E40AF;">📦 v0.9.7a — 2026-04-24 (기능 추가)</h3>
-      <p><strong>마크다운 다중·폴더 업로드 지원 + Windows 호환성 수정(v0.9.7) 포함</strong></p>
-      <h4 style="color:#065F46; margin-top:16px;">✨ 신규 기능 (v0.9.7a)</h4>
+      <h3 style="margin:0 0 8px; color:#1E40AF;">🎨 v0.9.7b — 2026-04-27 (UI/UX 정비 + 버그 수정)</h3>
+      <p><strong>화면 일관성 정리 · ScreenCode 규칙 개선 · 다수 잔여 버그 수정</strong></p>
+      <h4 style="color:#065F46; margin-top:16px;">✨ UI/UX 개선</h4>
       <ul>
-        <li><strong>📄 마크다운 다중 파일 업로드</strong>: 파일 선택창에서 여러 .md를 한 번에 선택 가능. 쪽대본처럼 쪼개진 기획서 묶음을 한 번에 처리.</li>
-        <li><strong>📁 폴더 선택 업로드</strong>: 폴더 통째로 선택 시 내부 .md/.markdown/.txt만 자동 필터링하고 파일명 순으로 정렬해 업로드. 50개 초과 시 확인 프롬프트로 실수 방지.</li>
-        <li><strong>중복 파일명 자동 보존</strong>: 같은 이름 파일을 연속 업로드하면 서버가 <code>_1</code>, <code>_2</code> 접미사를 자동 부여해 덮어쓰기 방지.</li>
-        <li>업로드된 파일마다 독립된 소스 카드로 자동 분할 — 이후 개별 삭제·관리 가능.</li>
+        <li><strong>Gate 화면 통합</strong>: 문서 Viewer + TC 분류 요약을 하나의 표 중심 화면으로 통합. 원본 마크다운은 펼침/접힘 토글로 선택 노출.</li>
+        <li><strong>파이프라인 카드 통합</strong>: 기존 card2 + card4 중복 → card2 하나로 통합. 단계별 제목/배지 동적 전환.</li>
+        <li><strong>Substep 시인성 강화</strong>: 6단계 파싱 → 정책·기능 → 분류 → 검토 → TC 생성 → Excel. 진행 중(파란 펄스), 완료(초록 ✓), 대기(회색)로 명확히 구분.</li>
+        <li><strong>분류 요약 표 재구성</strong>: 중분류별 행 분리 (A안), 같은 대분류는 첫 행에만 시트명/SuiteCode + 이후 ↳ 동일 시트 표기.</li>
+        <li>Excel 컬럼 순서 재배치 (TC ID → 대분류 → 중분류 → 소분류 → 사전조건 → 테스트 스텝 → 기대결과 → 중요도 → 대상 거래소 → Smoke → 화면 코드).</li>
+        <li>"도메인별 구성" → <strong>"화면별 TC 수"</strong> + ScreenCode · 중분류 이름 형태로 변경.</li>
       </ul>
-      <h4 style="color:#B45309; margin-top:16px;">🐛 v0.9.7 포함 내용 (Windows 환경)</h4>
+      <h4 style="color:#B45309; margin-top:16px;">🐛 버그 수정</h4>
       <ul>
-        <li>Excel 대분류별 시트 분할·🔥 Smoke Test 시트가 fallback으로 빠져 누락되던 문제</li>
-        <li>cp949 인코딩으로 subprocess 실패하던 문제</li>
-        <li>Excel 빌더를 모듈 import 방식으로 전환해 근본 해결</li>
+        <li><strong><code>**SM · **SM</code> 잔여 버그</strong>: bold 마크업이 라인 전체를 감쌀 때 parser가 ID로 오인식하던 문제 — ** 제거 후 통일 매칭으로 해결.</li>
+        <li><strong>ScreenCode 충돌</strong>: <code>GOO/GOO2/GOO3</code> 같은 의미 없는 접미사 → <code>GOWE/GOLOC/GOOAS</code> 등 의미 있는 단어 기반 코드.</li>
+        <li><strong>SSE 세션 소멸 시</strong>: 무한 재연결 시도 → 404 감지 후 명확한 안내 배너 + 새로고침 버튼.</li>
+        <li><strong>대분류 체크리스트 제거</strong>: 의미 없던 "TC 생성 범위 선택" 영역 삭제. 범위 지정은 Step 1 focus_area로 일원화.</li>
+        <li>"중분류별" 통계 섹션 중복 제거 (화면별 TC 수와 동일 정보).</li>
       </ul>
       <h4 style="color:#6B7280; margin-top:16px;">💡 참고</h4>
       <ul>
-        <li>v0.9.6의 모든 기능 유지 (기획서 diff 기반 TC 갱신, Traceability, Quick 모드 등)</li>
-        <li>실행 방법 변경 없음</li>
-        <li>전체 변경 이력은 프로젝트 루트 <code>CHANGELOG.md</code> 참고</li>
+        <li>v0.9.7a의 마크다운 다중·폴더 업로드 그대로 유지</li>
+        <li>v0.9.7의 Windows 호환성 수정 그대로 포함</li>
+        <li>실행 방법 변경 없음. 전체 이력: <code>CHANGELOG.md</code></li>
       </ul>
     </div>
     <div style="padding:12px 20px; border-top:1px solid #E5E7EB; text-align:right;">
@@ -5746,15 +5831,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Step 2: 파이프라인 실행 카드 -->
+  <!-- Step 2~4: 파이프라인 통합 카드 (Gate는 별도 card3에서 사용자 개입) -->
   <div class="card hidden" id="card2">
-    <div class="card-title">⚙️ 파이프라인 실행 <span class="badge">Step 2</span></div>
+    <div class="card-title">
+      <span id="pipelineCardTitle">⚙️ 파이프라인 실행</span>
+      <span class="badge" id="pipelineCardBadge">Step 2</span>
+    </div>
 
     <div class="substeps">
       <div class="substep" id="sub1">📄 파싱</div>
-      <div class="substep" id="sub2">🔎 정책</div>
-      <div class="substep" id="sub3">📋 기능</div>
-      <div class="substep" id="sub4">🗂 분류</div>
+      <div class="substep" id="sub2">🔎 정책·기능</div>
+      <div class="substep" id="sub3">🗂 분류</div>
+      <div class="substep" id="sub4">🔍 검토</div>
+      <div class="substep" id="sub5">✍️ TC 생성</div>
+      <div class="substep" id="sub6">📊 Excel</div>
     </div>
 
     <div style="font-size:14px; font-weight:600; color:var(--blue); margin-bottom:6px;">
@@ -5764,7 +5854,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="progress-bar" id="progressBar" style="width:0%"></div>
     </div>
 
-    <div class="log-box" id="logBox"></div>
+    <div class="log-box" id="logBox" style="max-height:360px; min-height:320px;"></div>
     <div style="margin-top:12px; text-align:right;">
       <button class="btn-stop" id="stopBtn2" onclick="stopPipeline()">⏹ 파이프라인 중단</button>
     </div>
@@ -5797,94 +5887,76 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- 채팅 + Viewer 2-column 레이아웃 -->
-    <div class="gate-layout">
-
-      <!-- 왼쪽: AI 채팅 패널 -->
-      <div class="gate-chat-panel">
-        <div class="gate-chat-header">
-          💬 AI와 대화하여 수정
-        </div>
-        <div class="gate-chat-messages" id="gateChatMessages">
-          <!-- 메시지가 여기에 추가됨 -->
-        </div>
-        <div class="gate-chat-input-row">
-          <textarea class="gate-chat-input" id="gateChatInput"
-            placeholder="수정 요청을 입력하세요. 예) AUTH 도메인 케이스 3번 삭제해줘"
-            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGateChat();}"></textarea>
-          <button class="gate-chat-send" id="gateChatSend" onclick="sendGateChat()">전송</button>
-        </div>
+    <!-- AI 채팅 영역 (단독 폭) -->
+    <div class="gate-chat-panel" style="margin-bottom:16px;">
+      <div class="gate-chat-header">
+        💬 AI와 대화하여 수정
       </div>
-
-      <!-- 오른쪽: 문서 Viewer -->
-      <div class="gate-viewer-panel">
-        <div class="gate-viewer-header">
-          📄 문서 Viewer <span id="gateViewerBadge" style="margin-left:auto; font-size:11px; opacity:0.8;"></span>
-        </div>
-        <div class="gate-viewer-content" id="gateViewer">
-          <!-- 마크다운 렌더링 결과 -->
-        </div>
+      <div class="gate-chat-messages" id="gateChatMessages">
+        <!-- 메시지가 여기에 추가됨 -->
+      </div>
+      <div class="gate-chat-input-row">
+        <textarea class="gate-chat-input" id="gateChatInput"
+          placeholder="수정 요청을 입력하세요. 예) AUTH 도메인 케이스 3번 삭제해줘"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGateChat();}"></textarea>
+        <button class="gate-chat-send" id="gateChatSend" onclick="sendGateChat()">전송</button>
       </div>
     </div>
 
-    <!-- 숨겨진 원본 데이터 저장용 -->
-    <textarea class="gate-textarea" id="gateContent"></textarea>
+    <!-- 분류표 & TC 매핑 표 영역 — 메인 (renderGateViewer가 채워넣음) -->
+    <div id="gateViewer">
+      <!-- TC 분류 요약 표가 여기에 들어감 -->
+    </div>
+
+    <!-- 원본 마크다운 보기 — 토글 가능 (기본 접힘) -->
+    <details style="margin:14px 0;">
+      <summary style="cursor:pointer; padding:8px 14px; background:#F3F4F6; border:1px solid #D1D5DB; border-radius:8px; font-size:13px; font-weight:600; color:#374151; user-select:none; list-style:none; display:flex; align-items:center; gap:6px;">
+        <span id="rawDocToggleIcon">▶</span>
+        <span>📄 분류표 원본 마크다운 보기 (펼치기)</span>
+      </summary>
+      <div id="rawDocContainer" style="margin-top:8px; padding:14px; background:#FAFAFA; border:1px solid #E5E7EB; border-radius:8px;">
+        <div id="rawDocBadge" style="font-size:11px; color:var(--muted); margin-bottom:8px;"></div>
+        <pre id="rawDocContent" style="margin:0; padding:12px; background:#FFFFFF; border:1px solid #E5E7EB; border-radius:6px; font-size:12px; line-height:1.7; max-height:400px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:#111827;"></pre>
+      </div>
+    </details>
+    <script>
+      // details 펼치기/접기 시 ▶ ↔ ▼ 화살표 전환
+      (function() {
+        document.addEventListener('toggle', function(e) {
+          if (e.target && e.target.tagName === 'DETAILS') {
+            var icon = e.target.querySelector('#rawDocToggleIcon');
+            if (icon) icon.textContent = e.target.open ? '▼' : '▶';
+            var sumText = e.target.querySelector('summary span:last-child');
+            if (sumText) sumText.textContent = e.target.open ? '📄 분류표 원본 마크다운 보기 (접기)' : '📄 분류표 원본 마크다운 보기 (펼치기)';
+          }
+        }, true);
+      })();
+    </script>
+
+    <!-- 숨겨진 원본 데이터 저장용 (gate-chat 등에서 참조) -->
+    <textarea class="gate-textarea" id="gateContent" style="display:none;"></textarea>
 
     <!-- SuiteCode 입력 테이블 (Viewer 밖 — 독립 영역) -->
     <div id="suiteCodeSection" style="display:none; margin-top:14px; margin-bottom:14px;"></div>
 
-    <!-- TC 생성 범위 선택 -->
-    <div style="margin-top:18px; margin-bottom:8px; font-size:13px; font-weight:600; color:var(--navy);">
-      📌 TC 생성 범위 선택
-      <span style="font-weight:400; color:var(--muted); font-size:12px; margin-left:8px;">체크된 도메인만 TC를 생성합니다</span>
-    </div>
-    <div id="domainChecklist" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;">
-      <!-- JS로 동적 생성 -->
-    </div>
-    <div style="display:flex; gap:8px; margin-bottom:16px; align-items:center;">
-      <button type="button" onclick="selectAllDomains(true)"
-        style="font-size:12px; padding:4px 12px; border:1px solid var(--border);
-          border-radius:6px; background:none; cursor:pointer; color:var(--text);">
-        전체 선택
-      </button>
-      <button type="button" onclick="selectAllDomains(false)"
-        style="font-size:12px; padding:4px 12px; border:1px solid var(--border);
-          border-radius:6px; background:none; cursor:pointer; color:var(--text);">
-        전체 해제
-      </button>
-      <button type="button" onclick="exportGateExcel()"
-        style="font-size:12px; padding:4px 14px; border:1.5px solid var(--teal);
-          border-radius:6px; background:none; cursor:pointer; color:var(--teal);
-          font-weight:600; margin-left:auto; display:flex; align-items:center; gap:5px;">
-        📥 Excel로 내보내기
-      </button>
-    </div>
-
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:18px;">
       <button class="btn btn-success" onclick="approveGate()">
         ✅ 승인 및 TC 생성 시작
       </button>
       <button style="padding:8px 16px;background:#EFF6FF;color:#1D4ED8;border:1.5px solid #93C5FD;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;" onclick="regenerateClassification()">
         🔄 분류표 다시 생성
       </button>
+      <button type="button" onclick="exportGateExcel()"
+        style="padding:8px 16px; border:1.5px solid var(--teal); border-radius:8px;
+          background:none; cursor:pointer; color:var(--teal); font-weight:600; font-size:13px;
+          display:flex; align-items:center; gap:5px;">
+        📥 Excel로 내보내기
+      </button>
       <button class="btn-stop" id="stopBtn3" onclick="stopPipeline()">⏹ 여기서 중단</button>
     </div>
   </div>
 
-  <!-- Step 4: TC 생성 카드 -->
-  <div class="card hidden" id="card4">
-    <div class="card-title">✍️ TC 생성 중 <span class="badge">Step 4</span></div>
-    <div id="tcStageLabel" style="font-size:14px; font-weight:600; color:var(--blue); margin-bottom:6px;">
-      TC 작성 중...
-    </div>
-    <div class="progress-wrap">
-      <div class="progress-bar" id="tcProgressBar" style="width:50%"></div>
-    </div>
-    <div class="log-box" id="tcLogBox"></div>
-    <div style="margin-top:12px; text-align:right;">
-      <button class="btn-stop" id="stopBtn4" onclick="stopPipeline()">⏹ TC 생성 중단</button>
-    </div>
-  </div>
+  <!-- Step 4는 card2로 통합됨 (진행 상태·로그를 한곳에서 표시) -->
 
   <!-- Step 5: 완료 카드 -->
   <div class="card hidden" id="card5">
@@ -6070,7 +6142,7 @@ async function onProjectDropdownChange() {
   currentFilename = null;
   stopCountdown();
   // 카드 숨김 (card2~card5)
-  ['card2','card3','card4','card5'].forEach(function(id) {
+  ['card2','card3','card5'].forEach(function(id) {
     var card = document.getElementById(id);
     if (card) card.classList.add('hidden');
   });
@@ -6128,7 +6200,7 @@ async function onProjectDropdownChange() {
   stopCountdown();
 
   // 진행/결과 카드 숨김
-  ['card2','card3','card4','card5'].forEach(function(id) {
+  ['card2','card3','card5'].forEach(function(id) {
     var card = document.getElementById(id);
     if (card) card.classList.add('hidden');
   });
@@ -6244,7 +6316,7 @@ function restartFromScratch() {
 
 function startNextIteration(focusOnly) {
   // 완료/진행 카드 숨김
-  ['card2','card3','card4','card5'].forEach(function(id) {
+  ['card2','card3','card5'].forEach(function(id) {
     document.getElementById(id).classList.add('hidden');
   });
   document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
@@ -7122,7 +7194,7 @@ function onInputsChanged() {
 
   // 3. 실행 중이 아니면 진행/Gate/작성 카드도 숨김
   if (!currentSid) {
-    ['card2','card3','card4'].forEach(function(id) {
+    ['card2','card3'].forEach(function(id) {
       var card = document.getElementById(id);
       if (card) card.classList.add('hidden');
     });
@@ -7218,7 +7290,7 @@ if (typeof document !== 'undefined') {
 }
 
 // v0.9.6 What's New 배너 표시 — localStorage에 dismiss 기록이 없으면 자동 표시
-const _WHATS_NEW_VERSION = 'v0.9.7a';
+const _WHATS_NEW_VERSION = 'v0.9.7b';
 const _WHATS_NEW_KEY = 'tc_whatsnew_dismissed_' + _WHATS_NEW_VERSION;
 
 function checkWhatsNewBanner() {
@@ -7499,12 +7571,18 @@ async function startPipeline() {
   }
 }
 
+let _sseReconnectCount = 0;
+const _SSE_MAX_RECONNECT = 3;
+
 function connectStream(sid) {
-  // 이전 중단 배너 제거
-  document.querySelectorAll('.stopped-banner').forEach(el => el.remove());
+  // 이전 중단 배너 제거 + 재연결 카운트 리셋
+  document.querySelectorAll('.stopped-banner, .error-banner, .session-lost-banner').forEach(el => el.remove());
+  _sseReconnectCount = 0;
+
   eventSource = new EventSource('/stream/' + sid);
-  // SSE 연결 성공 시 중단 버튼 활성화 보장 (재연결 포함)
   eventSource.onopen = () => {
+    // 성공 연결 → 재연결 카운트 리셋, 중단 버튼 활성
+    _sseReconnectCount = 0;
     setStopButtonsDisabled(false);
   };
   eventSource.onmessage = (e) => {
@@ -7513,12 +7591,67 @@ function connectStream(sid) {
       handleEvent(evt);
     } catch(err) {}
   };
-  eventSource.onerror = () => {
-    addLog('⚠️ SSE 연결 오류. 재연결 시도...', true);
-    // SSE가 끊겨도 /stop/<sid> POST는 가능하므로 버튼은 활성 유지
-    // (파이프라인이 서버에서 계속 돌고 있을 수 있음)
+  eventSource.onerror = async () => {
+    // 먼저 세션이 서버에 살아있는지 HEAD로 확인
+    // (/stream/<sid> 가 404면 세션이 사라진 것 — 영원히 재시도해도 소용없음)
+    let sessionAlive = false;
+    try {
+      const head = await fetch('/stream/' + sid, { method: 'HEAD' });
+      sessionAlive = (head.status !== 404);
+    } catch(e) {
+      // 네트워크 자체 문제 — 재시도 의미 있음
+      sessionAlive = true;
+    }
+
+    if (!sessionAlive) {
+      // 세션 소멸 확정 → 재연결 중단 + 명확한 안내
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      showSessionLostBanner();
+      setStopButtonsDisabled(true);
+      stopCountdown();
+      return;
+    }
+
+    // 세션은 살아있음 — 일반 네트워크 지연 등. 제한된 횟수만 재시도 안내
+    _sseReconnectCount++;
+    if (_sseReconnectCount === 1) {
+      addLog('⚠️ SSE 연결 오류. 재연결 시도 중...', true);
+    } else if (_sseReconnectCount >= _SSE_MAX_RECONNECT) {
+      addLog(`⚠️ 재연결 실패(${_sseReconnectCount}회). 새로고침이나 세션 확인 필요.`, true);
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      showSessionLostBanner(true);
+      return;
+    }
     setStopButtonsDisabled(false);
   };
+}
+
+function showSessionLostBanner(afterRetries) {
+  // 이미 표시되어 있으면 중복 방지
+  if (document.querySelector('.session-lost-banner')) return;
+  const banner = document.createElement('div');
+  banner.className = 'session-lost-banner';
+  banner.style.cssText = 'margin:12px 0;padding:14px 18px;background:#FEF2F2;border:1.5px solid #DC2626;border-radius:10px;color:#991B1B;';
+  banner.innerHTML = `
+    <div style="font-weight:700;font-size:14px;margin-bottom:6px;">🔌 세션이 종료되었습니다</div>
+    <div style="font-size:12.5px;line-height:1.6;color:#7F1D1D;">
+      서버와의 연결이 끊어졌습니다${afterRetries ? ' (재연결 시도 실패)' : ''}. 다음 중 하나를 선택하세요:<br>
+      • <strong>새로 시작</strong>: 브라우저 새로고침 후 처음부터<br>
+      • <strong>이어서 작업</strong>: 프로젝트 선택 후 아래 버튼 (승인 전 단계만 지원)
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;">
+      <button onclick="location.reload()" style="padding:6px 14px;background:#DC2626;color:#FFFFFF;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">🔄 새로고침</button>
+      <button onclick="document.querySelector('.session-lost-banner').remove()" style="padding:6px 14px;background:#FFFFFF;color:#6B7280;border:1px solid #D1D5DB;border-radius:6px;font-size:12px;cursor:pointer;">✕ 닫기</button>
+    </div>
+  `;
+  // 진행 중 카드 위에 삽입
+  const card2 = document.getElementById('card2');
+  if (card2 && !card2.classList.contains('hidden')) {
+    card2.insertBefore(banner, card2.firstChild);
+  } else {
+    const wrap = document.querySelector('.app') || document.body;
+    wrap.insertBefore(banner, wrap.firstChild);
+  }
 }
 
 function handleEvent(evt) {
@@ -7527,27 +7660,31 @@ function handleEvent(evt) {
   if (evt.type === 'stage') {
     const { stage, label, pct, eta_sec } = evt.data;
     updateProgress(label, pct, eta_sec);
-    updateSubsteps(stage);
-    if (stage >= 4) {
-      document.getElementById('tcStageLabel').textContent = label;
-      document.getElementById('tcProgressBar').style.width = pct + '%';
-      // TC 단계 진입 시 상단 카드 간략화 — 프로그레스바+로그+버튼 숨김
-      document.getElementById('logBox').style.display = 'none';
-      document.getElementById('stopBtn2').style.display = 'none';
-      document.getElementById('progressBar').parentElement.style.display = 'none';
-      document.querySelector('#card2 .substeps').style.display = 'none';
+    updateSubsteps(stage, label);
+    // 통합된 card2 제목/배지를 현 단계에 맞게 갱신
+    const titleEl = document.getElementById('pipelineCardTitle');
+    const badgeEl = document.getElementById('pipelineCardBadge');
+    if (titleEl && badgeEl) {
+      if (stage <= 2) {
+        titleEl.textContent = '⚙️ 분석 및 분류';
+        badgeEl.textContent = 'Step 2';
+      } else if (stage === 3) {
+        titleEl.textContent = '🔍 분류표 검토 대기';
+        badgeEl.textContent = 'Step 3';
+      } else if (stage === 4) {
+        titleEl.textContent = '✍️ TC 생성';
+        badgeEl.textContent = 'Step 4';
+      } else if (stage >= 5) {
+        titleEl.textContent = '📊 Excel 빌드';
+        badgeEl.textContent = 'Step 5';
+      }
     }
     setStepBar(stage);
   }
 
   if (evt.type === 'log') {
-    // TC 생성 단계(card4 보이면)에서는 하단에만 로그 표시
-    const card4 = document.getElementById('card4');
-    if (!card4.classList.contains('hidden')) {
-      addTcLog(evt.data.msg);
-    } else {
-      addLog(evt.data.msg);
-    }
+    // 모든 로그는 card2의 단일 logBox에 표시 (통합 뷰)
+    addLog(evt.data.msg);
   }
 
   if (evt.type === 'gate') {
@@ -7561,7 +7698,8 @@ function handleEvent(evt) {
       ? 'AI가 분석한 변경 영향도입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.'
       : 'AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.';
     initGateChat(evt.data.content);
-    renderDomainChecklist(evt.data.content);
+    // Gate 진입 시 파이프라인 카드는 숨기고 Gate 패널에 집중
+    document.getElementById('card2').classList.add('hidden');
     document.getElementById('card3').classList.remove('hidden');
     setStepBar(3);
 
@@ -7588,7 +7726,13 @@ function handleEvent(evt) {
     stopCountdown();
     const { filename, size, sid, total_tc, min_tc, smoke_tc } = evt.data;
     currentFilename = filename;
-    document.getElementById('card4').classList.add('hidden');
+    // 모든 substep을 done 처리 (visual 완결)
+    for (let i = 1; i <= 6; i++) {
+      const el = document.getElementById('sub' + i);
+      if (el) { el.classList.remove('active'); el.classList.add('done'); }
+    }
+    // 파이프라인(card2) 숨기고 완료 카드(card5) 노출
+    document.getElementById('card2').classList.add('hidden');
     document.getElementById('card5').classList.remove('hidden');
     document.getElementById('resultFilename').textContent = filename;
     document.getElementById('resultMeta').textContent =
@@ -7607,7 +7751,7 @@ function handleEvent(evt) {
   if (evt.type === 'stopped') {
     stopCountdown();
     setStopButtonsDisabled(true);
-    ['card2', 'card3', 'card4'].forEach(id => {
+    ['card2', 'card3'].forEach(id => {
       const card = document.getElementById(id);
       if (!card.classList.contains('hidden')) {
         const banner = document.createElement('div');
@@ -7697,27 +7841,76 @@ function startCountdown(seconds) {
 function updateProgress(label, pct, etaSec) {
   document.getElementById('stageLabel').textContent = label + ' (' + pct + '%)';
   document.getElementById('progressBar').style.width = pct + '%';
-  // 서버가 eta_sec을 명시하면 우선, 없으면 pct 기반 기본값 매핑
+  // 서버가 eta_sec을 명시하면 우선 사용
   if (typeof etaSec === 'number' && etaSec > 0) {
     startCountdown(etaSec);
     return;
   }
-  // 기본 예상 시간 (폴백)
-  var estimates = {5: 20, 15: 30, 22: 45, 25: 50, 30: 30, 35: 30, 38: 30, 50: 90,
-                   82: 20, 88: 10, 90: 60, 92: 60, 98: 3};
-  var estSec = estimates[pct];
-  if (estSec) startCountdown(estSec);
+  // 폴백: label 기준으로 대략적인 예상 시간 추정 (pct 정확 매칭 의존 제거)
+  const txt = String(label || '').toLowerCase();
+  let estSec = 0;
+  if (txt.includes('파싱')) estSec = 20;
+  else if (txt.includes('정책·기능') || txt.includes('정책+기능') || txt.includes('통합 추출')) estSec = 90;
+  else if (txt.includes('인벤토리')) estSec = 60;
+  else if (txt.includes('정책') || txt.includes('기능 목록')) estSec = 60;
+  else if (txt.includes('분류표')) estSec = 45;
+  else if (txt.includes('gate') || txt.includes('검토 대기')) estSec = 0;  // 사용자 대기
+  else if (txt.includes('tc 작성') || txt.includes('tc 생성')) estSec = 0; // 가변 — 중분류별로 다름
+  else if (txt.includes('품질 검토') || txt.includes('누락')) estSec = 30;
+  else if (txt.includes('보강')) estSec = 30;
+  else if (txt.includes('excel') || txt.includes('빌드')) estSec = 60;
+  else if (txt.includes('완료')) estSec = 0;
+  if (estSec > 0) startCountdown(estSec);
+  else stopCountdown();
 }
 
-function updateSubsteps(stage) {
-  const map = {1: 'sub1', 2: 'sub2', 3: 'sub2', 4: 'sub3'};
-  ['sub1','sub2','sub3','sub4'].forEach(id => {
+// 백엔드 stage(1~5) + label 조합으로 현재 활성 substep 계산
+// substep 구성: sub1 파싱 · sub2 정책·기능 · sub3 분류 · sub4 검토 · sub5 TC 생성 · sub6 Excel
+function updateSubsteps(stage, label) {
+  const ids = ['sub1','sub2','sub3','sub4','sub5','sub6'];
+  // 모두 초기화
+  ids.forEach(id => {
     const el = document.getElementById(id);
-    el.classList.remove('active','done');
+    if (el) el.classList.remove('active','done');
   });
-  // 파싱=1→sub1, 정책/기능/분류=2→sub2/sub3/sub4
-  if (stage >= 1) document.getElementById('sub1').classList.add('done');
-  if (stage >= 2) document.getElementById('sub2').classList.add('active');
+
+  // stage와 label로 현재 substep 인덱스 결정 (1-based)
+  const txt = String(label || '').toLowerCase();
+  let active = 1;
+  if (stage <= 1) {
+    active = 1;  // 파싱
+  } else if (stage === 2) {
+    // 라벨 기준으로 정책·기능 vs 분류 구분
+    if (txt.includes('분류표')) active = 3;  // "분류표 생성"
+    else active = 2;  // "정책 분석", "기능 목록", "정책·기능 통합 추출" 등
+  } else if (stage === 3) {
+    active = 3;  // Gate 대기 — 분류 완료 직후
+  } else if (stage === 4) {
+    // 검토 vs TC 생성 구분
+    if (txt.includes('검토') || txt.includes('보강')) active = 4;
+    else if (txt.includes('excel') || txt.includes('빌드')) active = 6;
+    else active = 5;  // "TC 작성 시작", "TC 작성: ..."
+  } else if (stage === 5) {
+    // Excel 빌드 또는 완료
+    if (txt.includes('완료')) {
+      active = 6;
+      // 완료 시 sub6까지 done 처리
+      for (let i = 1; i <= 6; i++) {
+        const el = document.getElementById('sub' + i);
+        if (el) el.classList.add('done');
+      }
+      return;
+    }
+    active = 6;
+  }
+
+  // 이전 substep들은 done, 현재만 active
+  for (let i = 1; i < active; i++) {
+    const el = document.getElementById('sub' + i);
+    if (el) el.classList.add('done');
+  }
+  const cur = document.getElementById('sub' + active);
+  if (cur) cur.classList.add('active');
 }
 
 function addLog(msg, isError=false) {
@@ -7729,71 +7922,9 @@ function addLog(msg, isError=false) {
   box.scrollTop = box.scrollHeight;
 }
 
-function addTcLog(msg) {
-  const box = document.getElementById('tcLogBox');
-  const line = document.createElement('div');
-  line.className = 'log-line';
-  line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
-  box.appendChild(line);
-  box.scrollTop = box.scrollHeight;
-}
-
-// ── 도메인 체크리스트 ─────────────────────────────────────────────────────────
-function parseDomains(text) {
-  const domains = [];
-  // "## 대분류: 이름 (코드)" 패턴
-  const re = /##\s+대분류[:\s]+([^\(]+?)\s*[\(\（]([A-Z]{2,8})[\)\）]/gm;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    domains.push({ name: m[1].trim(), code: m[2].trim() });
-  }
-  // 패턴 없으면 "## " 헤딩에서 코드 추출
-  if (domains.length === 0) {
-    const re2 = /^##\s+(.+)/gm;
-    while ((m = re2.exec(text)) !== null) {
-      const cm = m[1].match(/[\(\（]([A-Z]{2,8})[\)\）]/);
-      if (cm) {
-        const name = m[1].replace(/\s*[\(\（][A-Z]{2,8}[\)\）]/, '').trim();
-        domains.push({ name, code: cm[1] });
-      }
-    }
-  }
-  return domains;
-}
-
-function renderDomainChecklist(content) {
-  const domains = parseDomains(content);
-  const container = document.getElementById('domainChecklist');
-  container.innerHTML = '';
-  if (domains.length === 0) {
-    container.innerHTML = '<span style="font-size:12px;color:var(--muted)">도메인을 자동으로 인식하지 못했습니다. 전체 생성됩니다.</span>';
-    return;
-  }
-  domains.forEach(d => {
-    const label = document.createElement('label');
-    label.className = 'domain-chip checked';
-    label.innerHTML = '<input type="checkbox" checked value="' + d.code + '"><span class="chip-dot"></span>' + d.code + ' · ' + d.name;
-    label.querySelector('input').addEventListener('change', function() {
-      label.classList.toggle('checked', this.checked);
-    });
-    container.appendChild(label);
-  });
-}
-
-function selectAllDomains(checked) {
-  document.querySelectorAll('#domainChecklist input[type=checkbox]').forEach(cb => {
-    cb.checked = checked;
-    cb.closest('.domain-chip').classList.toggle('checked', checked);
-  });
-}
-
-function getSelectedDomains() {
-  const checked = [...document.querySelectorAll('#domainChecklist input[type=checkbox]:checked')];
-  if (checked.length === 0) return null; // 아무것도 없으면 null → 전체로 처리
-  const all = document.querySelectorAll('#domainChecklist input[type=checkbox]');
-  if (checked.length === all.length) return null; // 전체 선택이면 null (필터 없음)
-  return checked.map(cb => cb.value);
-}
+// NOTE: addTcLog는 제거됨 — 통합 card2의 addLog 하나만 사용
+// NOTE: 이전에 있던 "대분류 체크리스트"(parseDomains/renderDomainChecklist/selectAllDomains/getSelectedDomains)는
+// 제거되었습니다. 범위 지정은 Step 1의 "TC 생성 범위"(focus_area)로 일원화되었습니다.
 
 async function exportGateExcel() {
   const content = document.getElementById('gateContent').value.trim();
@@ -7890,38 +8021,76 @@ function mdToHtml(md) {
 
 function extractCategorySummary(mdText) {
   // 분류표에서 대분류/중분류/소분류 구조 추출
+  // 결과 구조 (중분류별 그룹핑 — A안):
+  //   [{
+  //     major: '대분류 이름',
+  //     middle: '중분류 이름',
+  //     minors: ['소분류 1', '소분류 2', ...]
+  //   }, ...]
+  // 소분류는 다음 두 가지 패턴 모두 지원:
+  //   1. `#### 소분류` 헤더 + 그 아래 `- 항목: 설명` 불릿
+  //   2. `### 중분류` 직후 바로 `- 항목` 불릿 (헤더 없음)
+  // `#### 소분류` 헤더 자체는 데이터가 아니므로 제외.
   var lines = mdText.split('\\n');
-  var suites = [];
+  var rows = [];
   var curMajor = '';
-  var curMiddles = [];
+  var curMiddle = '';
   var curMinors = [];
+  var inMinorSection = false;  // `#### 소분류` 헤더 직후 여부
+
+  function flushMiddle() {
+    if (curMajor && curMiddle) {
+      rows.push({ major: curMajor, middle: curMiddle, minors: curMinors });
+    }
+    curMiddle = '';
+    curMinors = [];
+    inMinorSection = false;
+  }
+
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim();
-    if (line.startsWith('## ') && !line.startsWith('### ')) {
-      if (curMajor) suites.push({ major: curMajor, middles: curMiddles, minors: curMinors });
-      curMajor = line.replace(/^##\s+/, '').replace(/\*\*/g, '');
-      curMiddles = [];
-      curMinors = [];
-    } else if (line.startsWith('### ')) {
-      curMiddles.push(line.replace(/^###\s+/, '').replace(/\*\*/g, ''));
-    } else if (line.startsWith('#### ')) {
-      curMinors.push(line.replace(/^####\s+/, '').replace(/\*\*/g, ''));
-    } else if ((line.startsWith('- ') || line.startsWith('* ')) && curMinors.length === 0 && curMiddles.length > 0) {
-      var txt = line.replace(/^[-*]\s+/, '');
-      if (txt.length < 40) curMinors.push(txt);
+    // 대분류
+    if (line.match(/^##\s+/) && !line.match(/^###\s+/)) {
+      flushMiddle();
+      curMajor = line.replace(/^##\s+/, '').replace(/\*\*/g, '').replace(/^대분류[:\s]*/, '').trim();
+    }
+    // 중분류
+    else if (line.match(/^###\s+/) && !line.match(/^####\s+/)) {
+      flushMiddle();
+      curMiddle = line.replace(/^###\s+/, '').replace(/\*\*/g, '').replace(/^중분류[:\s]*/, '').trim();
+      inMinorSection = false;
+    }
+    // 소분류 섹션 헤더 — '#### 소분류' 같은 헤더는 그 자체로 데이터 아님
+    else if (line.match(/^####\s+/)) {
+      inMinorSection = true;
+    }
+    // 불릿 항목 — 중분류 안에 있을 때만 소분류로 수집
+    else if ((line.startsWith('- ') || line.startsWith('* ')) && curMiddle) {
+      var txt = line.replace(/^[-*]\s+/, '').replace(/\*\*/g, '').trim();
+      if (txt) curMinors.push(txt);
     }
   }
-  if (curMajor) suites.push({ major: curMajor, middles: curMiddles, minors: curMinors });
-  return suites;
+  flushMiddle();
+  return rows;
 }
 
 function updateTcIdPreview(input) {
+  // SuiteCode 모드: 같은 대분류(domIdx)에 속한 모든 미리보기 셀에 동일 코드 적용
   var code = input.value.trim().toUpperCase();
   var pcode = input.dataset.pcode || 'SC';
-  var idx = input.dataset.domain;
-  var preview = document.getElementById('tcIdPreview_' + idx);
-  if (preview) {
-    preview.textContent = code ? pcode + '-' + code + '-001' : '-';
+  // System Generated 모드면 사용자가 SuiteCode 바꿔도 ScreenCode 자동 적용이 우선 — 무시
+  if (window._autoScreenCode) return;
+  // 입력 input의 행을 기준으로, 다음 SuiteCode input(다음 대분류 행)을 만나기 전까지의 모든
+  // tcIdPreview_* 셀에 적용
+  var row = input.closest('tr');
+  if (!row || !row.parentNode) return;
+  var rows = Array.prototype.slice.call(row.parentNode.children);
+  var startIdx = rows.indexOf(row);
+  for (var i = startIdx; i < rows.length; i++) {
+    var r = rows[i];
+    if (i > startIdx && r.querySelector('input.suite-code-input')) break;  // 다음 대분류 시작 — 중단
+    var prev = r.querySelector('[id^="tcIdPreview_"]');
+    if (prev) prev.textContent = code ? pcode + '-' + code + '-001' : '-';
   }
 }
 
@@ -7947,19 +8116,43 @@ async function loadScreenCodeMap(projectName) {
   return _screenCodeMapLoading;
 }
 
-// Middle name → ScreenCode 프론트엔드 해석 (백엔드 resolve_screen_code와 동일 로직)
+// Middle name → ScreenCode 프론트엔드 해석 (백엔드 resolve_screen_code와 동일 규칙, v0.9.7b)
+// 규칙:
+//   - 1단어:     앞 3자
+//   - 2단어:     각 단어 앞 2자 연결
+//   - 3단어 이상: 앞 단어들 2자 + 마지막 단어 1자
+//   - 최대 8자 절단, 대문자화
+// 충돌 처리는 백엔드에서만 수행 — FE 미리보기는 기본 파생값만 표시.
 function resolveScreenCodeFE(middleName, screenMap) {
   if (!middleName) return 'SCR';
-  if (screenMap && screenMap[middleName]) return screenMap[middleName];
-  var alpha = middleName.replace(/[^A-Za-z]/g, '');
-  if (alpha.length >= 3) return alpha.substring(0, 3).toUpperCase();
-  // 해시 폴백 (간이 버전)
-  var h = 0;
-  for (var i = 0; i < middleName.length; i++) {
-    h = ((h << 5) - h) + middleName.charCodeAt(i);
-    h = h & h;
+  if (screenMap && screenMap[middleName]) {
+    var e = screenMap[middleName];
+    if (typeof e === 'object' && e) return e.code || 'SCR';
+    return e;
   }
-  return 'MID' + String(Math.abs(h) % 1000).padStart(3, '0');
+  var words = String(middleName).split(/[\s\-_]+/)
+    .map(function(w) { return w.replace(/[^A-Za-z]/g, ''); })
+    .filter(function(w) { return w.length > 0; });
+  if (words.length === 0) {
+    var h = 0;
+    for (var i = 0; i < middleName.length; i++) {
+      h = ((h << 5) - h) + middleName.charCodeAt(i);
+      h = h & h;
+    }
+    return 'MID' + String(Math.abs(h) % 1000).padStart(3, '0');
+  }
+  var base;
+  if (words.length === 1) {
+    base = words[0].substring(0, 3);
+  } else if (words.length === 2) {
+    base = words[0].substring(0, 2) + words[1].substring(0, 2);
+  } else {
+    // 3단어 이상: 앞 단어들 앞 2자 + 마지막 단어 앞 1자
+    var head = words.slice(0, -1).map(function(w) { return w.substring(0, 2); }).join('');
+    var tail = words[words.length - 1].substring(0, 1);
+    base = head + tail;
+  }
+  return base.substring(0, 8).toUpperCase();
 }
 
 // 중분류명 정제
@@ -8035,28 +8228,30 @@ function toggleAutoScreenCode(checkbox) {
 }
 
 function rerenderPreviewForRow(idx, auto) {
+  // A안: 행마다 단일 중분류. data-middle 속성 사용.
   var cell = document.getElementById('tcIdPreview_' + idx);
   if (!cell) return;
   var pcode = cell.dataset.pcode || 'SC';
   if (auto) {
-    // 중분류별 ScreenCode 나열
-    var middlesJson = cell.dataset.middles || '[]';
-    var middles = [];
-    try { middles = JSON.parse(middlesJson); } catch(e) {}
+    // ScreenCode 자동 — 중분류 이름으로 코드 파생
+    var mid = cell.dataset.middle || '';
     var mapData = (_screenCodeMap && _screenCodeMap.map) ? _screenCodeMap.map : {};
-    if (middles.length === 0) {
+    if (!mid) {
       cell.textContent = '-';
     } else {
-      var parts = middles.slice(0, 4).map(function(m) {
-        var code = resolveScreenCodeFE(m, mapData);
-        return pcode + '-' + code + '-001';
-      });
-      var suffix = middles.length > 4 ? ' ... (+' + (middles.length - 4) + ')' : '';
-      cell.textContent = parts.join(', ') + suffix;
+      var code = resolveScreenCodeFE(mid, mapData);
+      cell.textContent = pcode + '-' + code + '-001';
     }
   } else {
-    // Suite-based (수동): 입력 필드 값 사용
-    var input = document.querySelector('.suite-code-input[data-domain="' + idx + '"]');
+    // Suite-based (수동): 같은 행/그룹의 SuiteCode input 값 사용
+    // 행을 거슬러 올라가며 가장 가까운 SuiteCode input(같은 대분류 그룹) 검색
+    var row = cell.closest('tr');
+    var input = null;
+    while (row) {
+      input = row.querySelector('input.suite-code-input');
+      if (input) break;
+      row = row.previousElementSibling;
+    }
     var code = input ? input.value.trim().toUpperCase() : '';
     cell.textContent = code ? pcode + '-' + code + '-001' : '-';
   }
@@ -8097,33 +8292,59 @@ function renderGateViewer(mdText) {
     summaryHtml += '<div id="suiteCodeHelpNormal" style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code> ...</div>';
     summaryHtml += '<div id="suiteCodeHelpAuto" style="display:none;font-size:12px;color:#4B5563;margin-bottom:10px;">🤖 <strong>시스템 규칙 자동 적용</strong> — 각 중분류(화면)가 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">screen_code_map.md</code>에 등록된 ScreenCode로 자동 매핑됩니다.<br>예: Splash → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-SPL-001</code>, Login Options → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-LGI-001</code> ... (화면별 독립 001~)</div>';
     summaryHtml += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-    summaryHtml += '<tr style="background:#DBEAFE;"><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">시트명</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">SuiteCode</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">TC ID 미리보기</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">소분류</th></tr>';
+    summaryHtml += '<tr style="background:#DBEAFE;"><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">시트명 (Excel)</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">SuiteCode</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">TC ID 미리보기</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">대분류</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">중분류 (화면)</th><th style="padding:6px 8px;text-align:left;border:1px solid #93C5FD;">소분류</th></tr>';
+    // A안: 중분류별 행 분리 — Excel은 대분류별 시트로 묶이지만 표는 각 중분류 단위로 명시
+    // 같은 대분류 내에서 첫 행만 시트명/대분류 셀 표시 (rowspan), 그 외는 비워서 그룹 시각화
+    var prevMajor = null;
+    var groupCount = 0;
+    var totalMiddles = cats.length;
+    // 대분류별로 같은 시트 → SuiteCode는 대분류 단위 한 번만 입력 가능. 표에서 input은 첫 행에만.
+    // domain index는 대분류 인덱스 (시트 그룹) 기준
+    var majorIndex = -1;
+    var seenMajors = {};
     for (var ci = 0; ci < cats.length; ci++) {
       var c = cats[ci];
-      var majorClean = c.major.replace(/대분류[:\s]*/g, '').replace(/\(.*?\)/g, '').trim();
-      var firstMid = c.middles.length > 0 ? c.middles[0].replace(/중분류[:\s]*/g, '').replace(/\(.*?\)/g, '').trim() : '';
-      var sheetName = firstMid ? majorClean + '-' + firstMid : majorClean;
+      var majorClean = c.major;
+      var midClean = (c.middle || '').trim();
+      var minorList = (c.minors || []).filter(function(m){ return m && m.trim(); });
+      var minorText = minorList.length > 0
+        ? minorList.map(function(m){ return '• ' + m; }).join('<br>')
+        : '<span style="color:#9CA3AF;">(소분류 없음)</span>';
+
+      var isFirstOfMajor = !(majorClean in seenMajors);
+      if (isFirstOfMajor) {
+        majorIndex++;
+        seenMajors[majorClean] = majorIndex;
+      }
+      var domIdx = seenMajors[majorClean];
+
+      // 시트명: 대분류 = Excel 시트 단위
+      var sheetName = majorClean;
+      // SuiteCode 자동값: 대분류 영문 4자
       var autoCode = majorClean.replace(/[^A-Za-z]/g, '').toUpperCase().substring(0, 4);
-      if (firstMid) autoCode += '-' + firstMid.replace(/[^A-Za-z]/g, '').toUpperCase().substring(0, 4);
-      var midText = c.middles.length > 0 ? c.middles.join(', ') : '-';
-      var minText = c.minors.length > 0 ? c.minors.join(', ') : '-';
+      // TC ID 미리보기: ScreenCode 모드 → resolveScreenCodeFE(중분류명)
+      //                  Suite 모드 → SuiteCode 입력값 사용 (대분류 단위)
+      // 우선 기본 (ScreenCode 자동) 미리보기 표시
+      var screenCode = resolveScreenCodeFE(midClean, {});
+      var previewId = _pcode + '-' + screenCode + '-001';
+
       var bg = ci % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
-      var previewId = _pcode + '-' + autoCode + '-001';
-      // 중분류 정제 목록 (Auto 모드 미리보기용, data-middles에 JSON 저장)
-      var cleanedMiddles = c.middles.map(function(m){ return cleanMiddleName(m); }).filter(function(x){ return x; });
-      var middlesJson = JSON.stringify(cleanedMiddles).replace(/"/g, '&quot;');
       summaryHtml += '<tr style="background:' + bg + ';">';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:600;">' + sheetName + '</td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;"><input type="text" class="suite-code-input" data-domain="' + ci + '" data-pcode="' + _pcode + '" value="' + autoCode + '" placeholder="예: GNBF" oninput="updateTcIdPreview(this)" style="width:80px;padding:4px 6px;border:1.5px solid #93C5FD;border-radius:4px;font-size:12px;font-weight:700;text-transform:uppercase;font-family:monospace;"></td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-family:monospace;font-size:11px;color:#1D4ED8;" id="tcIdPreview_' + ci + '" data-pcode="' + _pcode + '" data-middles="' + middlesJson + '">' + previewId + '</td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + majorClean + '</td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + midText + '</td>';
-      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#666;">' + minText + '</td>';
+      // 시트명 — 같은 대분류의 첫 행에만 표시 (rowspan 비슷한 효과)
+      if (isFirstOfMajor) {
+        summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:700;color:#1E3A5F;">' + _escapeHtml(sheetName) + '</td>';
+        summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;"><input type="text" class="suite-code-input" data-domain="' + domIdx + '" data-pcode="' + _pcode + '" value="' + autoCode + '" placeholder="예: GNBF" oninput="updateTcIdPreview(this)" style="width:80px;padding:4px 6px;border:1.5px solid #93C5FD;border-radius:4px;font-size:12px;font-weight:700;text-transform:uppercase;font-family:monospace;"></td>';
+      } else {
+        summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#9CA3AF;font-size:11px;">↳ 동일 시트</td>';
+        summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#9CA3AF;">↳</td>';
+      }
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-family:monospace;font-size:11px;color:#1D4ED8;" id="tcIdPreview_' + ci + '" data-pcode="' + _pcode + '" data-middle="' + _escapeHtml(midClean) + '">' + previewId + '</td>';
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;">' + (isFirstOfMajor ? _escapeHtml(majorClean) : '<span style="color:#9CA3AF;">↳</span>') + '</td>';
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;font-weight:600;">' + _escapeHtml(midClean) + '</td>';
+      summaryHtml += '<td style="padding:5px 8px;border:1px solid #D1D5DB;color:#374151;line-height:1.5;">' + minorText + '</td>';
       summaryHtml += '</tr>';
     }
     summaryHtml += '</table>';
-    var totalMiddles = 0;
-    for (var mi = 0; mi < cats.length; mi++) totalMiddles += Math.max(cats[mi].middles.length, 1);
     var estMin = totalMiddles * 5;
     var estMax = totalMiddles * 15;
     summaryHtml += '<div style="margin-top:10px;padding:8px 12px;background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;font-size:12px;color:#166534;display:flex;align-items:center;gap:8px;">';
@@ -8132,18 +8353,29 @@ function renderGateViewer(mdText) {
     summaryHtml += '</div>';
     summaryHtml += '</div>';
   }
-  // SuiteCode 테이블은 Viewer 밖 독립 영역에 렌더링 (문서 업데이트해도 유지)
-  var suiteSection = document.getElementById('suiteCodeSection');
-  if (suiteSection && summaryHtml && !suiteSection.innerHTML) {
-    suiteSection.innerHTML = summaryHtml;
-    suiteSection.style.display = 'block';
+  // 메인 영역(Viewer = gateViewer)에는 통합 표 + 분류표 헤더 표시 (옵션 A — 표 중심)
+  var headerLine = '<div style="font-size:13px;color:var(--muted);margin-bottom:10px;">📋 분류표 결과 — 채팅으로 수정하거나 SuiteCode를 입력한 후 승인하세요.</div>';
+  var fallbackHtml = '';
+  if (!summaryHtml) {
+    // 표를 만들 수 없으면 raw 마크다운을 즉시 보여주기 (토글 안 해도 보이게)
+    fallbackHtml = '<div style="padding:14px; background:#FEF3C7; border:1px solid #FCD34D; border-radius:8px; font-size:12px; color:#92400E; margin-bottom:10px;">⚠️ 분류표 구조 자동 인식 실패 — 아래 원본 문서를 확인하시거나, AI에게 "표 형식으로 다시 정리해줘"로 요청하세요.</div>';
+    fallbackHtml += '<pre style="margin:0; padding:14px; background:#FAFAFA; border:1px solid #E5E7EB; border-radius:6px; font-size:12px; line-height:1.7; max-height:400px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">' + _escapeHtml(mdText) + '</pre>';
   }
-  viewer.innerHTML = mdToHtml(mdText);
+  viewer.innerHTML = headerLine + (summaryHtml || fallbackHtml);
   viewer.classList.add('gate-doc-updated');
   setTimeout(() => viewer.classList.remove('gate-doc-updated'), 700);
-  var badge = document.getElementById('gateViewerBadge');
-  if (badge) {
-    badge.textContent = '최근 업데이트: ' + new Date().toLocaleTimeString();
+
+  // 원본 마크다운은 토글 영역(rawDocContent)에 별도 렌더 — 펼쳐진 상태일 때만 사용자가 봄
+  var rawCell = document.getElementById('rawDocContent');
+  if (rawCell) rawCell.textContent = mdText;
+  var rawBadge = document.getElementById('rawDocBadge');
+  if (rawBadge) rawBadge.textContent = '최근 업데이트: ' + new Date().toLocaleTimeString();
+
+  // 레거시: suiteCodeSection은 더 이상 사용하지 않지만 안전상 비워둠
+  var suiteSection = document.getElementById('suiteCodeSection');
+  if (suiteSection) {
+    suiteSection.innerHTML = '';
+    suiteSection.style.display = 'none';
   }
 }
 
@@ -8197,7 +8429,6 @@ async function sendGateChat() {
       // 문서 업데이트
       document.getElementById('gateContent').value = d.updated_doc;
       renderGateViewer(d.updated_doc);
-      renderDomainChecklist(d.updated_doc);
       // 히스토리 추가 (컨텍스트 유지용 — 축약 버전)
       gateChatHistory.push({ role: 'user', content: '요청: ' + msg });
       gateChatHistory.push({ role: 'assistant', content: d.reply });
@@ -8272,14 +8503,9 @@ async function approveGate() {
     suiteCodeList.push(suiteCodeInputs[i].value.trim().toUpperCase().replace(/^-+|-+$/g, ''));
   }
 
-  // 선택된 도메인 수집
-  const selectedDomains = getSelectedDomains();
-  const allCount = document.querySelectorAll('#domainChecklist input[type=checkbox]').length;
-  const selCount = selectedDomains ? selectedDomains.length : allCount;
-
-  if (selectedDomains && selectedDomains.length === 0) {
-    alert('TC를 생성할 도메인을 하나 이상 선택하세요.'); return;
-  }
+  // 대분류 선택 UI는 제거됨 — 범위 제한은 Step 1의 "TC 생성 범위"(focus_area)로 일원화
+  // selected_domains는 항상 null(=전체) 전송. 백엔드 하위 호환 유지.
+  const selectedDomains = null;
 
   const approveBtn = document.querySelector('#card3 .btn-success');
   approveBtn.disabled = true;
@@ -8291,9 +8517,7 @@ async function approveGate() {
   } else {
     codeMsg = suiteCodeList.length > 0 ? ' (SuiteCode: ' + suiteCodeList.join(', ') + ')' : '';
   }
-  const scopeMsg = selectedDomains
-    ? selCount + '개 도메인 범위로 TC를 생성합니다.' + codeMsg + ' 계속할까요?'
-    : '전체 도메인(' + allCount + '개)으로 TC를 생성합니다.' + codeMsg + ' 계속할까요?';
+  const scopeMsg = '분류표 전체 범위로 TC를 생성합니다.' + codeMsg + ' 계속할까요?';
   if (!confirm(scopeMsg)) {
     approveBtn.disabled = false;
     approveBtn.textContent = '✅ 승인 및 TC 생성 시작';
@@ -8313,12 +8537,12 @@ async function approveGate() {
     });
     const data = await resp.json();
     if (data.ok) {
+      // Gate 닫고 파이프라인 카드로 복귀 — 이후 TC 작성/빌드 로그는 card2에서 계속 표시
       document.getElementById('card3').classList.add('hidden');
-      document.getElementById('card4').classList.remove('hidden');
-      const label = selectedDomains ? selCount + '개 도메인 TC 작성 중...' : 'TC 작성 중...';
-      document.getElementById('tcStageLabel').textContent = label;
+      document.getElementById('card2').classList.remove('hidden');
+      document.getElementById('stageLabel').textContent = 'TC 작성 시작...';
       setStepBar(4);
-      document.getElementById('card4').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } else {
       alert('승인 오류: ' + data.error);
       approveBtn.disabled = false;
@@ -8354,7 +8578,7 @@ async function stopPipeline() {
 }
 
 function setStopButtonsDisabled(disabled) {
-  ['stopBtn2', 'stopBtn3', 'stopBtn4'].forEach(id => {
+  ['stopBtn2', 'stopBtn3'].forEach(id => {
     const btn = document.getElementById(id);
     if (btn) btn.disabled = disabled;
   });
