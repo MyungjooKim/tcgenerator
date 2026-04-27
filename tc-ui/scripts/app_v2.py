@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.9"
+APP_VERSION         = "v0.9.10"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "Excel 출력 옵션 (Full / Light / Custom)"
+APP_VERSION_TAGLINE = "tc-rules.md 컷오프 제거 — TC 품질 개선"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 Human Gate에서 Excel 출력 옵션 선택 — 📦 Full Set / 🪶 Light / 🛠 Custom 3가지 프리셋",
-    "🪶 Light 모드 — TC 전체 목록만 (표지·통계·Smoke·Traceability 제외) 빠른 중간 산출물",
-    "🛠 Custom 모드 — 6개 시트 개별 체크박스로 정밀 제어 (TC 목록은 필수 고정)",
-    "💾 마지막 선택 localStorage에 자동 저장 → 다음 진입 시 복원",
-    "🔁 v0.9.8g 파이프라인 중단 fix / v0.9.8f card1 누수 fix 모두 포함",
+    "🐛 tc-rules.md (28,540자) 가 AI 에게 첫 8,000자 (28%) 만 전달되던 문제 fix",
+    "🆕 원칙 D (시각 속성 통합) / Splash 10개 이상 금지 / TC 카테고리 비율 등이 이제 AI에게 전달됨",
+    "🆕 단일 화면 입력 시 디자인 TC 폭주 (예: email 만 입력 → 30~50개 TC) 방지 효과 기대",
+    "📐 신규 TC 작성(8000→전체) + 수정 영향도 분석(4000→전체) + TC 수정 적용(4000→전체) 3곳 fix",
+    "🔁 v0.9.9 Excel 출력 옵션 / v0.9.8g 파이프라인 중단 fix 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -1548,7 +1548,7 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 
 ## TC 작성 규칙
 
-{tc_rules[:8000] if tc_rules else "표준 TC 형식을 따릅니다."}
+{tc_rules if tc_rules else "표준 TC 형식을 따릅니다."}
 {policy_section}{fewshot_section}
 ## 분류표
 {classification[:10000]}
@@ -3523,7 +3523,7 @@ TC 형식 규칙:
 - bold heading (### **SC-XXX-YYY-NNN**) = 최소 TC
 - plain heading (### SC-XXX-YYY-NNN) = 일반 TC
 
-{tc_rules[:4000] if tc_rules else ""}"""
+{tc_rules if tc_rules else ""}"""
 
         user_impact = f"""## 기존 TC ({tc_count_before}개)
 
@@ -3591,7 +3591,7 @@ TC 형식 규칙:
 - Given(사전 조건)은 번호 매긴 목록
 - 전체 TC의 약 35%가 최소 TC여야 함
 
-{tc_rules[:4000] if tc_rules else ""}"""
+{tc_rules if tc_rules else ""}"""
 
         user_modify = f"""## 수정 지시사항
 
