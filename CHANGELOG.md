@@ -9,6 +9,40 @@
 
 ---
 
+## v0.9.8b — 2026-04-27 (헤더 서버 재시작 버튼)
+
+> **요약**: 코드 변경 후 매번 터미널로 가서 Ctrl+C → 재실행하던 번거로움 해소. 헤더에서 클릭 한 번으로 서버 재시작 + 자동 새로고침.
+
+### ✨ 신규 기능
+
+- **헤더 우측 `🔄 서버 재시작` 버튼** — 코드 변경 사항을 즉시 반영해야 할 때 한 번에 처리.
+  - 클릭 → confirm 다이얼로그 → 재시작 요청 전송 → 진행 오버레이 표시
+  - 백엔드는 `os.execv(sys.executable, [sys.executable] + sys.argv)` 로 자기 자신 재실행
+  - 프론트는 `/admin/status` 폴링으로 서버 살아남 감지 → 자동 `window.location.reload()`
+  - 폴링 최대 30초 (그 이후엔 사용자에게 수동 새로고침 안내)
+
+### 🛡 보안 / 안전장치
+
+- **localhost 가드** — `request.remote_addr` 가 `127.0.0.1` / `::1` / `localhost` 가 아니면 403 반환. 같은 LAN의 다른 PC에서 재시작 호출 차단.
+- **활성 세션 보호** — `parsing/inventory/classifying/policy_features/tc_writing/reviewing/building/analyzing` 상태인 세션이 1개 이상이면 기본 거부 (409 응답). 프론트에서 활성 세션 개수를 표시하고 사용자가 다시 한 번 confirm하면 `force=1` 으로 재요청.
+- **응답 → 재시작 순서** — 응답을 먼저 보내고 1.2초 후 백그라운드 스레드에서 `os.execv` 호출. 클라이언트가 "재시작 시작됨" 응답을 정상 수신하도록 보장.
+
+### 🆕 새 엔드포인트
+
+| 경로 | 메서드 | 용도 |
+|---|---|---|
+| `/admin/status` | GET | 살아있음 확인 + 버전 + 활성 세션 수 (폴링용) |
+| `/admin/restart` | POST | 서버 재시작 (localhost + 활성 세션 가드) |
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.8b 갱신, `_ACTIVE_STATUSES` 상수 + `_count_active_sessions` / `_is_localhost_request` 헬퍼, `/admin/status` + `/admin/restart` 엔드포인트, 헤더에 `btn-restart-server` 버튼 + `restartOverlay` HTML, `restartServer()` + `pollServerAlive()` JS, `window._INITIAL_APP_VERSION` 노출 |
+| `CHANGELOG.md` | v0.9.8b 섹션 추가 |
+
+---
+
 ## v0.9.8a — 2026-04-27 (TC 분류 요약 접기 기능 추가)
 
 > **요약**: v0.9.8 직후 합류 — 분류 검토 화면에서 TC 분류 요약 카드 자체를 접기/펼치기 가능하도록 개선

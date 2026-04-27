@@ -53,16 +53,15 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8a"
+APP_VERSION         = "v0.9.8b"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "입력 소스 일괄 삭제 + Sticky AI 입력바 + TC 분류 요약 접기"
+APP_VERSION_TAGLINE = "헤더 서버 재시작 버튼 + 안전장치"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 입력 소스 2개 이상일 때 '🗑 전체 삭제' 버튼 노출 — 한 번에 정리 가능",
-    "🆕 분류 검토(Step 3) 화면에서 표를 길게 스크롤해도 하단에 떠 있는 'AI 수정 요청' 입력바로 즉시 요청 가능",
-    "🆕 TC 분류 요약 표 접기/펼치기 기능 — 헤더 클릭 시 토글 (기본 펼침). 분류표 원본 마크다운 토글과 동일 패턴",
-    "🪟 Floating 입력바는 메인 채팅창이 화면 밖일 때만 노출되며, ▾ 버튼으로 최소화 가능",
-    "🔁 v0.9.7c의 소분류 중복 자동 차별화 / 버전 SSOT 모두 포함",
+    "🆕 헤더 우측에 '🔄 서버 재시작' 버튼 — 코드 변경 후 클릭 한 번으로 재시작 + 자동 새로고침",
+    "🛡 보안: localhost 요청만 허용 (LAN 차단), 활성 세션 있으면 강한 경고 후 force=1 필요",
+    "🪟 재시작 진행 중 전체화면 오버레이 + 서버 살아남 자동 폴링 (최대 30초)",
+    "🔁 v0.9.8a의 입력 소스 전체 삭제 / Sticky AI 입력바 / TC 분류 요약 접기 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -3700,6 +3699,72 @@ def index():
     )
 
 
+# ── 관리자 엔드포인트 ─────────────────────────────────────────────────────────
+# 활성 세션으로 간주되는 status (이 외에는 종료/대기 상태로 봄)
+_ACTIVE_STATUSES = {
+    "parsing", "inventory", "classifying", "policy_features",
+    "tc_writing", "reviewing", "building", "analyzing",
+}
+
+def _count_active_sessions() -> int:
+    return sum(1 for s in SESSIONS.values() if s.get("status") in _ACTIVE_STATUSES)
+
+def _is_localhost_request() -> bool:
+    """요청이 로컬호스트(127.0.0.1 / ::1)에서 왔는지 검사."""
+    addr = request.remote_addr or ""
+    return addr in ("127.0.0.1", "::1", "localhost")
+
+
+@app.route("/admin/status", methods=["GET"])
+def admin_status():
+    """서버 살아있음 + 버전 + 활성 세션 수 (재시작 폴링용)."""
+    return jsonify({
+        "ok": True,
+        "version": APP_VERSION,
+        "active_sessions": _count_active_sessions(),
+        "localhost": _is_localhost_request(),
+    })
+
+
+@app.route("/admin/restart", methods=["POST"])
+def admin_restart():
+    """서버 자기 자신을 재시작 (os.execv).
+    보안:
+      - localhost 요청만 허용
+      - 활성 세션 있으면 ?force=1 로 강제 가능
+    """
+    # 1) localhost 가드 (LAN 다른 PC 차단)
+    if not _is_localhost_request():
+        return jsonify({"ok": False, "error": "재시작은 로컬에서만 허용됩니다."}), 403
+
+    # 2) 활성 세션 가드
+    force = (request.args.get("force", "0") == "1") or \
+            (request.get_json(silent=True) or {}).get("force") is True
+    active = _count_active_sessions()
+    if active > 0 and not force:
+        return jsonify({
+            "ok": False,
+            "error": "active_sessions",
+            "active_sessions": active,
+            "message": f"진행 중인 세션이 {active}개 있습니다. 정말 재시작하려면 force=1 로 다시 요청하세요.",
+        }), 409
+
+    # 3) 응답을 먼저 보내고 백그라운드에서 실제 재시작 (1.2초 후 os.execv)
+    def _do_restart():
+        try:
+            time.sleep(1.2)  # 응답 도달 시간 확보
+        finally:
+            # 현재 인터프리터 + 동일 인자로 자기 자신 재실행
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return jsonify({
+        "ok": True,
+        "message": "서버 재시작 중... 약 3~5초 후 자동 재연결됩니다.",
+        "delay_sec": 1.2,
+    })
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     if "file" not in request.files:
@@ -5210,6 +5275,36 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
   header .header-sub { font-size: 13px; opacity: 0.7; margin-left: auto; }
   .version-badge { font-size: 11px; font-weight: 600; color: #FF8C00; letter-spacing: 0.3px; }
+  /* 헤더 우측 서버 재시작 버튼 */
+  .btn-restart-server {
+    padding: 6px 12px; border-radius: 6px;
+    background: rgba(255,255,255,0.10); color: #FFFFFF;
+    border: 1px solid rgba(255,255,255,0.30);
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    transition: all 0.15s; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .btn-restart-server:hover {
+    background: rgba(239, 68, 68, 0.85); border-color: #EF4444;
+  }
+  .btn-restart-server:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* 재시작 진행 오버레이 */
+  .restart-overlay {
+    position: fixed; inset: 0; z-index: 10000;
+    background: rgba(15, 23, 42, 0.85); color: #FFFFFF;
+    display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px; text-align: center; padding: 24px;
+  }
+  .restart-overlay.visible { display: flex; }
+  .restart-overlay-spinner {
+    width: 56px; height: 56px; border: 4px solid rgba(255,255,255,0.25);
+    border-top-color: #FFFFFF; border-radius: 50%;
+    animation: restartSpin 0.9s linear infinite;
+  }
+  @keyframes restartSpin { to { transform: rotate(360deg); } }
+  .restart-overlay-title { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+  .restart-overlay-msg { font-size: 14px; opacity: 0.85; max-width: 480px; line-height: 1.6; }
+  .restart-overlay-status { font-size: 12px; opacity: 0.7; font-family: monospace; }
 
   /* 진행 스텝 바 */
   .steps-bar {
@@ -5793,7 +5888,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="version-badge" style="cursor:pointer;" onclick="showWhatsNew()" title="{{ app_version }} 릴리즈 노트 보기">{{ app_version }}</span>
   </div>
   <span class="header-sub">Claude AI · PDF / URL / 텍스트 → Excel</span>
+  <button type="button" class="btn-restart-server" id="btnRestartServer" onclick="restartServer()" title="코드 변경 반영을 위해 서버를 재시작합니다 (로컬에서만)">
+    🔄 서버 재시작
+  </button>
 </header>
+
+<!-- 서버 재시작 진행 오버레이 -->
+<div id="restartOverlay" class="restart-overlay">
+  <div class="restart-overlay-spinner"></div>
+  <div class="restart-overlay-title">서버 재시작 중...</div>
+  <div class="restart-overlay-msg">
+    잠시만 기다려주세요. 서버가 다시 살아나면 자동으로 새로고침됩니다.<br>
+    <span style="font-size:12px;opacity:0.8;">5~10초가 지나도 새로고침되지 않으면 직접 페이지를 새로고침해 주세요.</span>
+  </div>
+  <div class="restart-overlay-status" id="restartOverlayStatus">서버 응답 대기 중...</div>
+</div>
 
 <!-- What's new 배너 ({{ app_version }} 첫 방문 시 자동 표시, localStorage로 dismiss 기억) -->
 <div id="whatsNewBanner" style="display:none; margin:12px 0; padding:12px 16px; background:linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%); border:1px solid #93C5FD; border-radius:10px;">
@@ -7525,6 +7634,8 @@ if (typeof document !== 'undefined') {
 // v0.9.6 What's New 배너 표시 — localStorage에 dismiss 기록이 없으면 자동 표시
 const _WHATS_NEW_VERSION = '{{ app_version }}';
 const _WHATS_NEW_KEY = 'tc_whatsnew_dismissed_' + _WHATS_NEW_VERSION;
+// 서버 재시작 후 버전 비교용
+window._INITIAL_APP_VERSION = '{{ app_version }}';
 
 function checkWhatsNewBanner() {
   try {
@@ -9012,6 +9123,89 @@ function showToast(msg, type = 'success') {
   const t = document.getElementById('toast');
   t.textContent = msg; t.className = type; t.style.display = 'block';
   setTimeout(() => t.style.display = 'none', 3000);
+}
+
+// ── 서버 재시작 (헤더 버튼) ──
+async function restartServer() {
+  const btn = document.getElementById('btnRestartServer');
+  const overlay = document.getElementById('restartOverlay');
+  const status = document.getElementById('restartOverlayStatus');
+
+  // 1) 활성 세션 확인 (사전 체크)
+  let activeSessions = 0;
+  try {
+    const r = await fetch('/admin/status');
+    const d = await r.json();
+    activeSessions = d.active_sessions || 0;
+  } catch (_) {}
+
+  // 2) confirm 다이얼로그 (활성 세션 있으면 강한 경고)
+  let msg = '서버를 재시작하시겠습니까?\n\n';
+  msg += '• 코드 변경사항이 반영됩니다.\n';
+  msg += '• 진행 중인 SSE 연결이 모두 끊깁니다.\n';
+  if (activeSessions > 0) {
+    msg = '⚠️ 진행 중인 작업이 ' + activeSessions + '개 있습니다!\n\n';
+    msg += '재시작하면 진행 중인 TC 생성이 모두 중단되며,\n';
+    msg += '복원이 어려울 수 있습니다.\n\n';
+    msg += '정말 재시작하시겠습니까?';
+  }
+  if (!confirm(msg)) return;
+
+  // 3) 재시작 요청 (활성 세션이 있으면 force=1)
+  btn.disabled = true;
+  overlay.classList.add('visible');
+  status.textContent = '재시작 요청 전송 중...';
+
+  try {
+    const url = '/admin/restart' + (activeSessions > 0 ? '?force=1' : '');
+    const r = await fetch(url, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) {
+      overlay.classList.remove('visible');
+      btn.disabled = false;
+      alert('재시작 실패: ' + (d.message || d.error || 'unknown error'));
+      return;
+    }
+  } catch (e) {
+    // 네트워크 오류 — 이미 서버가 죽었을 수 있음 (정상 흐름)
+    status.textContent = '서버가 종료되었습니다. 살아나길 기다리는 중...';
+  }
+
+  // 4) 서버 살아남 폴링 → 새 버전이면 reload
+  pollServerAlive();
+}
+
+// 서버가 다시 살아날 때까지 폴링 (최대 30초)
+async function pollServerAlive() {
+  const status = document.getElementById('restartOverlayStatus');
+  const startedAt = Date.now();
+  const maxMs = 30 * 1000;
+  let attempt = 0;
+  const initialVersion = window._INITIAL_APP_VERSION || '';
+
+  while (Date.now() - startedAt < maxMs) {
+    attempt++;
+    status.textContent = '서버 응답 확인 중... (시도 ' + attempt + ')';
+    try {
+      const r = await fetch('/admin/status', { cache: 'no-store' });
+      if (r.ok) {
+        const d = await r.json();
+        const newVersion = d.version || '';
+        // 버전이 바뀌었거나 동일해도 살아있음 → reload
+        status.textContent = '✅ 서버 응답 감지: ' + newVersion + ' — 새로고침합니다.';
+        await new Promise(r => setTimeout(r, 600));
+        // 강제 reload (캐시 우회)
+        window.location.reload();
+        return;
+      }
+    } catch (_) {
+      // 아직 죽어있음 — 계속 폴링
+    }
+    await new Promise(r => setTimeout(r, 800));
+  }
+
+  // 30초 초과 → 사용자에게 수동 새로고침 요청
+  status.textContent = '⚠️ 30초 동안 응답 없음. 직접 새로고침해 주세요.';
 }
 
 // ── Sticky Floating AI 입력바: card3 노출 + 메인 입력창이 화면 밖일 때만 표시 ──
