@@ -3749,19 +3749,27 @@ def admin_restart():
             "message": f"진행 중인 세션이 {active}개 있습니다. 정말 재시작하려면 force=1 로 다시 요청하세요.",
         }), 409
 
-    # 3) 응답을 먼저 보내고 백그라운드에서 실제 재시작 (1.2초 후 os.execv)
+    # 3) 응답을 먼저 보내고 백그라운드에서 실제 재시작 (1.5초 후 os.execv)
     def _do_restart():
         try:
-            time.sleep(1.2)  # 응답 도달 시간 확보
+            time.sleep(1.5)  # 응답 도달 시간 확보
         finally:
+            # listen socket 명시적 close — 새 프로세스만 incoming connection 처리하도록
+            try:
+                sk = getattr(app, "_listen_sock", None)
+                if sk is not None:
+                    sk.close()
+            except Exception:
+                pass
             # 현재 인터프리터 + 동일 인자로 자기 자신 재실행
+            # SO_REUSEADDR 가 활성화되어 있어 새 프로세스도 즉시 bind 가능
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
     threading.Thread(target=_do_restart, daemon=True).start()
     return jsonify({
         "ok": True,
         "message": "서버 재시작 중... 약 3~5초 후 자동 재연결됩니다.",
-        "delay_sec": 1.2,
+        "delay_sec": 1.5,
     })
 
 
@@ -9330,4 +9338,33 @@ if __name__ == "__main__":
             print("   SAMPLE PDF : ⚠️  생성 실패 (fpdf2 확인)")
     except Exception as _e:
         print(f"   SAMPLE PDF : ⚠️  {_e}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    # ── SO_REUSEADDR/SO_REUSEPORT 활성화 + listen socket 캡처 (자기 재시작 지원) ──
+    # 문제 1: 기본 소켓은 os.execv 후 새 프로세스가 'Address already in use' 로 즉시 bind 실패
+    #         → SO_REUSEADDR/SO_REUSEPORT 활성화로 해결
+    # 문제 2: execv 후에도 옛 listen socket fd가 살아있어서 OS가 connection을 임의로 두 fd 중 하나에
+    #         배분 → 옛 fd로 가면 처리 안 됨
+    #         → execv 직전에 우리 listen socket 을 명시적 close 해야 함 → app._listen_sock 캡처
+    import socket as _socket_mod
+    from werkzeug.serving import BaseWSGIServer as _BWS
+    _orig_server_bind = _BWS.server_bind
+    def _patched_server_bind(self):
+        # bind 직전에 SO_REUSEADDR/SO_REUSEPORT 강제 활성화
+        try:
+            self.socket.setsockopt(_socket_mod.SOL_SOCKET, _socket_mod.SO_REUSEADDR, 1)
+        except OSError:
+            pass
+        if hasattr(_socket_mod, "SO_REUSEPORT"):
+            try:
+                self.socket.setsockopt(_socket_mod.SOL_SOCKET, _socket_mod.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        result = _orig_server_bind(self)
+        # 자기 재시작 핸들러가 close 할 수 있도록 listen socket 캡처
+        try:
+            app._listen_sock = self.socket
+        except Exception:
+            pass
+        return result
+    _BWS.server_bind = _patched_server_bind
+    # 일반 app.run 사용 — patched bind 가 자동 적용됨
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True, use_reloader=False)
