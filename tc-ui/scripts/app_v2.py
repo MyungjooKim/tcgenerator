@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.12"
+APP_VERSION         = "v0.9.13"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "메인 채팅 정리 + 다국어 + 모달 리사이즈"
+APP_VERSION_TAGLINE = "화면 코드 → 입력 소스 기반 추출 (환각 차단)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 상단 메인 채팅 패널 시각적 제거 — 미니/모달 채팅이 단일 UI (DOM 은 단일 진실 소스로 유지)",
-    "🌍 다국어 placeholder 자동 감지 — 한/영/일/중 4개 언어 (브라우저 언어 기반)",
-    "🛠 setStickyAiLang('en') 등으로 수동 변경 가능 (localStorage 영속)",
-    "📐 모달 사용자 리사이즈 — 우측 하단 모서리 드래그 (CSS resize 네이티브, 크기 자동 저장)",
-    "🔁 v0.9.11 미니 채팅 패널 / v0.9.10 tc-rules.md 컷오프 제거 모두 포함",
+    "🐛 동료 보고: TC 와 화면 코드가 상이한 문제 근본 fix",
+    "🆕 화면 코드는 입력 소스 자체에서 추출 (파일명 / H1 / 본문 순)",
+    "🛡 AI 환각/자동 파생 차단 — 입력 소스에 SCR 식별자 없으면 화면 코드 컬럼 빈 칸",
+    "💡 Step 3 진입 시 SCR 매핑 안내 노출 (발견된 매핑 또는 빈 칸 정책 안내)",
+    "🔁 TC ID 형식 (SM-LG-001) 변경 없음 / v0.9.12 다국어·모달 리사이즈 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -586,10 +586,48 @@ def step_parse(sess: dict, input_type: str, content: str) -> str:
     return step_parse_sources(sess, [{"type": input_type, "content": content}])
 
 
+def extract_scr_from_source(filename: str, content: str) -> str:
+    """입력 소스에서 화면 식별자(SCR-NNN[A]) 추출 — Phase 1 단순 패턴.
+
+    우선순위:
+      1) 파일명 매칭: SCR-003.md → 'SCR-003'
+      2) 본문 H1 첫 줄: '# SCR-003: ...' → 'SCR-003'
+      3) 본문 첫 번째 패턴 등장
+      4) 위 모두 실패 → '' (빈 문자열, AI 환각/추측 금지)
+    """
+    pattern = re.compile(r'SCR-\d+[A-Z]?')
+
+    # 1) 파일명
+    if filename:
+        m = pattern.search(filename)
+        if m:
+            return m.group(0)
+
+    if not content:
+        return ''
+
+    # 2) H1 첫 줄
+    first_line = content.lstrip().split('\n', 1)[0] if content.lstrip() else ''
+    if first_line.startswith('#'):
+        m = pattern.search(first_line)
+        if m:
+            return m.group(0)
+
+    # 3) 본문 첫 번째 등장
+    m = pattern.search(content)
+    if m:
+        return m.group(0)
+
+    # 4) 폴백
+    return ''
+
+
 def step_parse_sources(sess: dict, sources: list) -> str:
     """복수 소스를 각각 파싱한 뒤 하나의 텍스트로 합친다."""
     parts = []
     total = len(sources)
+    # 입력 소스의 SCR 식별자 매핑 — TC 작성 단계에서 AI 에게 전달됨
+    sess["_source_scr_map"] = {}  # {filename: scr_id}
     for i, src in enumerate(sources, 1):
         src_type = src.get("type", "text")
         content  = src.get("content", "").strip()
@@ -618,6 +656,11 @@ def step_parse_sources(sess: dict, sources: list) -> str:
             text = md_path.read_text(encoding="utf-8")
             label = f"📝 마크다운: {content}"
             push_log(sess, f"[파싱] 마크다운 읽기 완료 ({len(text):,}자)")
+            # SCR 식별자 추출 (마크다운 입력만 우선 적용)
+            scr_id = extract_scr_from_source(content, text)
+            if scr_id:
+                sess["_source_scr_map"][content] = scr_id
+                push_log(sess, f"[파싱] 화면 식별자 발견: {content} → {scr_id}")
         else:
             text  = content
             label = "✏️ 텍스트 입력"
@@ -628,6 +671,11 @@ def step_parse_sources(sess: dict, sources: list) -> str:
     raw_text = "\n\n".join(parts)
     parsed_path = sess["workspace"] / "01_parsed.md"
     parsed_path.write_text(f"# 파싱 결과\n\n{raw_text}", encoding="utf-8")
+    # SCR 매핑 요약 로그
+    if sess["_source_scr_map"]:
+        push_log(sess, f"[파싱] 입력 소스 화면 식별자 매핑: {len(sess['_source_scr_map'])}개")
+    else:
+        push_log(sess, "[파싱] 입력 소스에서 화면 식별자(SCR-NNN) 미발견 — 화면 코드 컬럼은 빈 칸으로 출력됩니다")
     return raw_text
 
 
@@ -1250,7 +1298,12 @@ def extract_section_from_raw(raw_text: str, middle_name: str,
 def step_gate(sess: dict, classification: str):
     push_log(sess, "[GATE] 분류표 검토 대기 중... 사용자 승인 필요")
     sess["status"] = "gate_waiting"
-    push(sess, "gate", {"content": classification})
+    # 입력 소스 SCR 매핑도 함께 전달 — 프론트의 Gate UI에서 안내문 노출
+    _scr_map = sess.get("_source_scr_map") or {}
+    push(sess, "gate", {
+        "content": classification,
+        "source_scr_map": _scr_map,
+    })
     # 사용자 승인까지 블로킹
     sess["gate_event"].wait()
     approved_content = sess["approved"]
@@ -1419,6 +1472,8 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
                 # 섹션을 못 찾으면 features_text로 폴백
 
             # 중분류 단위 프롬프트 — 해당 중분류에 집중, effective_code & starting_seq & 성격 & 네비 전달
+            # 입력 소스 SCR 매핑 (v0.9.13~) — AI 가 화면 코드 환각 안 하도록 명시적 주입
+            _scr_map = sess.get("_source_scr_map") or {}
             if middle != "전체":
                 domain_with_middle = dict(domain)
                 domain_with_middle["_focus_middle"] = middle
@@ -1427,7 +1482,8 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
                                             project_name, approved_classification,
                                             starting_seq=starting_seq,
                                             screen_character=screen_character,
-                                            screen_navigation=screen_navigation)
+                                            screen_navigation=screen_navigation,
+                                            source_scr_map=_scr_map)
             else:
                 domain_copy = dict(domain)
                 domain_copy["suite_code"] = effective_code
@@ -1435,7 +1491,8 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
                                             project_name, approved_classification,
                                             starting_seq=starting_seq,
                                             screen_character=screen_character,
-                                            screen_navigation=screen_navigation)
+                                            screen_navigation=screen_navigation,
+                                            source_scr_map=_scr_map)
 
             try:
                 tc_draft = call_claude(system, user, max_tokens=16000)
@@ -2058,7 +2115,8 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
                           project_name: str, classification: str,
                           starting_seq: int = 1,
                           screen_character: str = "",
-                          screen_navigation: str = "") -> str:
+                          screen_navigation: str = "",
+                          source_scr_map: dict | None = None) -> str:
     # 해당 도메인의 분류 섹션 추출
     domain_section = extract_domain_section(classification, domain["code"])
     project_code = _detect_project_code(project_name)
@@ -2144,29 +2202,67 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 다른 중분류의 TC는 작성하지 마세요. "{focus_middle}" 중분류의 모든 소분류에 대해 빠짐없이 작성하세요.
 """
 
-    # 중분류 이름으로부터 관련 화면 코드(SCR-xxx / SCREEN-xxx / PAGE-xxx) 자동 탐지
-    # features_text(원문 섹션 발췌 or features 전체)에서 중분류 이름 근처의 화면 코드를 찾는다.
+    # 화면 코드는 입력 소스 자체에서 추출 (v0.9.13~)
+    # 우선순위:
+    #   1) source_scr_map: step_parse_sources 가 파일명/H1/본문에서 미리 뽑은 매핑 — 가장 정확
+    #   2) _detect_screen_codes_for_middle: features_text 에서 중분류 이름 근처 SCR 패턴 탐색 (보조)
+    #   3) 둘 다 없으면 → 빈 칸 명시 (AI 환각 금지)
     screen_code_hint = ""
     if focus_middle:
+        # source_scr_map 에서 입력 파일별 매핑이 있으면 모두 안내 — AI 가 본문 컨텍스트로 해당 TC 의 SCR 결정
+        scr_table_lines = []
+        if source_scr_map:
+            for fn, scr in source_scr_map.items():
+                scr_table_lines.append(f"| {fn} | {scr} |")
+
         detected = _detect_screen_codes_for_middle(focus_middle, features_text)
-        if detected:
+
+        if scr_table_lines:
+            scr_table = "\n".join(scr_table_lines)
+            primary_example = list(source_scr_map.values())[0]
+            screen_code_hint = f"""
+## 📱 화면 코드 매핑 (입력 소스 기반 — 반드시 준수)
+
+이 분류표는 다음 입력 소스에서 추출되었습니다. 각 TC 의 `| 연관 화면 |` 필드에는 **해당 TC 가 어느 입력 소스에서 나왔는지 기준으로** 아래 매핑 표의 화면 코드를 정확히 사용하세요:
+
+| 입력 소스 파일 | 화면 코드 |
+|---|---|
+{scr_table}
+
+⚠️ **규칙**:
+1. 각 TC 메타 테이블에 `| 연관 화면 | SCR-NNN |` 형식 정확히 사용 (예: `| 연관 화면 | {primary_example} |`)
+2. 화면명 없이 코드만: "SCR-001" ✅ / "Splash (SCR-001)" ❌
+3. 한 TC 가 여러 화면에 걸치면 쉼표 구분: `SCR-001, SCR-003`
+4. **임의 코드 생성 금지**: 위 매핑 표에 없는 화면 코드(예: SCR-999, LGI, ABC)는 절대 만들지 마세요
+5. **해당 TC 의 출처 입력 소스에 화면 코드가 매핑돼 있지 않으면 `| 연관 화면 |` 필드를 비워두세요** (`| 연관 화면 |  |` 형식). 추측해서 만들지 마세요.
+"""
+        elif detected:
+            # source_scr_map 은 비어있지만 features_text 에서 SCR 패턴 발견 (예: 본문에 SCR-NNN 언급)
             codes_str = ", ".join(detected[:5])
             screen_code_hint = f"""
-## 📱 연관 화면 코드 (필수 필드)
-이 중분류 "{focus_middle}"는 기획서의 다음 화면 코드와 대응합니다: **{codes_str}**
+## 📱 연관 화면 코드 (입력 본문에서 탐지)
 
-⚠️ **필수**: 각 TC 메타 테이블에 반드시 `| 연관 화면 | {detected[0]} |` 형식으로 화면 코드를 기재하세요.
-- 여러 화면에 걸치면 쉼표로 구분: `| 연관 화면 | SCR-001, SCR-002 |`
-- 화면명 없이 코드만 적으세요. (예: "SCR-001" ✅ / "Splash (SCR-001)" ❌ — 화면명은 중분류에 이미 있음)
+이 중분류 "{focus_middle}" 와 관련해 입력 본문에서 다음 화면 코드를 발견했습니다: **{codes_str}**
+
+⚠️ **규칙**:
+1. 각 TC 메타 테이블에 `| 연관 화면 | {detected[0]} |` 형식 사용
+2. 위에 나열된 코드만 사용 — **임의 코드(LGI, ABC, SCR-999 등) 생성 금지**
+3. 본문에 SCR 코드가 명시되지 않은 TC 는 `| 연관 화면 |  |` 필드를 비워두세요
 """
         else:
-            # 코드가 없으면 fallback: 중분류 이름을 화면명으로 사용
+            # 입력 소스에 화면 식별자가 전혀 없음 — 빈 칸 명시
             screen_code_hint = f"""
-## 📱 연관 화면 (필수 필드)
-이 중분류에 대응하는 화면 코드(SCR-xxx/SCREEN-xxx 등)가 원문에서 자동 탐지되지 않았습니다.
+## 📱 연관 화면 (입력 소스에 화면 식별자 없음)
 
-⚠️ **필수**: 각 TC 메타 테이블에 `| 연관 화면 | {focus_middle} |` 형식으로 화면명을 기재하세요.
-(원문에 SCR 코드가 있으면 코드를, 없으면 화면명을 사용)
+⚠️ 이 입력 소스에서 화면 코드(SCR-NNN 형식)가 발견되지 않았습니다.
+
+**규칙**: 각 TC 메타 테이블의 `| 연관 화면 |` 필드를 **반드시 빈 칸**으로 두세요:
+```
+| 연관 화면 |  |
+```
+- 임의 코드(SCR-001, LGI 등) 생성 금지
+- 중분류 이름을 화면 코드 자리에 넣지 마세요
+- 빈 칸이 정상입니다. 입력 소스에 식별자가 추가되면 다음 실행에서 자동 채워집니다.
 """
 
     return f"""프로젝트: {project_name}
@@ -2414,11 +2510,13 @@ def _generate_missing_tc_for_middle(sess: dict, major: str, middle: str,
             else:
                 effective_policy = (policy_text[:4000] + "\n\n---\n\n원문 섹션:\n" + section) if policy_text else section
     system = build_tc_system_prompt(tc_rules, classification, project_policies, fewshot)
+    _scr_map = sess.get("_source_scr_map") or {}
     user = build_tc_user_prompt(domain_with_middle, effective_features, effective_policy,
                                 project_name, classification,
                                 starting_seq=starting_seq,
                                 screen_character=screen_character,
-                                screen_navigation=screen_navigation)
+                                screen_navigation=screen_navigation,
+                                source_scr_map=_scr_map)
     try:
         tc_draft = call_claude(system, user, max_tokens=16000)
     except Exception as e:
@@ -4549,6 +4647,7 @@ def update_tc():
                     user_prompt = build_tc_user_prompt(
                         domain, prompt_context, prompt_context, project_name,
                         temp_classification, starting_seq=starting_seq,
+                        source_scr_map=(sess.get("_source_scr_map") or {}),
                     )
                     system_prompt = build_tc_system_prompt(
                         tc_rules, temp_classification, project_policies, fewshot
@@ -6381,6 +6480,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="info-box" id="gateInfoBox">
       AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 결과를 확인한 뒤 승인하세요.
     </div>
+
+    <!-- 입력 소스 화면 식별자 안내 (v0.9.13~) — gate 이벤트 도착 시 채워짐 -->
+    <div id="sourceScrNotice" style="display:none;margin:10px 0;padding:10px 14px;border-radius:8px;font-size:12.5px;line-height:1.55;"></div>
 
     <!-- TC ID 생성 방식 선택 패널 (독립 영역, 항상 표시) -->
     <div id="tcIdModePanel" style="background:linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%);border:2px solid #3B82F6;border-radius:12px;padding:16px 20px;margin:14px 0 18px 0;box-shadow:0 2px 8px rgba(59, 130, 246, 0.15);">
@@ -8307,6 +8409,10 @@ function handleEvent(evt) {
       ? 'AI가 분석한 변경 영향도입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.'
       : 'AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.';
     initGateChat(evt.data.content);
+    // 입력 소스 SCR 매핑 — 프론트 전역에 저장 (미니 채팅/뷰어 등에서 참조 가능)
+    window._sourceScrMap = evt.data.source_scr_map || {};
+    // 사용자 안내: 입력 소스에서 화면 식별자 발견 여부
+    renderSourceScrNotice(window._sourceScrMap);
     // Gate 진입 시 입력/파이프라인 카드는 숨기고 Gate 패널에 집중
     document.getElementById('card1').classList.add('hidden');
     document.getElementById('card2').classList.add('hidden');
@@ -8585,6 +8691,39 @@ async function exportGateExcel() {
     showToast('✅ Excel 다운로드 완료!');
   } catch(e) {
     showToast('❌ 오류: ' + e.message, 'error');
+  }
+}
+
+// ── 입력 소스 화면 식별자 (v0.9.13) — gate 이벤트로 받은 source_scr_map 안내 ──
+function renderSourceScrNotice(scrMap) {
+  var el = document.getElementById('sourceScrNotice');
+  if (!el) return;
+  scrMap = scrMap || {};
+  var entries = Object.entries(scrMap);
+  if (entries.length === 0) {
+    // 입력 소스에서 화면 식별자 발견 못함 — 빈 칸 정책 안내
+    el.style.display = '';
+    el.style.background = '#FEF3C7';
+    el.style.border = '1px solid #FCD34D';
+    el.style.color = '#78350F';
+    el.innerHTML =
+      '<strong>📌 화면 코드 안내</strong> — ' +
+      '입력 소스에서 화면 식별자(<code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;">SCR-NNN</code> 형식)가 발견되지 않았습니다. ' +
+      '<br>Excel 의 <strong>화면 코드</strong> 컬럼은 <strong>빈 칸</strong>으로 출력됩니다 (정상). ' +
+      '식별자가 필요하면 입력 파일명을 <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;">SCR-001.md</code> 형식으로 변경하거나, 본문 H1 에 <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;">SCR-001:</code> 처럼 명시하세요.';
+  } else {
+    // 매핑 발견됨 — 사용자에게 안내
+    el.style.display = '';
+    el.style.background = '#ECFDF5';
+    el.style.border = '1px solid #6EE7B7';
+    el.style.color = '#065F46';
+    var rows = entries.map(function(kv) {
+      return '<code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;font-size:11px;">' + kv[0] + '</code> → <strong>' + kv[1] + '</strong>';
+    }).join(' &nbsp;·&nbsp; ');
+    el.innerHTML =
+      '<strong>📌 입력 소스 화면 코드 매핑 (' + entries.length + '개)</strong><br>' +
+      rows +
+      '<br><span style="font-size:11px;opacity:0.85;">생성된 TC 의 <strong>화면 코드</strong> 컬럼은 위 매핑을 따릅니다. 임의 추론 없음.</span>';
   }
 }
 
