@@ -9,6 +9,58 @@
 
 ---
 
+## v0.9.8f — 2026-04-27 (card1 누수 fix — 단계 전환 시 입력 카드도 숨김)
+
+> **요약**: card1(Step 1 입력 카드)이 모든 단계에서 visible 로 남아있던 누수 fix. v0.9.8e 의 stepBar3 가드와 함께 Sticky AI bar 노출 조건도 명확해짐.
+
+### 🐛 버그 (사용자 보고)
+
+**증상**: Step 3 진입 후 짧은 분류표(스크롤 불필요)에서도 위로 스크롤하면 Sticky AI bar 가 등장
+- 화면을 자세히 보면 card1(입력 설정 + 마크다운 소스 + 파이프라인 시작) 이 card3 사이/위에 끼어 있음
+- 사용자 시선이 card1 영역에 도달하면 메인 채팅창(card3 내부)은 viewport 밖 → Sticky bar 노출
+
+### 🔍 진짜 원인
+
+코드를 분석한 결과 **card1 은 어떤 위치에서도 명시적으로 hide 되지 않습니다**. 모든 카드 토글 코드가 `[card2, card3, card5]` 만 다루고 card1 은 항상 visible 유지.
+
+7곳 누락 확인:
+- `startPipeline` (line 7959) — 메인 시작
+- `resumePipeline` (line 6753) — 이전 작업 이어가기
+- `startModify` (line 7460) — 기존 TC 수정
+- `restartModify` (line 9205) — 수정 재시작
+- `regenerateClassification` (line 8929) — 분류표 재생성
+- `approveGate` (line 9011) — Gate 승인
+- SSE `gate` 이벤트 핸들러 (line 8115) — Step 3 진입
+- SSE `done` 이벤트 핸들러 (line 8148) — 완료 진입
+
+### 🛡 해결
+
+**옵션 B (사용자 선택)**: 단계를 떠날 때 명시적으로 card1 hide, Step 1 복귀 시 명시적으로 card1 show.
+
+- **card1 hide 추가 (7곳 + 1)**: 위 7개 + SSE `done` 핸들러 = 총 8곳에 `document.getElementById('card1').classList.add('hidden')` 추가
+- **card1 show 추가 (4곳)**: Step 1 복귀 시점에 `document.getElementById('card1').classList.remove('hidden')` 추가
+  - `onProjectDropdownChange` (line 6544) — 프로젝트 변경
+  - 빈 프로젝트 변경 (line 6602)
+  - `restartFromScratch` (line 6708) — 처음부터 재시작
+  - `startNextIteration` (line 6716) — 다음 반복
+  - 입력 변경 (line 7596) — 소스 등 입력 바뀌었을 때
+
+### 📐 부수 효과 (긍정)
+
+card1 이 정상적으로 숨겨지면서:
+- 페이지 길이 정상화
+- 메인 채팅창(`#gateChatInput`)이 viewport 안에 있을 확률 증가
+- Sticky AI bar 가 정말 필요한 시점에만 노출 (긴 분류표 스크롤 시)
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.8f, 8곳 card1 hide 추가, 5곳 card1 show 추가 |
+| `CHANGELOG.md` | v0.9.8f 섹션 추가 |
+
+---
+
 ## v0.9.8e — 2026-04-27 (Sticky AI bar 누수 근본 fix)
 
 > **요약**: v0.9.8c 에서 추가한 가드가 일부 케이스를 못 막던 문제 — 진짜 원인 파악 후 근본 fix.

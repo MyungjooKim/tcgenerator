@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.8e"
+APP_VERSION         = "v0.9.8f"
 APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "Sticky AI bar 누수 근본 fix (stepBar3 기반)"
+APP_VERSION_TAGLINE = "card1 누수 fix — 단계 전환 시 입력 카드도 숨김"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 Step 1 화면에서 Sticky AI bar 가 떠 있던 문제 근본 fix — SSE 재연결로 card3 만 DOM 에서 unhidden 되는 케이스 방어",
-    "🛡 가드 강화: card3.hidden + stepBar3.active 둘 다 검증 → 진짜 Step 3 화면일 때만 노출",
-    "🛡 CSS :has() 가드도 stepBar3:not(.active) 추가 — JS race 와 무관하게 차단",
-    "💡 안내 토스트도 stepBar3 active 시점에만 노출 (이전엔 SSE 재연결 시 잘못 노출 가능)",
-    "🔁 v0.9.8d의 분류 요약 표 가독성 개선 / v0.9.8c Sticky AI UX 모두 포함",
+    "🐛 Step 1 입력 카드(card1) 가 모든 단계에서 visible 로 남아있던 문제 근본 fix",
+    "🛡 startPipeline / resumePipeline / startModify / gate / done 등 7곳에서 card1 명시적 hide 추가",
+    "🛡 Step 1 복귀 시점(restartFromScratch / startNextIteration / 입력 변경) 4곳에서 card1 명시적 show 추가",
+    "📐 페이지 길이 정상화 → 메인 채팅창이 viewport 밖에 있을 확률 감소 → Sticky bar 가 의미있는 시점에만 노출",
+    "🔁 v0.9.8e Sticky AI 가드 / v0.9.8d 분류 요약 표 가독성 / v0.9.8b 헤더 재시작 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -6540,11 +6540,12 @@ async function onProjectDropdownChange() {
   currentSid = null;
   currentFilename = null;
   stopCountdown();
-  // 카드 숨김 (card2~card5)
+  // 카드 숨김 (card2~card5) + Step 1 입력 카드 복원
   ['card2','card3','card5'].forEach(function(id) {
     var card = document.getElementById(id);
     if (card) card.classList.add('hidden');
   });
+  document.getElementById('card1').classList.remove('hidden');
   // 중단/오류 배너 제거
   document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
   // 버튼 상태 복원
@@ -6598,11 +6599,12 @@ async function onProjectDropdownChange() {
   currentFilename = null;
   stopCountdown();
 
-  // 진행/결과 카드 숨김
+  // 진행/결과 카드 숨김 + Step 1 입력 카드 복원
   ['card2','card3','card5'].forEach(function(id) {
     var card = document.getElementById(id);
     if (card) card.classList.add('hidden');
   });
+  document.getElementById('card1').classList.remove('hidden');
 
   // 중단/오류 배너 제거
   document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
@@ -6707,6 +6709,7 @@ async function retryPipeline() {
 
 function restartFromScratch() {
   document.querySelectorAll('.error-banner').forEach(el => el.remove());
+  document.getElementById('card1').classList.remove('hidden');
   document.getElementById('card2').classList.add('hidden');
   document.getElementById('startBtn').disabled = false;
   setStepBar(1);
@@ -6714,10 +6717,11 @@ function restartFromScratch() {
 }
 
 function startNextIteration(focusOnly) {
-  // 완료/진행 카드 숨김
+  // 완료/진행 카드 숨김 + Step 1 입력 카드 복원
   ['card2','card3','card5'].forEach(function(id) {
     document.getElementById(id).classList.add('hidden');
   });
+  document.getElementById('card1').classList.remove('hidden');
   document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
   // 상단 card2 요소 복원
   var logBox = document.getElementById('logBox');
@@ -6750,6 +6754,7 @@ function startNextIteration(focusOnly) {
 async function resumePipeline() {
   if (!selectedProject) return;
   document.getElementById('startBtn').disabled = true;
+  document.getElementById('card1').classList.add('hidden');
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -7428,6 +7433,7 @@ async function approveAndUpdate() {
     alert('승인할 항목을 최소 1개 이상 선택하세요.');
     return;
   }
+  document.getElementById('card1').classList.add('hidden');
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -7457,6 +7463,7 @@ async function startModify() {
   if (!changeDesc)   { alert('변경사항 내용을 입력하세요.'); return; }
 
   document.getElementById('startModifyBtn').disabled = true;
+  document.getElementById('card1').classList.add('hidden');
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -7591,12 +7598,13 @@ function onInputsChanged() {
   var card5 = document.getElementById('card5');
   if (card5) card5.classList.add('hidden');
 
-  // 3. 실행 중이 아니면 진행/Gate/작성 카드도 숨김
+  // 3. 실행 중이 아니면 진행/Gate/작성 카드도 숨김 + Step 1 입력 카드 복원
   if (!currentSid) {
     ['card2','card3'].forEach(function(id) {
       var card = document.getElementById(id);
       if (card) card.classList.add('hidden');
     });
+    document.getElementById('card1').classList.remove('hidden');
     document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
     setStepBar(1);
   }
@@ -7956,6 +7964,7 @@ async function startPipeline() {
   const payload = sources.map(s => ({ type: s.type, content: s.content, selected_files: s.selected_files || null }));
 
   document.getElementById('startBtn').disabled = true;
+  document.getElementById('card1').classList.add('hidden');
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -8111,7 +8120,8 @@ function handleEvent(evt) {
       ? 'AI가 분석한 변경 영향도입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.'
       : 'AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.';
     initGateChat(evt.data.content);
-    // Gate 진입 시 파이프라인 카드는 숨기고 Gate 패널에 집중
+    // Gate 진입 시 입력/파이프라인 카드는 숨기고 Gate 패널에 집중
+    document.getElementById('card1').classList.add('hidden');
     document.getElementById('card2').classList.add('hidden');
     document.getElementById('card3').classList.remove('hidden');
     setStepBar(3);
@@ -8144,7 +8154,8 @@ function handleEvent(evt) {
       const el = document.getElementById('sub' + i);
       if (el) { el.classList.remove('active'); el.classList.add('done'); }
     }
-    // 파이프라인(card2) 숨기고 완료 카드(card5) 노출
+    // 입력(card1)/파이프라인(card2) 숨기고 완료 카드(card5) 노출
+    document.getElementById('card1').classList.add('hidden');
     document.getElementById('card2').classList.add('hidden');
     document.getElementById('card5').classList.remove('hidden');
     document.getElementById('resultFilename').textContent = filename;
@@ -8925,6 +8936,7 @@ async function regenerateClassification() {
     // 분류표 재생성 요청
     const projectName = document.getElementById('projectName').value.trim() || selectedProject || '';
     const focusArea = document.getElementById('focusArea').value.trim();
+    document.getElementById('card1').classList.add('hidden');
     document.getElementById('card3').classList.add('hidden');
     document.getElementById('card2').classList.remove('hidden');
     setStepBar(2);
@@ -9007,6 +9019,7 @@ async function approveGate() {
     const data = await resp.json();
     if (data.ok) {
       // Gate 닫고 파이프라인 카드로 복귀 — 이후 TC 작성/빌드 로그는 card2에서 계속 표시
+      document.getElementById('card1').classList.add('hidden');
       document.getElementById('card3').classList.add('hidden');
       document.getElementById('card2').classList.remove('hidden');
       document.getElementById('stageLabel').textContent = 'TC 작성 시작...';
@@ -9202,6 +9215,7 @@ async function restartModify(mode) {
   document.getElementById('recovery-modal').classList.remove('open');
   const projectName = document.getElementById('projectSelect').value;
   const changeDesc  = document.getElementById('changeDesc')?.value?.trim() || '';
+  document.getElementById('card1').classList.add('hidden');
   document.getElementById('card2').classList.remove('hidden');
   setStepBar(2);
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
