@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.20"
+APP_VERSION         = "v0.9.21"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "Gate 채팅 신뢰성 — 명령형 적극 수용 + 변경 여부 정확한 안내"
+APP_VERSION_TAGLINE = "중복 패턴 분석 — 명확한 사용 단계 가이드"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 [중대] '삭제' 명령에도 AI가 '질문 모호' 라며 거부하던 문제 fix — system_prompt 적극 수용 모드",
-    "🐛 변경 없는데 '✅ 업데이트되었습니다' 라며 거짓 안내하던 버그 fix — 변경 여부 명시",
-    "🔧 max_tokens 4096 → 16384 — 긴 분류표 출력 잘림 방지",
-    "🛡 잘림 감지 시 원본 보존 + 사용자에게 '더 작은 단위로 나눠 요청' 안내",
-    "🔁 v0.9.19 SCR 매핑 복원 / v0.9.18 gate_waiting 보호 모두 포함",
+    "💡 중복 패턴 발견 시 '이 분석을 어떻게 활용하나요?' 단계별 가이드 박스 노출",
+    "🆕 단계 2-A (권장): 지금 바로 통합 — 복사 → 추가 TC 생성 → AI 채팅에 붙여넣기 → 즉시 정리",
+    "🆕 단계 2-B: 다음 신규 작업 시 활용 — TC 생성 범위 입력란에 붙여넣기",
+    "📋 복사 텍스트 자체에 사용법 + AI 즉시 실행 가능한 명령형 포함",
+    "🔁 v0.9.20 Gate 채팅 신뢰성 / v0.9.19 SCR 매핑 복원 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -9183,11 +9183,43 @@ function renderDuplicateNotice(report) {
   });
   html += '</div>';
 
+  // ── v0.9.21: 명확한 사용 단계 가이드 ──
+  html += '<div style="margin-top:14px;padding:12px;background:#FFFFFF;border:1.5px solid #FBBF24;border-radius:8px;">';
+  html += '<div style="font-size:12.5px;font-weight:700;color:#92400E;margin-bottom:8px;display:flex;align-items:center;gap:6px;">';
+  html += '<span>💡</span><span>이 분석을 어떻게 활용하나요?</span>';
+  html += '</div>';
+  html += '<div style="font-size:11.5px;color:#374151;line-height:1.7;">';
+
+  // 단계 1
+  html += '<div style="margin-bottom:8px;"><strong style="color:#1E3A5F;">단계 1.</strong> 위 내용 검토 — 통합이 필요한 패턴 결정 (스펙 명시 케이스는 그대로 두기)</div>';
+
+  // 단계 2 — 가장 권장하는 방법
+  html += '<div style="margin-bottom:8px;padding:8px 10px;background:#ECFDF5;border-left:3px solid #10B981;border-radius:4px;">';
+  html += '<strong style="color:#065F46;">단계 2-A. 지금 바로 통합 (권장)</strong> — Excel 다시 만들 필요 있을 때<br>';
+  html += '① <strong>📋 분석 결과 복사</strong> 버튼 클릭<br>';
+  html += '② 아래 <strong>"🔄 추가 TC 생성"</strong> 또는 <strong>"📝 범위만 변경하여 재시작"</strong> 버튼 클릭<br>';
+  html += '③ 분류표 검토(Step 3) 화면 진입 → <strong>하단 AI 도우미 채팅창에 Cmd+V (붙여넣기)</strong><br>';
+  html += '④ 채팅 끝에 <em>"위 분석에 따라 통합 후보 TC 들을 제거해줘"</em> 추가 입력 → 전송<br>';
+  html += '⑤ AI 가 분류표 정리 → 승인 → 새 Excel 생성';
+  html += '</div>';
+
+  // 단계 2-B — 보조 방법
+  html += '<div style="margin-bottom:6px;padding:8px 10px;background:#F3F4F6;border-left:3px solid #6B7280;border-radius:4px;">';
+  html += '<strong style="color:#374151;">단계 2-B. 다음 신규 작업 시 활용</strong> — 비슷한 입력으로 새로 만들 때<br>';
+  html += '① 📋 분석 결과 복사<br>';
+  html += '② 신규 작업 시작 → <strong>"TC 생성 범위"</strong> 입력란에 붙여넣기 후 다음 추가:<br>';
+  html += '<code style="display:block;margin-top:4px;padding:6px 8px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;font-size:10.5px;color:#374151;">';
+  html += '⚠️ 위 패턴들은 그룹당 1개 대표 화면(Entry 성격)에만 작성. 같은 비기능 TC 를 여러 화면에 반복 금지 (원칙 G).';
+  html += '</code>';
+  html += '</div>';
+
+  html += '</div></div>';
+
   // 액션 버튼
   html += '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">';
-  html += '<button onclick="copyDuplicateReportToClipboard()" style="padding:6px 12px;background:#FFFFFF;color:#92400E;border:1.5px solid #FCD34D;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">📋 분석 결과 복사</button>';
+  html += '<button onclick="copyDuplicateReportToClipboard()" style="padding:7px 14px;background:#10B981;color:#FFFFFF;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">📋 분석 결과 복사</button>';
   html += '<span style="font-size:11px;color:#78350F;align-self:center;">';
-  html += '검토 후 다음 실행에서 더 명확한 분류표 / 화면 범위 지정으로 중복을 줄이세요.';
+  html += '복사 후 위 단계 2-A 또는 2-B 따라 활용하세요.';
   html += '</span>';
   html += '</div>';
 
@@ -9198,20 +9230,35 @@ function renderDuplicateNotice(report) {
 function copyDuplicateReportToClipboard() {
   var report = window._duplicateReport;
   if (!report || !report.patterns) return;
-  var text = '# 중복 의심 패턴 분석 (원칙 G)\\n\\n';
-  text += '총 ' + report.patterns.length + '개 패턴, 통합 시 약 ' + (report.total_duplicates || 0) + '개 TC 감소 가능\\n\\n';
-  report.patterns.forEach(function(p) {
-    text += '## ' + p.pattern + ' — ' + p.major + ' (' + p.count + '개)\\n';
-    text += '- 유지 권장: ' + p.keep + '\\n';
-    text += '- 통합 후보: ' + (p.remove || []).join(', ') + '\\n';
-    (p.tcs || []).forEach(function(t) {
-      text += '  - ' + t.id + ' / ' + (t.middle || '') + ' / ' + (t.title || '') + '\\n';
-    });
+
+  // v0.9.21: 복사되는 텍스트에 사용 안내 + AI 즉시 실행 가능한 명령형 포함
+  var text = '# 중복 의심 패턴 통합 요청 (원칙 G)\\n\\n';
+  text += '> 사용 방법: 이 텍스트를 분류표 검토(Step 3) 의 하단 AI 도우미 채팅에 붙여넣고 전송하세요.\\n';
+  text += '> AI 가 자동으로 통합 후보 TC 들을 제거하고 대표 화면에만 1개로 통합합니다.\\n\\n';
+  text += '---\\n\\n';
+  text += '## 분석 요약\\n';
+  text += '- 총 ' + report.patterns.length + '개 중복 패턴 발견\\n';
+  text += '- 통합 시 약 ' + (report.total_duplicates || 0) + '개 TC 감소 가능\\n\\n';
+  text += '## 통합 지시\\n\\n';
+  text += '아래 패턴별로 **통합 후보 TC 들을 분류표에서 제거**해줘. **유지 권장 TC** 는 그대로 두고, 그 TC 의 비고에 \\'[통합] 그룹 단위 비기능 검증\\' 태그를 추가해줘.\\n\\n';
+  report.patterns.forEach(function(p, idx) {
+    text += '### ' + (idx+1) + '. ' + p.pattern + ' (' + p.major + ')\\n';
+    text += '- ✅ 유지: `' + p.keep + '`\\n';
+    text += '- ❌ 제거: ' + (p.remove || []).map(function(id) { return '`' + id + '`'; }).join(', ') + '\\n';
+    if (p.tcs && p.tcs.length) {
+      text += '- 상세:\\n';
+      p.tcs.forEach(function(t) {
+        text += '  - ' + t.id + ' — ' + (t.middle || '') + ' / ' + (t.title || '').substring(0, 60) + '\\n';
+      });
+    }
     text += '\\n';
   });
+  text += '---\\n\\n';
+  text += '**스펙 표에 명시된 에러 케이스는 보존**하고, 위 비기능 패턴(네트워크/타임아웃/로딩 등)만 통합해줘.\\n';
+
   if (navigator.clipboard) {
     navigator.clipboard.writeText(text).then(function() {
-      showToast('📋 분석 결과가 클립보드에 복사되었습니다');
+      showToast('📋 복사 완료 — Step 3 의 AI 도우미 채팅에 Cmd+V 후 전송하세요', 'success');
     });
   } else {
     alert(text);
