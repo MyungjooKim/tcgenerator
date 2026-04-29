@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.13"
-APP_VERSION_DATE    = "2026-04-27"
-APP_VERSION_TAGLINE = "화면 코드 → 입력 소스 기반 추출 (환각 차단)"
+APP_VERSION         = "v0.9.14"
+APP_VERSION_DATE    = "2026-04-29"
+APP_VERSION_TAGLINE = "테스트 단계 / 예상 결과 마침표 종결 규칙"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 동료 보고: TC 와 화면 코드가 상이한 문제 근본 fix",
-    "🆕 화면 코드는 입력 소스 자체에서 추출 (파일명 / H1 / 본문 순)",
-    "🛡 AI 환각/자동 파생 차단 — 입력 소스에 SCR 식별자 없으면 화면 코드 컬럼 빈 칸",
-    "💡 Step 3 진입 시 SCR 매핑 안내 노출 (발견된 매핑 또는 빈 칸 정책 안내)",
-    "🔁 TC ID 형식 (SM-LG-001) 변경 없음 / v0.9.12 다국어·모달 리사이즈 모두 포함",
+    "🐛 사용자 보고: 기대결과 셀 안 문장 끝에 마침표가 없던 문제 fix",
+    "🆕 tc-rules.md 9-2 절 신설 — 테스트 단계/예상 결과 마침표 필수 규칙",
+    "🛡 사전 조건은 명사/상태형 종결이라 마침표 불필요 (구분 명확화)",
+    "💡 build_tc_user_prompt 에 마침표 안내 한 번 더 강조 (이중 안전망)",
+    "🔁 v0.9.13 화면 코드 입력 소스 기반 추출 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -2265,6 +2265,32 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 - 빈 칸이 정상입니다. 입력 소스에 식별자가 추가되면 다음 실행에서 자동 채워집니다.
 """
 
+    # 마침표 종결 강화 안내 (tc-rules.md 9-2 절 보강)
+    period_hint = """
+## ✍️ 문장 종결 규칙 (tc-rules.md 9-2 — 반드시 준수)
+
+**테스트 단계** 와 **예상 결과** 의 **모든 항목은 마침표(`.`)로 끝**나야 합니다.
+
+✅ 올바른 예:
+```
+**테스트 단계**
+1. Continue 버튼을 탭한다.
+
+**예상 결과**
+- 인증 코드 입력 화면으로 이동한다.
+- AppState 의 email 값이 갱신된다.
+```
+
+❌ 잘못된 예:
+```
+**예상 결과**
+- 인증 코드 입력 화면으로 이동한다  ← 마침표 누락
+- email 값 갱신                     ← 단어형 + 마침표 누락
+```
+
+사전 조건은 명사형 (`~인 상태`, `~된 상태`) 이므로 마침표 불필요.
+"""
+
     return f"""프로젝트: {project_name}
 도메인: {domain['name']} ({domain['code']})
 {tc_id_instruction}
@@ -2272,6 +2298,7 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 {nfr_instruction}
 {nav_instruction}
 {screen_code_hint}
+{period_hint}
 ## 이 도메인의 분류 구조
 {domain_section}
 
