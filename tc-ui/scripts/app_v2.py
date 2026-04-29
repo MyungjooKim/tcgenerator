@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.22"
+APP_VERSION         = "v0.9.23"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "중복 알림 + 자동 통합 — 양 단계 (Step 3 + Step 5)"
+APP_VERSION_TAGLINE = "원칙 G 강화 — 그룹 정의 + 의미 기반 우선순위 + AI 자기점검"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 [Stage 1] 분류표 검토(Step 3) 에서 중복 가능성 예측 + 🔁 자동 정리 버튼",
-    "🆕 [Stage 2] 결과 화면(Step 5) 에서 실제 TC 중복 탐지 + 🔁 자동 통합 + Excel 재생성",
-    "🛡 원본 Excel 보존 — 통합본은 _merged suffix 별도 파일",
-    "💡 같은 작업 안에서 정리 완료 — '다음 작업으로 미루지 않음' (사용자 통찰 반영)",
-    "🔁 v0.9.21 가이드 단계 / v0.9.20 Gate 채팅 신뢰성 모두 포함",
+    "🆕 G-0 그룹 정의 명확화 — '그룹 = 같은 대분류, ≠ 화면' 모호성 제거",
+    "🆕 G-3 의미 기반 대표 화면 우선순위 — Start/Splash/Entry 키워드 + character=entry (번호 의존 X)",
+    "🆕 G-7 협력 관계 명시 — AI/시스템/사용자 역할 분담 (위협 X, 안내 O)",
+    "🆕 G-8 AI 자기 점검 가이드 — 출력 직전 체크리스트 + 흔한 함정 4가지 명시",
+    "🔁 v0.9.22 양 단계 자동 통합 / v0.9.21 가이드 단계 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
