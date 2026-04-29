@@ -9,6 +9,90 @@
 
 ---
 
+## v0.9.15 — 2026-04-29 (Gate 수정 사항 TC 미반영 버그 fix)
+
+> **요약 (중대 버그 fix)**: Gate 채팅에서 분류표 수정 → Viewer 반영 → 그러나 최종 Excel 은 원본 기준 으로 생성되던 문제. 사용자 검토·승인이 무시되던 시스템 핵심 동작 fix.
+
+### 🐛 사용자 보고 (중대)
+
+> "SCR-013 입력 → 분류표 받음 → 체크박스 기능 제거 + 2개 항목 수정 요청 → Viewer 에서는 수정됨 → 그러나 Excel 은 원본대로 생성됨"
+
+### 🔍 진짜 원인
+
+데이터 흐름 분석:
+
+```
+1. 입력 소스 → policy_text + features_text 추출 (체크박스 정보 포함)
+2. features_text → 분류표 (체크박스 항목 포함)
+3. Gate 채팅: "체크박스 제거" → 분류표 만 수정됨
+4. TC 작성:
+   - approved_classification (수정됨 ✓)
+   - features_text (원본 — 체크박스 그대로 ❌)
+   - extract_section_from_raw(원본) ← _quick_mode/_section_extract 시 사용 ❌
+5. AI 가 분류표 + 본문 모두 보고 판단
+   → 본문이 풍부하니 본문 우선 → 체크박스 TC 다시 만듦
+```
+
+핵심: **분류표 수정 = "목차"만 바꿈, 본문 (features_text + 원본 raw) 은 그대로** → AI 가 본문 기준으로 환상 복원
+
+### 🛡 해결 — 이중 fix
+
+#### 옵션 C: TC 작성 프롬프트에 "분류표 우선 원칙" 절대 규칙 추가
+
+`build_tc_user_prompt` 에 새 섹션 신설:
+
+```
+## 🎯 분류표 우선 원칙 (절대 규칙 — 반드시 준수)
+
+⚠️ 사용자가 검토·승인한 분류표가 최종 진실 소스입니다.
+
+규칙:
+1. 분류표에 있는 중분류/소분류만 TC 로 작성하세요.
+2. 본문(features_text, 정책)에 추가 기능이 보여도, 분류표에 없으면 TC 만들지 마세요.
+3. 분류표 ⊃ 본문이 아닙니다. 본문이 더 자세할 수 있지만 분류표가 우선입니다.
+4. 본문은 TC 상세 시나리오 작성을 위한 참고일 뿐.
+5. 본문에는 있는데 분류표에는 없는 기능 = 사용자가 의도적으로 제외한 것 → TC 만들지 마세요.
+```
+
+또한 features/policy 섹션 헤더에 "참고용 — 분류표가 우선" 강조:
+```
+## 전체 기능 목록 (참고용 — 분류표가 우선)
+⚠️ 아래 정보는 TC 상세 작성을 위한 참고입니다. 항목 포함 여부는 위 분류표 기준으로 결정.
+```
+
+#### 옵션 B: Gate 채팅이 분류표 수정 시 features/policy 자동 동기화
+
+새 함수 `_sync_features_policy_with_classification()`:
+
+1. Gate 채팅 응답이 분류표를 수정한 것을 감지 (`updated_doc != current_doc`)
+2. 별도 AI 호출로 features/policy 도 분류표와 일관되게 갱신
+3. 응답: `[POLICY] ... [FEATURES] ...` 형식 파싱하여 `sess["_policy_text"]`, `sess["_features_text"]` 갱신
+4. 사용자에게 동기화 결과 안내 (✅ synced / ⚠️ failed)
+
+`run_pipeline` 수정:
+- Gate 진입 전: `sess["_features_text"]`, `sess["_policy_text"]` 에 초기값 저장
+- Gate 후: 갱신된 값 (`synced_features`, `synced_policy`) 사용
+- `step_review` 에도 동기화된 값 전달
+
+### 📐 효과 예측
+
+| 시나리오 | v0.9.14 이하 | v0.9.15 |
+|---------|------------|---------|
+| 사용자가 분류표만 수정 | ❌ TC 에 원본 기준 항목 포함 | ✅ 분류표 우선 (옵션 C) |
+| Gate 채팅이 본문 동기화 성공 | N/A | ✅ 분류표 + 본문 일관 (옵션 B) |
+| Gate 채팅 동기화 AI 호출 실패 | N/A | ⚠️ 분류표만 수정, 사용자 안내 메시지 (옵션 C 가 안전망) |
+
+이중 안전망으로 거의 100% 케이스 해결.
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.15, `build_tc_user_prompt` 에 `classification_priority_hint` 섹션 추가 + features/policy 헤더에 "참고용 — 분류표가 우선" 추가, `gate_chat` 엔드포인트에 `_sync_features_policy_with_classification` 호출, 새 함수 신설, `run_pipeline` 에서 `_features_text`/`_policy_text` 세션 저장 + 갱신본 사용, 프론트 `sendGateChat` 에 sync_status 안내 메시지 |
+| `CHANGELOG.md` | v0.9.15 섹션 추가 |
+
+---
+
 ## v0.9.14 — 2026-04-29 (테스트 단계 / 예상 결과 마침표 종결 규칙)
 
 > **요약**: 사용자 보고 — 기대결과 셀 안 문장 끝에 마침표가 빠져 있는 문제. tc-rules.md 에 명시적 규칙이 없던 것이 원인. 9-2 절 신설.

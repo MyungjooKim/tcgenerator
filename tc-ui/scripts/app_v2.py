@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.14"
+APP_VERSION         = "v0.9.15"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "테스트 단계 / 예상 결과 마침표 종결 규칙"
+APP_VERSION_TAGLINE = "Gate 수정 사항 TC 미반영 버그 fix (분류표 우선 + 본문 자동 동기화)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 사용자 보고: 기대결과 셀 안 문장 끝에 마침표가 없던 문제 fix",
-    "🆕 tc-rules.md 9-2 절 신설 — 테스트 단계/예상 결과 마침표 필수 규칙",
-    "🛡 사전 조건은 명사/상태형 종결이라 마침표 불필요 (구분 명확화)",
-    "💡 build_tc_user_prompt 에 마침표 안내 한 번 더 강조 (이중 안전망)",
-    "🔁 v0.9.13 화면 코드 입력 소스 기반 추출 모두 포함",
+    "🐛 [중대] Gate 채팅에서 분류표 수정 → Viewer 반영 → 그러나 Excel 결과는 원본 기준이던 버그 fix",
+    "🆕 옵션 C: TC 작성 프롬프트에 '분류표 우선 원칙' 절대 규칙 추가 — 본문에 있어도 분류표에 없으면 TC 만들지 말 것",
+    "🆕 옵션 B: Gate 채팅이 분류표 수정 시 features/policy 본문도 AI 로 자동 동기화 — 일관된 컨텍스트",
+    "💡 동기화 결과를 사용자에게 안내 (✅ 본문 동기화 완료 / ⚠️ 본문 동기화 실패)",
+    "🔁 v0.9.14 마침표 규칙 / v0.9.13 화면 코드 입력 소스 기반 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -2265,6 +2265,33 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 - 빈 칸이 정상입니다. 입력 소스에 식별자가 추가되면 다음 실행에서 자동 채워집니다.
 """
 
+    # 분류표 우선 원칙 (Gate 검토 후 사용자 수정사항이 본문/features 보다 우선)
+    classification_priority_hint = """
+## 🎯 분류표 우선 원칙 (절대 규칙 — 반드시 준수)
+
+⚠️ **사용자가 검토·승인한 분류표가 최종 진실 소스입니다.**
+
+분류표는 단순 목차가 아닙니다. 사용자가 Gate 검토 단계에서 다음과 같은 수정을 했을 수 있습니다:
+- 불필요한 기능 (예: 체크박스, 광고 영역 등) 제거
+- 중분류/소분류 통합 또는 분리
+- 시나리오 우선순위 조정
+- 범위 외 항목 제외
+
+**그러므로**:
+
+1. **분류표에 있는 중분류/소분류만 TC 로 작성하세요.**
+2. **본문(features_text, 정책)에 추가 기능이 보여도, 분류표에 없으면 TC 만들지 마세요.**
+3. **분류표 ⊃ 본문이 아닙니다.** 본문이 더 자세할 수 있지만 분류표가 우선입니다.
+4. 본문은 TC **상세 시나리오 작성을 위한 참고**일 뿐 (입력값/조건/결과 등). **항목 자체의 포함 여부 결정에는 사용 금지.**
+5. 만약 본문에는 있는데 분류표에는 없는 기능이 있다면: **사용자가 의도적으로 제외한 것** — TC 만들지 마세요.
+
+예시:
+- 분류표에 "이메일 입력" 만 있고 본문에 "체크박스 동의" 가 있을 때
+  → 체크박스 동의 TC 만들지 않음 (사용자가 의도적으로 제거한 것)
+- 분류표에 "로그인" 이 있을 때
+  → 본문의 로그인 관련 상세 시나리오를 참고하여 TC 작성 (정상)
+"""
+
     # 마침표 종결 강화 안내 (tc-rules.md 9-2 절 보강)
     period_hint = """
 ## ✍️ 문장 종결 규칙 (tc-rules.md 9-2 — 반드시 준수)
@@ -2298,14 +2325,17 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 {nfr_instruction}
 {nav_instruction}
 {screen_code_hint}
+{classification_priority_hint}
 {period_hint}
-## 이 도메인의 분류 구조
+## 이 도메인의 분류 구조 (사용자 승인 — 최종 진실 소스)
 {domain_section}
 
-## 전체 기능 목록 (참고)
+## 전체 기능 목록 (참고용 — 분류표가 우선)
+⚠️ 아래 정보는 **TC 상세 작성을 위한 참고**입니다. 항목 포함 여부는 위 분류표 기준으로 결정하세요.
 {features_text[:15000]}
 
-## 관련 정책
+## 관련 정책 (참고용 — 분류표가 우선)
+⚠️ 아래 정책은 **TC 의 사전조건/예상결과 작성에 참고**합니다. 분류표에 없는 기능은 정책이 있어도 TC 만들지 마세요.
 {policy_text[:15000]}
 
 위 도메인({domain['name']}){' 중 "' + focus_middle + '" 중분류' if focus_middle else ''}에 속하는 TC를 아래 4가지 카테고리 순서로 상세하게 작성해주세요.
@@ -3533,16 +3563,24 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
             sess["_raw_text"] = raw_text
             sess["_section_extract"] = True
 
+        # Gate 단계에서 features/policy 도 sess 에 노출 — gate_chat 이 수정 시 함께 동기화하기 위함 (v0.9.15~)
+        sess["_features_text"] = features_text
+        sess["_policy_text"] = policy_text
+
         # Human Gate
         push_stage(sess, 3, "분류표 검토 대기", 45)
         approved = step_gate(sess, classification)
         check_stop(sess)
 
+        # Gate 채팅에서 features/policy 도 수정됐을 수 있음 — 갱신본 사용 (v0.9.15~)
+        synced_features = sess.get("_features_text", features_text)
+        synced_policy = sess.get("_policy_text", policy_text)
+
         # TC 작성
         sess["status"] = "tc_writing"
         push_stage(sess, 4, "TC 작성 시작", 50)
         tc_content, total_tc, min_tc = step_write_tc(
-            sess, approved, features_text, policy_text, project_name,
+            sess, approved, synced_features, synced_policy, project_name,
             selected_domain_codes=sess.get("selected_domains")
         )
         check_stop(sess)
@@ -3553,8 +3591,8 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         push_stage(sess, 4, "TC 품질 검토 — 누락 탐지 중", 82, eta_sec=20)
         step_review(sess, tc_content, project_name,
                     approved_classification=approved,
-                    features_text=features_text,
-                    policy_text=policy_text)
+                    features_text=synced_features,
+                    policy_text=synced_policy)
         check_stop(sess)
         # 보강된 TC가 있으면 채택
         augmented_tc = sess.get("_augmented_tc")
@@ -5029,14 +5067,124 @@ def gate_chat(sid):
         if not reply_text:
             reply_text = ai_text.strip()
 
+        # ── v0.9.15: 분류표 모드에서 변경이 감지되면 features/policy 도 동기화 ──
+        # 사용자가 "체크박스 기능 제거" 등 의미 있는 수정을 했을 때, 본문(features/policy)에서도
+        # 해당 항목을 제거하여 TC 작성 시 일관된 컨텍스트가 전달되도록 함.
+        sync_status = None  # 'synced' | 'unchanged' | 'failed'
+        if gate_mode == "new" and updated_doc and updated_doc != current_doc:
+            try:
+                sync_status = _sync_features_policy_with_classification(
+                    sess, client, updated_doc, current_doc, user_msg
+                )
+                if sync_status == "synced":
+                    reply_text += "\n\n📌 본문 정책·기능 정보도 분류표와 일관되도록 자동 동기화했습니다."
+            except Exception as _sync_e:
+                sync_status = "failed"
+                # 동기화 실패해도 분류표 수정은 그대로 반영 (최소 보장)
+                push_log(sess, f"[Gate] features/policy 동기화 실패 (분류표만 반영): {_sync_e}")
+
         return jsonify({
             "ok": True,
             "reply": reply_text,
-            "updated_doc": updated_doc
+            "updated_doc": updated_doc,
+            "sync_status": sync_status,
         })
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _sync_features_policy_with_classification(sess, client, new_classification, old_classification, user_msg):
+    """v0.9.15: Gate 채팅에서 분류표가 수정되면 features/policy 도 함께 동기화.
+
+    사용자의 의도(예: "체크박스 기능 제거")를 본문 문서에도 반영하여
+    TC 작성 시 분류표·본문 사이의 모순을 제거.
+
+    Returns:
+        "synced" — 동기화 성공
+        "unchanged" — features/policy 가 sess 에 없거나 변경 사항이 사소함
+        "failed" — AI 호출 실패 (예외 raise 됨)
+    """
+    features_text = sess.get("_features_text", "")
+    policy_text = sess.get("_policy_text", "")
+    if not features_text and not policy_text:
+        return "unchanged"  # gate 단계 진입 전이거나 복원 케이스 — 동기화 불가
+
+    sync_system = """당신은 TC 분류 전문가입니다. 사용자가 분류표를 수정했을 때, 본문 정책·기능 문서를 분류표와 일관되게 동기화합니다.
+
+규칙:
+- 사용자의 분류표 변경(추가/제거/수정)을 본문 문서에 반영하세요.
+- 분류표에서 **제거된 항목** 은 본문 정책·기능 문서에서도 제거하세요.
+- 분류표에서 **수정된 항목** 은 본문 문서에서도 동일하게 수정하세요.
+- 분류표에 그대로 있는 항목은 본문 문서에서도 유지하세요.
+- 분류표 변경과 무관한 본문 내용은 절대 변경하지 마세요.
+- 응답은 반드시 다음 두 부분으로 구성:
+  1. [POLICY] 태그: 동기화된 정책 문서 전체
+  2. [FEATURES] 태그: 동기화된 기능 문서 전체
+- 변경할 내용이 없으면 두 태그 안에 원본을 그대로 포함하세요."""
+
+    sync_user = f"""## 사용자 요청
+{user_msg}
+
+## 변경 전 분류표
+```
+{old_classification[:8000]}
+```
+
+## 변경 후 분류표 (사용자 승인 — 최종)
+```
+{new_classification[:8000]}
+```
+
+## 현재 정책 문서 (동기화 대상)
+```
+{policy_text[:10000]}
+```
+
+## 현재 기능 문서 (동기화 대상)
+```
+{features_text[:10000]}
+```
+
+위 분류표 변경에 맞춰 정책·기능 문서를 동기화한 결과를 [POLICY] 와 [FEATURES] 태그로 반환하세요."""
+
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=8192,
+        temperature=0,
+        system=sync_system,
+        messages=[{"role": "user", "content": sync_user}],
+    )
+    sync_text = resp.content[0].text
+
+    # [POLICY] / [FEATURES] 파싱
+    policy_match = re.search(r'\[POLICY\](.*?)(?=\[FEATURES\]|$)', sync_text, re.DOTALL)
+    features_match = re.search(r'\[FEATURES\](.*?)$', sync_text, re.DOTALL)
+
+    new_policy = policy_text
+    new_features = features_text
+
+    if policy_match:
+        candidate = policy_match.group(1).strip()
+        # 코드블록 래핑 제거
+        if candidate.startswith("```"):
+            lines = candidate.split("\n")
+            candidate = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+        if candidate:
+            new_policy = candidate
+
+    if features_match:
+        candidate = features_match.group(1).strip()
+        if candidate.startswith("```"):
+            lines = candidate.split("\n")
+            candidate = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+        if candidate:
+            new_features = candidate
+
+    # 세션 갱신
+    sess["_policy_text"] = new_policy
+    sess["_features_text"] = new_features
+    return "synced"
 
 
 @app.route("/export-gate", methods=["POST"])
@@ -9292,8 +9440,14 @@ async function sendGateChat() {
       // 히스토리 추가 (컨텍스트 유지용 — 축약 버전)
       gateChatHistory.push({ role: 'user', content: '요청: ' + msg });
       gateChatHistory.push({ role: 'assistant', content: d.reply });
-      // 변경 알림
-      addGateChatMsg('system', '✅ 문서가 업데이트되었습니다. 우측 Viewer에서 확인하세요.');
+      // 변경 알림 — 동기화 결과(v0.9.15) 에 따라 다른 메시지
+      var statusMsg = '✅ 분류표가 업데이트되었습니다. 우측 Viewer에서 확인하세요.';
+      if (d.sync_status === 'synced') {
+        statusMsg += ' 본문 정책·기능 문서도 자동 동기화 완료 — TC 작성 시 일관됨.';
+      } else if (d.sync_status === 'failed') {
+        statusMsg += ' (⚠️ 본문 동기화 실패 — 분류표 변경만 반영됨. TC 결과에 분류표 외 항목이 포함될 수 있음.)';
+      }
+      addGateChatMsg('system', statusMsg);
     } else {
       document.getElementById('gateLoadingMsg')?.remove();
       addGateChatMsg('system', '❌ 오류: ' + d.error);
