@@ -9,6 +9,68 @@
 
 ---
 
+## v0.9.18 — 2026-04-29 (Gate 검토 중 재시작 보호 + 안내 문구 정리)
+
+> **요약**: 사용자가 분류표 검토 중 (gate_waiting 상태) 인데 서버 재시작으로 세션이 사라져 "승인 오류: 세션 없음" 404 발생 — 활성 세션 가드에 gate_waiting 누락이 원인.
+
+### 🐛 사용자 보고
+
+> "분류표 확인 후 tc 만들기 승인을 했는데, 이런 에러가 뜨네 — 승인 오류: 세션 없음"
+
+네트워크 탭: `POST /approve/e0b0c532 → 404 NOT FOUND`
+
+### 🔍 원인
+
+`_ACTIVE_STATUSES` set 에 **`"gate_waiting"` 누락**:
+
+```python
+# Before (v0.9.17 이하)
+_ACTIVE_STATUSES = {
+    "parsing", "inventory", "classifying", "policy_features",
+    "tc_writing", "reviewing", "building", "analyzing",
+    # gate_waiting 빠짐!
+}
+```
+
+→ 사용자가 분류표 검토 중(`gate_waiting`)인데 active 로 안 잡혀 → 서버 재시작 시 force 가드 미작동 → SESSIONS 메모리 dict 소실 → 승인 클릭 시 `SESSIONS.get(sid)` None → 404.
+
+이 문제는 v0.9.8b (헤더 재시작 버튼) 도입 시점부터 잠재돼 있었음. 우리가 이번 세션에서 자기 재시작을 여러 번 하면서 표면화됨.
+
+### 🛡 해결
+
+**1) `_ACTIVE_STATUSES` 에 `gate_waiting` 추가**:
+```python
+_ACTIVE_STATUSES = {
+    "parsing", "inventory", "classifying", "policy_features",
+    "gate_waiting",  # ← v0.9.18 추가
+    "tc_writing", "reviewing", "building", "analyzing",
+}
+```
+
+이제 분류표 검토 중인 사용자가 있으면 헤더 `🔄 서버 재시작` 버튼 클릭 시 강한 경고 + force=1 필요. 의도치 않은 세션 끊김 방지.
+
+**2) 친화적 에러 메시지** (`/approve`, `/gate-chat` 두 엔드포인트):
+- Before: `세션 없음`
+- After: `세션이 만료되었습니다. 서버가 재시작됐을 수 있어요.\n페이지를 새로고침하고 '이어서 작업'을 클릭하면 분류표 검토 단계부터 복원됩니다.`
+
+### 📝 추가 — 안내 문구 정리
+
+v0.9.11~12 에서 메인 채팅 패널이 미니/모달로 통합되면서 "우측 Viewer" 표현이 더 이상 맞지 않음. 4곳 모두 수정:
+
+| Before | After |
+|--------|-------|
+| 채팅으로 수정을 요청하고, **우측 Viewer**에서 결과를 확인 | 하단 AI 도우미로 수정을 요청하고, **아래 표**에서 결과를 확인 |
+| ✅ 분류표가 업데이트되었습니다. **우측 Viewer**에서 확인하세요 | ✅ 분류표가 업데이트되었습니다. **아래 표**에서 확인하세요 |
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.18, `_ACTIVE_STATUSES` 에 `gate_waiting` 추가, `/approve` + `/gate-chat` 친화적 에러 메시지, "우측 Viewer" 문구 4곳 → "아래 표" 등으로 정리 |
+| `CHANGELOG.md` | v0.9.18 섹션 추가 |
+
+---
+
 ## v0.9.17 — 2026-04-29 (원칙 G — 그룹 단위 에러 패턴 통합 + 중복 자동 탐지)
 
 > **요약**: 동료 보고 — "같은 그룹 내 비기능 TC (네트워크/타임아웃/로딩 등) 가 화면마다 반복되어 중복이 많다." 분석: SCR-010, SCR-013 으로 시뮬레이션 → 6가지 패턴이 그룹 내 5개 화면에 반복 → 약 14개 중복 TC 발생. **예방(C) + 탐지(D) 동시 적용**.

@@ -53,16 +53,15 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.17"
+APP_VERSION         = "v0.9.18"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "원칙 G — 그룹 단위 에러 패턴 통합 + 중복 자동 탐지"
+APP_VERSION_TAGLINE = "Gate 검토 중 재시작 보호 + 우측 Viewer 안내 문구 정리"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 [예방] tc-rules.md 원칙 G — 같은 그룹 내 동일 비기능 TC (네트워크/타임아웃/로딩 등) 그룹당 1개 통합 규칙",
-    "🆕 [탐지] detect_duplicate_error_tcs() — TC 작성 후 패턴 자동 감지 (6가지 비기능 패턴)",
-    "💡 결과 화면에 '중복 의심 패턴 N개' 노란 알림 박스 + 대표/통합 후보 TC ID 표시",
-    "📋 분석 결과 클립보드 복사 버튼 — 다음 실행 시 분류표/범위 지정에 활용",
-    "🔁 v0.9.16 수정 플로우 영향도 우선 / v0.9.15 분류표 우선 원칙 모두 포함",
+    "🐛 [중요] gate_waiting 상태가 active_sessions 에서 빠져있던 버그 fix — 분류표 검토 중에 재시작 시 세션 보호",
+    "💡 '세션 없음' 404 에러 메시지 친화적으로 변경 — 새로고침 + 이어서 작업 안내",
+    "🆕 안내 문구 정리 — 더 이상 존재하지 않는 '우측 Viewer' 표현 제거 (4곳)",
+    "🔁 v0.9.17 원칙 G + 중복 탐지 / v0.9.16 영향도 우선 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -4050,8 +4049,11 @@ def index():
 
 # ── 관리자 엔드포인트 ─────────────────────────────────────────────────────────
 # 활성 세션으로 간주되는 status (이 외에는 종료/대기 상태로 봄)
+# v0.9.18: gate_waiting 도 활성 세션 — 사용자가 분류표 검토 중인데 재시작하면
+#          승인 시점에 sid 가 사라져 "세션 없음" 404 발생함
 _ACTIVE_STATUSES = {
     "parsing", "inventory", "classifying", "policy_features",
+    "gate_waiting",  # ← v0.9.18 추가: 분류표 검토 대기 중인 사용자 보호
     "tc_writing", "reviewing", "building", "analyzing",
 }
 
@@ -5134,7 +5136,11 @@ def regenerate_classification():
 def approve(sid):
     sess = SESSIONS.get(sid)
     if not sess:
-        return jsonify({"ok": False, "error": "세션 없음"}), 404
+        # v0.9.18: 사용자 친화적 메시지 — 서버 재시작 등으로 세션 소실 시
+        return jsonify({
+            "ok": False,
+            "error": "세션이 만료되었습니다. 서버가 재시작됐을 수 있어요.\n페이지를 새로고침하고 '이어서 작업'을 클릭하면 분류표 검토 단계부터 복원됩니다."
+        }), 404
     data = request.get_json(force=True) or {}
     content = data.get("content", "").strip()
     if not content:
@@ -5169,7 +5175,11 @@ def gate_chat(sid):
     import anthropic
     sess = SESSIONS.get(sid)
     if not sess:
-        return jsonify({"ok": False, "error": "세션 없음"}), 404
+        # v0.9.18: 사용자 친화적 메시지
+        return jsonify({
+            "ok": False,
+            "error": "세션이 만료되었습니다. 서버가 재시작됐을 수 있어요.\n페이지를 새로고침하고 '이어서 작업'을 클릭하면 분류표 검토 단계부터 복원됩니다."
+        }), 404
     if sess.get("status") != "gate_waiting":
         return jsonify({"ok": False, "error": "Gate 대기 상태가 아닙니다."}), 400
 
@@ -6835,7 +6845,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="card hidden" id="card3">
     <div class="card-title" id="gateTitle">🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span></div>
     <div class="info-box" id="gateInfoBox">
-      AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 결과를 확인한 뒤 승인하세요.
+      AI가 생성한 분류표입니다. 하단 AI 도우미로 수정을 요청하고, 아래 표에서 결과를 확인한 뒤 승인하세요.
     </div>
 
     <!-- 입력 소스 화면 식별자 안내 (v0.9.13~) — gate 이벤트 도착 시 채워짐 -->
@@ -8766,8 +8776,8 @@ function handleEvent(evt) {
       ? '📋 영향도 검토 <span class="badge">Step 3 · Human Gate</span>'
       : '🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span>';
     document.getElementById('gateInfoBox').innerHTML = isModify
-      ? 'AI가 분석한 변경 영향도입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.'
-      : 'AI가 생성한 분류표입니다. 채팅으로 수정을 요청하고, 우측 Viewer에서 확인한 뒤 승인하세요.';
+      ? 'AI가 분석한 변경 영향도입니다. 하단 AI 도우미로 수정을 요청하고, 아래 내용에서 확인한 뒤 승인하세요.'
+      : 'AI가 생성한 분류표입니다. 하단 AI 도우미로 수정을 요청하고, 아래 표에서 확인한 뒤 승인하세요.';
     initGateChat(evt.data.content);
     // 입력 소스 SCR 매핑 — 프론트 전역에 저장 (미니 채팅/뷰어 등에서 참조 가능)
     window._sourceScrMap = evt.data.source_scr_map || {};
@@ -9726,7 +9736,7 @@ async function sendGateChat() {
       gateChatHistory.push({ role: 'user', content: '요청: ' + msg });
       gateChatHistory.push({ role: 'assistant', content: d.reply });
       // 변경 알림 — 동기화 결과(v0.9.15) 에 따라 다른 메시지
-      var statusMsg = '✅ 분류표가 업데이트되었습니다. 우측 Viewer에서 확인하세요.';
+      var statusMsg = '✅ 분류표가 업데이트되었습니다. 아래 표에서 확인하세요.';
       if (d.sync_status === 'synced') {
         statusMsg += ' 본문 정책·기능 문서도 자동 동기화 완료 — TC 작성 시 일관됨.';
       } else if (d.sync_status === 'failed') {
