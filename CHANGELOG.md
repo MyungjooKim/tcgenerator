@@ -9,6 +9,53 @@
 
 ---
 
+## v0.9.25 — 2026-04-29 (시스템 점검용 샘플 기능 제거)
+
+> **요약**: 사용자 결정 — "시스템 점검용 샘플은 이제 삭제해도 될 거 같아.. 앞으로 다른 것으로 사용해도 될 거 같거든". 초기 검증용으로 만들어진 샘플 PDF / 직접입력 기능을 제거하여 코드 정리.
+
+### 🐛 사용자 결정
+
+> "이제 화면 하단에 있는 시스템 점검용 샘플이면 이 기능은 삭제해도 될 거 같아.. 앞으로 다른 것으로 사용해도 될 거 같거든"
+
+실제 입력 소스(SCR-XXX.md 등) 워크플로우가 안정화되어 샘플 검증 기능 불필요.
+
+### 🗑 제거 대상 (8개 영역)
+
+| # | 위치 | 내용 |
+|---|------|------|
+| 1 | 상수 | `SAMPLE_DOC_FILENAME`, `SAMPLE_DOC_CONTENT` (긴 마크다운 ~130줄) |
+| 2 | 상수 | `SAMPLE_PDF_FILENAME`, `STATIC_DIR`, `SAMPLE_PDF_PATH` |
+| 3 | 함수 | `_find_korean_font()`, `_find_korean_bold_font()` (PDF 생성 전용) |
+| 4 | 함수 | `build_sample_pdf()` (~95줄) |
+| 5 | 라우트 | `/sample-download`, `/sample-content` |
+| 6 | CSS | `.sample-footer`, `.sample-banner`, `.btn-sample-dl`, `.btn-sample-fill` |
+| 7 | HTML | 푸터 영역 (`<footer class="sample-footer">`) |
+| 8 | JS | `loadSampleDoc()` 함수 |
+| 9 | startup | 서버 시작 시 PDF 사전 생성 로그 |
+
+총 **~280줄** 코드 제거.
+
+### 📊 효과
+
+- **화면**: 푸터 영역 제거로 깔끔
+- **코드**: 약 280줄 감소 (450KB → 443KB)
+- **시작 속도**: PDF 사전 생성 단계 제거로 약간 빨라짐
+- **유지보수**: 사용 안 하는 fpdf2 의존성 사실상 제거 (라이브러리 import 도 함수 안에 있어서 영향 적음)
+
+### 🛡 보존된 것
+- `OUTPUTS_DIR`, `WORKSPACE_ROOT`, `SPECS_DIR`, `TC_FILES_DIR` 등 다른 디렉토리는 그대로
+- 다른 입력 소스 흐름(PDF / GitHub URL / 웹 / 마크다운 / 텍스트 추가) 은 그대로 작동
+- `static/` 폴더는 .gitignore 에 그대로 (다른 정적 자원 위해 보존)
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.25, 샘플 관련 모든 코드 제거 (상수/함수/라우트/CSS/HTML/JS/startup) |
+| `CHANGELOG.md` | v0.9.25 섹션 추가 |
+
+---
+
 ## v0.9.24 — 2026-04-29 (한글 IME Enter 다중 처리 버그 fix)
 
 > **요약 (중대)**: 사용자 보고 — "대화창에서 마지막으로 입력한 단어가 한 번 더 입력되는 버그", "그래서 AI 가 답변을 정확하게 하지 못해". 한글 IME composition 처리 누락이 원인.

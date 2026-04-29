@@ -53,305 +53,22 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.24"
+APP_VERSION         = "v0.9.25"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "한글 IME Enter 다중 처리 버그 fix (메시지 잘림)"
+APP_VERSION_TAGLINE = "시스템 점검용 샘플 기능 제거 (실 워크플로우 정착)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 [중대] 한글 입력 후 Enter 시 마지막 글자가 별도 메시지로 한 번 더 전송되던 버그 fix",
-    "💡 사용자가 보낸 의도와 다른 메시지가 AI 에게 전달돼 답변이 부정확했던 원인",
-    "🛡 모든 입력창에 IME composition 가드 추가 (event.isComposing / keyCode 229)",
-    "📌 적용 위치: 메인 채팅 / Floating bar / 모달 / 신규 프로젝트 입력 (총 4곳)",
-    "🔁 v0.9.23 원칙 G 강화 / v0.9.22 양 단계 자동 통합 모두 포함",
+    "🗑 시스템 점검용 샘플 PDF / 직접입력으로 채우기 기능 제거 (초기 검증용 → 역할 종료)",
+    "📐 푸터 영역 제거 — 화면이 더 깔끔해짐",
+    "🧹 코드 정리 — SAMPLE_DOC_CONTENT, build_sample_pdf, _find_korean_font 등 ~280줄 제거",
+    "🚀 시작 시 PDF 사전 생성 단계 제거 — 서버 기동 약간 빨라짐",
+    "🔁 v0.9.24 한글 IME fix / v0.9.23 원칙 G 강화 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
 SPECS_DIR.mkdir(exist_ok=True)
 TC_FILES_DIR.mkdir(exist_ok=True)
-
-# ── 샘플 기획서 ────────────────────────────────────────────────────────────────
-SAMPLE_DOC_FILENAME = "sample_planning_쇼핑몰앱.md"
-SAMPLE_DOC_CONTENT = """\
-# 샘플 기획서 — 온라인 쇼핑몰 앱 v1.0
-> 이 문서는 TC 자동화 시스템 점검용 샘플 기획서입니다.
-
----
-
-## 대분류: 회원 관리 (AUTH)
-
-### 중분류: 회원가입
-- 이메일 + 비밀번호 조합으로 회원가입
-- 이메일 중복 확인 (실시간 API 검증)
-- 비밀번호 규칙: 8자 이상, 영문+숫자+특수문자 조합
-- 가입 완료 시 인증 이메일 발송, 24시간 내 미인증 시 계정 비활성화
-- 소셜 로그인 지원: 카카오, 네이버, 구글 (OAuth 2.0)
-
-### 중분류: 로그인 / 로그아웃
-- 이메일·비밀번호 로그인, 5회 오류 시 계정 30분 잠금
-- JWT 토큰 발급 (Access: 1h, Refresh: 30d)
-- 자동 로그인 설정 (기기당 Refresh 토큰 저장)
-- 로그아웃 시 Refresh 토큰 무효화
-
-### 중분류: 비밀번호 관리
-- 비밀번호 찾기: 이메일로 재설정 링크 발송 (유효 10분)
-- 로그인 상태에서 비밀번호 변경 (현재 PW 확인 후 변경)
-- 재설정 완료 시 모든 기기 세션 만료
-
-### 중분류: 마이페이지
-- 회원 정보 수정 (닉네임, 연락처, 배송지)
-- 회원 탈퇴 (즉시 개인정보 익명화, 30일 후 완전 삭제)
-- 알림 수신 설정 (마케팅 이메일, 앱 푸시, SMS)
-
----
-
-## 대분류: 상품 탐색 (PROD)
-
-### 중분류: 상품 목록
-- 카테고리별 상품 목록 조회 (대분류 → 소분류 depth 3단계)
-- 정렬: 인기순, 최신순, 낮은 가격순, 높은 가격순, 리뷰 많은 순
-- 필터: 가격 범위, 브랜드, 평점, 배송 유형(일반/당일/새벽)
-- 무한 스크롤 (페이지당 20개 로드)
-- 품절 상품은 목록 하단 배치, 구매 불가 표시
-
-### 중분류: 상품 검색
-- 키워드 검색 (Elasticsearch 기반, 오타 교정 지원)
-- 최근 검색어 저장 (최대 20개, 개별/전체 삭제)
-- 자동 완성 추천 (입력 2자 이상 시 최대 10개 노출)
-- 검색 결과 없을 시 연관 상품 추천
-
-### 중분류: 상품 상세
-- 상품명, 가격(정가/할인가), 할인율, 재고 수량 표시
-- 이미지 갤러리 (최대 10장, 확대/슬라이드)
-- 상품 옵션 선택 (색상, 사이즈 등 조합별 재고 연동)
-- 배송 예정일 표시 (재고·배송 유형에 따라 실시간 계산)
-- 판매자 정보, 교환/반품 정책 노출
-
-### 중분류: 찜 목록
-- 상품 찜 추가/해제 (하트 아이콘 토글)
-- 찜 목록 페이지 (가격 변동 표시, 품절 여부 실시간 반영)
-- 최대 500개 저장, 초과 시 경고
-
----
-
-## 대분류: 장바구니 및 주문 (ORDER)
-
-### 중분류: 장바구니
-- 상품 추가 (옵션 포함), 수량 변경 (최소 1, 최대 99)
-- 개별 항목 삭제 / 전체 삭제
-- 품절·판매종료 항목 자동 비활성화 및 안내
-- 비로그인 장바구니 지원 (로컬 스토리지, 로그인 시 병합)
-- 선택한 항목만 주문하기
-
-### 중분류: 주문서 작성
-- 배송지 입력/수정 (기본 배송지 자동 불러오기)
-- 배송 메모 선택 (사전 정의 옵션 + 직접 입력)
-- 쿠폰 적용 (1회 주문당 1개, 중복 불가)
-- 포인트 사용 (100P 이상, 10P 단위 입력)
-- 최종 결제 금액 실시간 계산 (상품가 + 배송비 - 할인)
-
-### 중분류: 주문 내역
-- 주문 목록: 최근 3개월 기본, 기간 필터 가능
-- 주문 상세: 상품 정보, 배송 현황, 결제 정보
-- 주문 취소 (결제 완료 후 배송 전까지 가능)
-- 구매 확정 (배송 완료 후 자동 14일 or 수동 확정)
-
----
-
-## 대분류: 결제 (PAY)
-
-### 중분류: 결제 수단
-- 신용·체크카드 (국내 주요 8개사 간편 결제)
-- 카카오페이, 네이버페이, 토스페이
-- 무통장 입금 (가상계좌 발급, 24시간 내 입금 확인)
-- 결제 수단 저장 및 기본 결제수단 설정
-
-### 중분류: 결제 처리
-- PG사 연동 (토스페이먼츠) — 실결제 / 테스트 모드 전환 가능
-- 결제 완료 시 주문 확인 SMS·이메일 즉시 발송
-- 결제 실패 시 실패 사유 표시 및 재시도 안내
-- 금액 불일치(위변조) 서버 사이드 검증
-
-### 중분류: 환불
-- 취소 승인 시 원결제 수단으로 자동 환불 (3~5 영업일)
-- 부분 취소 지원 (다품목 주문 중 일부만 취소)
-- 가상계좌 환불은 고객 환불 계좌 입력 후 처리
-- 포인트·쿠폰 사용분 취소 시 원복 처리 규칙 명시
-
----
-
-## 대분류: 배송 관리 (DELIV)
-
-### 중분류: 배송 조회
-- 운송장 번호 자동 연동 (출고 시 등록)
-- 배송 단계: 상품 준비중 → 배송중 → 배송 완료
-- 택배사별 배송 조회 페이지 연결 (CJ, 한진, 롯데, 우체국)
-- 배송 지연 시 알림 발송 (출고 예정일 +1일 초과)
-
-### 중분류: 교환 / 반품
-- 구매 확정 전까지 교환·반품 신청 가능
-- 반품 사유 입력 (고객 귀책 / 판매자 귀책 선택)
-- 반품 회수 택배사 자동 배정, 회수 운송장 발급
-- 교환 상품 재배송 일정 안내
-
-### 중분류: 리뷰
-- 구매 확정 후 리뷰 작성 가능 (텍스트 + 이미지 최대 5장)
-- 평점 1~5점, 옵션 정보 함께 저장
-- 리뷰 수정·삭제 (작성자 본인만)
-- 판매자 리뷰 답변 기능
-- 신고 기능 (욕설, 광고성 등 — 관리자 검토 후 블라인드)
-"""
-
-SAMPLE_PDF_FILENAME = "sample_planning_쇼핑몰앱.pdf"
-STATIC_DIR = BASE_DIR / "static"
-SAMPLE_PDF_PATH = STATIC_DIR / SAMPLE_PDF_FILENAME
-
-
-def _find_korean_font():
-    """OS별 한글 TTF/TTC 폰트 경로를 반환한다. 없으면 None."""
-    import platform
-    sys_name = platform.system()
-    candidates = []
-    if sys_name == "Darwin":
-        candidates = [
-            "/Library/Fonts/NanumGothic.ttf",
-            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-            "/Library/Fonts/AppleGothic.ttf",
-        ]
-    elif sys_name == "Windows":
-        candidates = [
-            r"C:\Windows\Fonts\malgun.ttf",
-            r"C:\Windows\Fonts\gulim.ttc",
-        ]
-    else:
-        candidates = [
-            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        ]
-    for p in candidates:
-        if Path(p).exists():
-            return p
-    return None
-
-
-def _find_korean_bold_font():
-    """한글 Bold 폰트 경로. 없으면 일반 폰트로 대체."""
-    import platform
-    sys_name = platform.system()
-    if sys_name == "Darwin":
-        for p in ["/Library/Fonts/NanumGothicBold.ttf"]:
-            if Path(p).exists():
-                return p
-    elif sys_name == "Windows":
-        for p in [r"C:\Windows\Fonts\malgunbd.ttf"]:
-            if Path(p).exists():
-                return p
-    else:
-        for p in ["/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"]:
-            if Path(p).exists():
-                return p
-    return None
-
-
-def build_sample_pdf(force: bool = False) -> Path:
-    """샘플 기획서 PDF를 생성(또는 캐시)하여 경로를 반환한다."""
-    STATIC_DIR.mkdir(exist_ok=True)
-    if SAMPLE_PDF_PATH.exists() and not force:
-        return SAMPLE_PDF_PATH
-
-    try:
-        from fpdf import FPDF
-
-        font_path = _find_korean_font()
-        bold_path = _find_korean_bold_font() or font_path
-        has_kr = font_path is not None
-
-        class SamplePDF(FPDF):
-            pass
-
-        pdf = SamplePDF(orientation="P", unit="mm", format="A4")
-        pdf.set_auto_page_break(auto=True, margin=18)
-        pdf.set_margins(20, 20, 20)
-        pdf.add_page()
-
-        if has_kr:
-            pdf.add_font("KR",  "",  font_path)
-            pdf.add_font("KR",  "B", bold_path)
-
-        L = pdf.l_margin           # 왼쪽 여백
-        W = pdf.w - L - pdf.r_margin  # 유효 너비
-
-        def kr(size, bold=False):
-            if has_kr:
-                pdf.set_font("KR", "B" if bold else "", size)
-            else:
-                pdf.set_font("Helvetica", "B" if bold else "", size)
-
-        def put(text, w, h, indent=0):
-            """x를 항상 왼쪽 여백+indent로 고정한 뒤 multi_cell 출력"""
-            pdf.set_x(L + indent)
-            pdf.multi_cell(w - indent, h, text)
-            pdf.set_x(L)  # 출력 후 x 리셋
-
-        for raw_line in SAMPLE_DOC_CONTENT.split("\n"):
-            s = raw_line.strip()
-            pdf.set_x(L)  # 매 줄 시작 전 x 리셋 (핵심 수정)
-
-            if s.startswith("# "):          # H1 제목
-                kr(16, bold=True)
-                pdf.set_text_color(20, 20, 70)
-                put(s[2:], W, 9)
-                pdf.ln(1)
-
-            elif s.startswith("## "):       # H2 대분류
-                pdf.ln(3)
-                kr(12, bold=True)
-                pdf.set_text_color(0, 95, 125)
-                put(s[3:], W, 8)
-                pdf.set_x(L)
-                pdf.set_draw_color(0, 95, 125)
-                pdf.set_line_width(0.4)
-                pdf.line(L, pdf.get_y(), L + W, pdf.get_y())
-                pdf.ln(2)
-
-            elif s.startswith("### "):      # H3 중분류
-                pdf.ln(2)
-                kr(11, bold=True)
-                pdf.set_text_color(50, 50, 50)
-                put(s[4:], W, 7)
-
-            elif s.startswith("- "):        # 불릿 항목
-                kr(10)
-                pdf.set_text_color(60, 60, 60)
-                put("\u2022  " + s[2:], W, 6, indent=4)
-
-            elif s.startswith(">"):         # 인용 (부제)
-                kr(9)
-                pdf.set_text_color(130, 130, 130)
-                put(s.lstrip("> ").strip(), W, 6, indent=2)
-
-            elif s.startswith("---"):       # 수평선
-                pdf.ln(2)
-                pdf.set_draw_color(200, 200, 200)
-                pdf.set_line_width(0.3)
-                pdf.line(L, pdf.get_y(), L + W, pdf.get_y())
-                pdf.ln(4)
-
-            elif s == "":
-                pdf.ln(2)
-
-            else:
-                kr(10)
-                pdf.set_text_color(50, 50, 50)
-                put(s, W, 6)
-
-        pdf.output(str(SAMPLE_PDF_PATH))
-        return SAMPLE_PDF_PATH
-
-    except Exception as e:
-        print(f"[WARN] PDF 생성 실패: {e}")
-        return None
-
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
@@ -6094,26 +5811,6 @@ def download(sid, filename):
     return send_file(str(result), as_attachment=True, download_name=filename)
 
 
-@app.route("/sample-download")
-def sample_download():
-    """샘플 기획서 PDF 다운로드 (없으면 즉석 생성)"""
-    pdf_path = build_sample_pdf()
-    if pdf_path is None or not pdf_path.exists():
-        return jsonify({"error": "PDF 생성 실패. fpdf2 패키지 설치 여부를 확인하세요."}), 500
-    return send_file(
-        str(pdf_path),
-        as_attachment=True,
-        download_name=SAMPLE_PDF_FILENAME,
-        mimetype="application/pdf",
-    )
-
-
-@app.route("/sample-content")
-def sample_content():
-    """샘플 기획서 텍스트 반환 (JS에서 직접 채우기용)"""
-    return jsonify({"content": SAMPLE_DOC_CONTENT, "filename": SAMPLE_PDF_FILENAME})
-
-
 @app.route("/github-tree", methods=["POST"])
 def github_tree():
     """GitHub 리포지토리 파일 트리를 반환 (파일 선택 미리보기용)"""
@@ -6511,37 +6208,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .new-project-form { margin-top: 10px; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
   .btn-delete-project { margin-top: 6px; font-size: 11px; padding: 2px 8px; border: 1px solid #e53e3e; color: #e53e3e; background: none; border-radius: 6px; cursor: pointer; }
   .btn-delete-project:hover { background: #e53e3e; color: #fff; }
-
-  /* 샘플 기획서 푸터 */
-  .sample-footer { display: flex; align-items: center; gap: 10px; padding: 10px 32px; background: var(--surface); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
-  .sample-footer-label { color: var(--muted); }
-
-  /* 샘플 기획서 배너 (구) */
-  .sample-banner {
-    display: flex; align-items: center; justify-content: space-between; gap: 14px;
-    background: linear-gradient(135deg, #F0FFF4, #EBF2FF);
-    border: 1.5px solid #9AE6B4; border-radius: 12px;
-    padding: 14px 18px; margin-bottom: 20px; flex-wrap: wrap;
-  }
-  .sample-banner-left { display: flex; align-items: center; gap: 12px; }
-  .sample-icon { font-size: 28px; flex-shrink: 0; }
-  .sample-title { font-size: 13px; font-weight: 700; color: var(--text); }
-  .sample-desc  { font-size: 11px; color: var(--muted); margin-top: 2px; }
-  .sample-banner-right { display: flex; gap: 8px; flex-wrap: wrap; }
-  .btn-sample-dl {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 7px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
-    background: var(--white); color: var(--blue); border: 1.5px solid var(--blue);
-    cursor: pointer; text-decoration: none; transition: background 0.15s;
-  }
-  .btn-sample-dl:hover { background: #EBF2FF; }
-  .btn-sample-fill {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 7px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
-    background: var(--teal); color: var(--white); border: none;
-    cursor: pointer; transition: opacity 0.15s;
-  }
-  .btn-sample-fill:hover { opacity: 0.88; }
 
   /* 진행률 바 */
   .progress-wrap { background: var(--bg); border-radius: 99px; height: 10px; overflow: hidden; margin: 12px 0; }
@@ -7537,13 +7203,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 </main>
 
-<!-- 시스템 점검용 샘플 기획서 (푸터) -->
-<footer class="sample-footer">
-  <span class="sample-footer-label">🧪 시스템 점검용 샘플:</span>
-  <a href="/sample-download" class="btn-sample-dl" download>⬇ 샘플 PDF</a>
-  <button type="button" class="btn-sample-fill" onclick="loadSampleDoc()">✏️ 직접입력으로 채우기</button>
-</footer>
-
 <!-- 오류 복구 모달 -->
 <div class="modal-bg" id="recovery-modal">
   <div class="modal">
@@ -7960,22 +7619,6 @@ function switchMode(mode) {
 }
 
 // 샘플 기획서 불러오기 — 직접 입력 모드로 전환 후 textarea 채우기
-async function loadSampleDoc() {
-  try {
-    const r = await fetch('/sample-content');
-    const data = await r.json();
-    // 텍스트 소스로 추가
-    const id = ++sourceCounter;
-    sources.push({ id, type: 'text', content: data.content });
-    renderSources();
-    const pn = document.getElementById('projectName');
-    if (!pn.value.trim()) pn.value = '샘플_쇼핑몰앱';
-    showToast('샘플 기획서가 소스로 추가됐습니다. 파이프라인을 시작하세요!');
-  } catch(e) {
-    alert('샘플 불러오기 실패: ' + e.message);
-  }
-}
-
 // 간단한 토스트 메시지
 function showToast(msg) {
   let t = document.getElementById('toast');
@@ -11334,15 +10977,6 @@ if __name__ == "__main__":
         print(f"   API KEY    : sk-ant-...{api_key[-6:]} (설정됨)")
     else:
         print("   API KEY    : ⚠️  미설정 — .env 파일을 확인하세요")
-    # 샘플 PDF 사전 생성 (없을 때만)
-    try:
-        sp = build_sample_pdf()
-        if sp:
-            print(f"   SAMPLE PDF : {sp.name} ✓")
-        else:
-            print("   SAMPLE PDF : ⚠️  생성 실패 (fpdf2 확인)")
-    except Exception as _e:
-        print(f"   SAMPLE PDF : ⚠️  {_e}")
     # ── SO_REUSEADDR/SO_REUSEPORT 활성화 + listen socket 캡처 (자기 재시작 지원) ──
     # 문제 1: 기본 소켓은 os.execv 후 새 프로세스가 'Address already in use' 로 즉시 bind 실패
     #         → SO_REUSEADDR/SO_REUSEPORT 활성화로 해결
