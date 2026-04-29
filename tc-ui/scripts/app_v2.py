@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.21"
+APP_VERSION         = "v0.9.22"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "중복 패턴 분석 — 명확한 사용 단계 가이드"
+APP_VERSION_TAGLINE = "중복 알림 + 자동 통합 — 양 단계 (Step 3 + Step 5)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "💡 중복 패턴 발견 시 '이 분석을 어떻게 활용하나요?' 단계별 가이드 박스 노출",
-    "🆕 단계 2-A (권장): 지금 바로 통합 — 복사 → 추가 TC 생성 → AI 채팅에 붙여넣기 → 즉시 정리",
-    "🆕 단계 2-B: 다음 신규 작업 시 활용 — TC 생성 범위 입력란에 붙여넣기",
-    "📋 복사 텍스트 자체에 사용법 + AI 즉시 실행 가능한 명령형 포함",
-    "🔁 v0.9.20 Gate 채팅 신뢰성 / v0.9.19 SCR 매핑 복원 모두 포함",
+    "🆕 [Stage 1] 분류표 검토(Step 3) 에서 중복 가능성 예측 + 🔁 자동 정리 버튼",
+    "🆕 [Stage 2] 결과 화면(Step 5) 에서 실제 TC 중복 탐지 + 🔁 자동 통합 + Excel 재생성",
+    "🛡 원본 Excel 보존 — 통합본은 _merged suffix 별도 파일",
+    "💡 같은 작업 안에서 정리 완료 — '다음 작업으로 미루지 않음' (사용자 통찰 반영)",
+    "🔁 v0.9.21 가이드 단계 / v0.9.20 Gate 채팅 신뢰성 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -1300,9 +1300,18 @@ def step_gate(sess: dict, classification: str):
     sess["status"] = "gate_waiting"
     # 입력 소스 SCR 매핑도 함께 전달 — 프론트의 Gate UI에서 안내문 노출
     _scr_map = sess.get("_source_scr_map") or {}
+    # v0.9.22: Stage 1 분류표 중복 가능성 예측
+    try:
+        prediction = predict_classification_duplicates(classification)
+    except Exception as _e:
+        push_log(sess, f"[GATE] 중복 예측 스킵: {_e}")
+        prediction = {"predictions": [], "high_risk_count": 0}
+    if prediction.get("high_risk_count"):
+        push_log(sess, f"[GATE] 분류표 중복 가능성 {prediction['high_risk_count']}개 그룹 탐지")
     push(sess, "gate", {
         "content": classification,
         "source_scr_map": _scr_map,
+        "duplicate_prediction": prediction,
     })
     # 사용자 승인까지 블로킹
     sess["gate_event"].wait()
@@ -2033,6 +2042,117 @@ def detect_duplicate_error_tcs(tc_md: str) -> dict:
         "total_duplicates": total_duplicates,
         "suggested_keep": suggested_keep,
         "suggested_remove": suggested_remove,
+    }
+
+
+def predict_classification_duplicates(classification_md: str) -> dict:
+    """분류표(TC 작성 전) 단계에서 중복 가능성 예측 — Stage 1.
+
+    TC ID 가 아직 없으므로 휴리스틱 기반:
+      1. 같은 대분류 내 중분류 5개 이상 → AI 가 비기능 TC 반복 작성 가능성 높음
+      2. 같은 대분류 내 여러 중분류에 같은 소분류 키워드 등장 (예: 모두에 "로딩") → 통합 후보
+
+    Returns:
+      {
+        "predictions": [
+          {
+            "type": "group_size" | "shared_minor",
+            "major": "01.로그인_Gmail",
+            "middle_count": 5,
+            "middles": [...],
+            "shared_keyword": "로딩 시간" (shared_minor 일 때만),
+            "predicted_pattern": "비기능 TC (네트워크/타임아웃/로딩) 가 반복될 가능성 높음",
+            "recommendation": "그룹 entry 화면 1개에만 비기능 TC 작성 권장"
+          },
+          ...
+        ],
+        "high_risk_count": int,
+      }
+    """
+    if not classification_md:
+        return {"predictions": [], "high_risk_count": 0}
+
+    # 분류표 파싱: ## 대분류 / ### 중분류 / 소분류 불릿
+    majors = {}  # {major_name: {middle_name: [minor1, minor2, ...]}}
+    cur_major = None
+    cur_middle = None
+    for line in classification_md.split('\n'):
+        line = line.rstrip()
+        # 대분류 헤더: ## 또는 ## 대분류:
+        m_major = re.match(r'^##\s+(?:대분류[:\s]*)?(.+?)\s*$', line)
+        m_middle = re.match(r'^###\s+(?:중분류[:\s]*)?(.+?)\s*$', line)
+        if m_major and not line.startswith('###') and not line.startswith('####'):
+            name = m_major.group(1).strip()
+            # '소분류' 이런 건 대분류가 아님
+            if name and name not in ('소분류', '중분류'):
+                cur_major = name
+                cur_middle = None
+                majors.setdefault(cur_major, {})
+        elif m_middle and cur_major:
+            mid_name = m_middle.group(1).strip()
+            if mid_name and mid_name != '소분류':
+                cur_middle = mid_name
+                majors[cur_major].setdefault(cur_middle, [])
+        elif cur_major and cur_middle:
+            # 소분류 불릿: - 또는 *
+            m_minor = re.match(r'^\s*[-*]\s+(.+?)\s*$', line)
+            if m_minor:
+                minor_text = m_minor.group(1).strip()
+                # 콜론 앞부분만 추출 (예: "로딩 시간: 3G 환경..." → "로딩 시간")
+                minor_label = minor_text.split(':', 1)[0].split('—', 1)[0].strip()
+                if minor_label and minor_label != '소분류':
+                    majors[cur_major][cur_middle].append(minor_label)
+
+    predictions = []
+
+    # 휴리스틱 1: 그룹 크기 (중분류 5개 이상)
+    SIZE_THRESHOLD = 5
+    for major_name, middles in majors.items():
+        if len(middles) >= SIZE_THRESHOLD:
+            predictions.append({
+                "type": "group_size",
+                "major": major_name,
+                "middle_count": len(middles),
+                "middles": list(middles.keys()),
+                "predicted_pattern": "비기능 TC (네트워크/타임아웃/로딩 시간 등) 가 여러 화면에 반복 작성될 가능성 높음",
+                "recommendation": "그룹의 entry 성격 화면 1개에만 비기능 TC 작성 권장 (원칙 G)"
+            })
+
+    # 휴리스틱 2: 같은 대분류 내 여러 중분류에 동일 소분류 키워드 등장
+    DUPLICATE_KEYWORDS = [
+        '로딩 시간', '네트워크', '타임아웃', '백그라운드', '포그라운드',
+        '화면 회전', '메모리', '강제 종료', '오프라인',
+    ]
+    for major_name, middles in majors.items():
+        # 각 키워드가 몇 개 중분류에 등장하는지 카운트
+        keyword_hits = {kw: [] for kw in DUPLICATE_KEYWORDS}
+        for mid_name, minors in middles.items():
+            for minor_label in minors:
+                for kw in DUPLICATE_KEYWORDS:
+                    if kw in minor_label:
+                        keyword_hits[kw].append(mid_name)
+                        break
+        for kw, mids_with_kw in keyword_hits.items():
+            if len(mids_with_kw) >= 2:
+                # 그룹 크기 휴리스틱과 중복 안 되게 — 같은 major 가 이미 group_size 로 들어가 있으면 키워드만 추가
+                existing = next((p for p in predictions if p["major"] == major_name and p["type"] == "group_size"), None)
+                if existing:
+                    existing.setdefault("shared_keywords", []).append({"keyword": kw, "middles": mids_with_kw})
+                else:
+                    predictions.append({
+                        "type": "shared_minor",
+                        "major": major_name,
+                        "middle_count": len(middles),
+                        "middles": list(middles.keys()),
+                        "shared_keyword": kw,
+                        "shared_in_middles": mids_with_kw,
+                        "predicted_pattern": f'"{kw}" 관련 소분류가 여러 중분류에 등장 — 통합 후보',
+                        "recommendation": f'"{kw}" 검증은 그룹 대표 화면 1개에서만 권장'
+                    })
+
+    return {
+        "predictions": predictions,
+        "high_risk_count": len(predictions),
     }
 
 
@@ -2902,7 +3022,19 @@ def step_build_excel(sess: dict, tc_content: str, project_name: str,
             if result and result.get("ok"):
                 push_log(sess, f"[빌드] 모듈 호출 성공 — 총 {result['total_tc']} TC / Smoke {result['smoke_tc']} / 대분류 {result['major_count']}시트")
                 sess["smoke_tc"] = result["smoke_tc"]
-                return result["out_path"]
+                out_path = result["out_path"]
+                # v0.9.22: 통합 빌드인 경우 파일명에 _merged suffix 추가
+                fname_suffix = sess.get("_excel_filename_suffix", "")
+                if fname_suffix and out_path and out_path.exists():
+                    new_name = out_path.stem + fname_suffix + out_path.suffix
+                    new_path = out_path.parent / new_name
+                    try:
+                        out_path.rename(new_path)
+                        out_path = new_path
+                        push_log(sess, f"[빌드] 통합 결과 파일명 → {new_path.name}")
+                    except Exception as _re:
+                        push_log(sess, f"[빌드] 파일명 rename 실패 (원본 유지): {_re}")
+                return out_path
         except Exception as e:
             push_log(sess, f"[빌드] 모듈 호출 실패 ({type(e).__name__}: {e}) — subprocess 폴백")
 
@@ -5442,6 +5574,270 @@ def _sync_features_policy_with_classification(sess, client, new_classification, 
     return "synced"
 
 
+@app.route("/merge-classification/<sid>", methods=["POST"])
+def merge_classification(sid):
+    """Stage 1 — 분류표 자동 정리 (TC 작성 전).
+
+    예측된 중복 가능성에 따라 AI 가 분류표 재구성:
+    - 같은 그룹 내 비기능 TC 후보를 entry 화면에 통합 (비고에 [통합] 명시)
+    - 중분류 자체는 보존 (사용자 의도 명시 없으면 함부로 통합 X)
+
+    응답: { "ok": true, "updated_doc": str, "predictions_resolved": int }
+    """
+    import anthropic
+    sess = SESSIONS.get(sid)
+    if not sess:
+        return jsonify({
+            "ok": False,
+            "error": "세션이 만료되었습니다. 페이지를 새로고침하고 '이어서 작업'을 클릭하세요."
+        }), 404
+    if sess.get("status") != "gate_waiting":
+        return jsonify({"ok": False, "error": "Gate 대기 상태가 아닙니다."}), 400
+
+    data = request.get_json(force=True) or {}
+    current_doc = (data.get("current_doc") or "").strip()
+    predictions = data.get("predictions") or []
+    if not current_doc:
+        return jsonify({"ok": False, "error": "분류표가 비어있습니다."}), 400
+    if not predictions:
+        return jsonify({"ok": False, "error": "통합할 예측 정보가 없습니다."}), 400
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # 예측 결과 텍스트화
+    pred_text_lines = []
+    for i, p in enumerate(predictions, 1):
+        major = p.get("major", "")
+        rec = p.get("recommendation", "")
+        if p.get("type") == "shared_minor":
+            kw = p.get("shared_keyword", "")
+            mids = p.get("shared_in_middles", [])
+            pred_text_lines.append(f"{i}. [{major}] '{kw}' 키워드가 {len(mids)}개 중분류에 등장 ({', '.join(mids)}). {rec}")
+        else:
+            mc = p.get("middle_count", 0)
+            mids = p.get("middles", [])
+            pred_text_lines.append(f"{i}. [{major}] 중분류 {mc}개 → {rec}")
+    pred_text = "\n".join(pred_text_lines)
+
+    system_prompt = """당신은 TC 분류 전문가입니다. 분류표에서 중복 가능성을 줄이도록 정리합니다.
+
+## 절대 규칙
+
+1. **중분류 자체를 함부로 삭제하지 마세요** — 사용자가 명시적으로 요청한 경우만 삭제.
+2. **소분류는 정리 가능** — 같은 그룹 내 여러 중분류에 같은 비기능 소분류가 반복되면, 그룹 entry 화면(첫 번째 중분류 또는 'Splash'/'Sign-in Start' 같은 진입 성격) 1개로 통합하고 다른 중분류에선 제거.
+3. **통합된 소분류 옆에 [통합] 표시** — 예: "- 로딩 시간 [통합 — 그룹 대표 화면 검증]"
+4. **응답은 두 부분 형식 유지**:
+   1. [REPLY] 태그: 무엇을 정리했는지 1-3문장 요약
+   2. [DOCUMENT] 태그: 정리된 전체 분류표 (마크다운)
+5. **분류표 형식 유지** (## 대분류, ### 중분류, 소분류 불릿)
+"""
+
+    user_msg = f"""## 현재 분류표
+```
+{current_doc[:12000]}
+```
+
+## 발견된 중복 가능성 ({len(predictions)}개)
+{pred_text}
+
+## 통합 지시
+위 예측에 따라 분류표의 비기능 소분류 (네트워크/타임아웃/로딩 시간 등) 를 그룹 대표 화면 1개에만 남기고 다른 중분류에선 제거하세요.
+스펙 명시 케이스(에러 처리 등 고유 시나리오) 는 유지하세요.
+"""
+
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=16384,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        ai_text = resp.content[0].text
+        stop_reason = getattr(resp, "stop_reason", None)
+
+        reply_match = re.search(r'\[REPLY\](.*?)(?=\[DOCUMENT\]|$)', ai_text, re.DOTALL)
+        doc_match = re.search(r'\[DOCUMENT\](.*?)$', ai_text, re.DOTALL)
+        reply_text = reply_match.group(1).strip() if reply_match else ai_text.strip()
+        updated_doc = current_doc
+        if doc_match:
+            updated_doc = doc_match.group(1).strip()
+            if updated_doc.startswith("```"):
+                lines = updated_doc.split("\n")
+                updated_doc = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+
+        truncated = (stop_reason == "max_tokens")
+        if truncated:
+            return jsonify({
+                "ok": False,
+                "error": "AI 응답이 너무 길어 잘렸습니다. 분류표가 매우 큰 경우 발생할 수 있어요. 수동으로 미니 채팅에서 통합 요청해 주세요.",
+            }), 500
+
+        push_log(sess, f"[분류표 정리] 자동 통합 완료 — {len(predictions)}개 패턴 처리")
+        return jsonify({
+            "ok": True,
+            "updated_doc": updated_doc,
+            "reply": reply_text,
+            "predictions_resolved": len(predictions),
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"분류표 정리 실패: {e}"}), 500
+
+
+@app.route("/merge-tcs/<sid>", methods=["POST"])
+def merge_tcs(sid):
+    """Stage 2 — TC 자동 통합 + Excel 재빌드 (Step 5).
+
+    1. tc_final.md 로드
+    2. AI 호출 — duplicate_report 의 통합 후보 TC 제거 + 대표 TC 비고에 [통합] 태그
+    3. tc_final.md 새 버전 저장 (원본 보존)
+    4. step_build_excel() 다시 호출 → 새 Excel 생성 (_merged suffix)
+    5. 응답: { ok, filename, removed_count, new_total_tc }
+    """
+    import anthropic
+    sess = SESSIONS.get(sid)
+    if not sess:
+        return jsonify({
+            "ok": False,
+            "error": "세션이 만료되었습니다. 페이지를 새로고침하세요."
+        }), 404
+
+    data = request.get_json(force=True) or {}
+    duplicate_report = data.get("duplicate_report") or {}
+    patterns = duplicate_report.get("patterns") or []
+    if not patterns:
+        return jsonify({"ok": False, "error": "통합할 중복 패턴이 없습니다."}), 400
+
+    # tc_final.md 로드
+    tc_final_path = sess.get("workspace", Path()) / "tc_final.md"
+    if not tc_final_path.exists():
+        return jsonify({"ok": False, "error": f"TC 파일을 찾을 수 없습니다: {tc_final_path}"}), 404
+    tc_md = tc_final_path.read_text(encoding="utf-8")
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # 통합 지시 텍스트 생성
+    merge_instructions = []
+    total_to_remove = 0
+    for p in patterns:
+        keep = p.get("keep", "")
+        remove = p.get("remove") or []
+        pattern_name = p.get("pattern", "")
+        major = p.get("major", "")
+        if keep and remove:
+            merge_instructions.append(
+                f'- [{major}] "{pattern_name}" 패턴: '
+                f'유지 = `{keep}`, 제거 = {", ".join(f"`{r}`" for r in remove)}'
+            )
+            total_to_remove += len(remove)
+    if not merge_instructions:
+        return jsonify({"ok": False, "error": "통합할 TC 가 없습니다."}), 400
+
+    instructions_text = "\n".join(merge_instructions)
+
+    system_prompt = """당신은 TC 통합 전문가입니다. 기존 TC 마크다운에서 중복 패턴을 통합 정리합니다.
+
+## 절대 규칙
+
+1. **통합 후보 TC 들을 마크다운에서 완전히 제거** (`### TC-ID — title` 부터 다음 `### ` 또는 `---` 직전까지).
+2. **유지 권장 TC 의 비고에 [통합] 태그 추가** — 예: `**비고**\\n- [통합] 그룹 단위 비기능 검증 — 같은 패턴을 다른 화면별로 반복 작성하지 않음 (원칙 G)`
+3. **다른 모든 TC 는 그대로 유지** — 명시되지 않은 TC 는 절대 변경 금지.
+4. **마크다운 형식 보존** — `### TC-ID`, `| 분류 |`, `**테스트 단계**` 등 모든 형식 유지.
+5. **응답은 통합된 마크다운 전체** — 메타 헤더(`# TC 최종본 — ...`) 도 포함하여 그대로 반환.
+
+응답 형식:
+[REPLY] 1-2문장 요약
+[DOCUMENT] 통합된 전체 마크다운
+"""
+
+    user_msg = f"""## 통합 지시
+{instructions_text}
+
+## 현재 TC 마크다운 (전체 보존, 위 지시만 적용)
+```
+{tc_md[:18000]}
+```
+
+위 통합 지시를 정확히 적용하여 **수정된 전체 TC 마크다운**을 반환하세요."""
+
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=16384,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        ai_text = resp.content[0].text
+        stop_reason = getattr(resp, "stop_reason", None)
+
+        doc_match = re.search(r'\[DOCUMENT\](.*?)$', ai_text, re.DOTALL)
+        reply_match = re.search(r'\[REPLY\](.*?)(?=\[DOCUMENT\]|$)', ai_text, re.DOTALL)
+        if not doc_match:
+            return jsonify({"ok": False, "error": "AI 응답 파싱 실패 — DOCUMENT 태그 누락"}), 500
+
+        new_tc_md = doc_match.group(1).strip()
+        if new_tc_md.startswith("```"):
+            lines = new_tc_md.split("\n")
+            new_tc_md = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+
+        if stop_reason == "max_tokens":
+            return jsonify({"ok": False, "error": "AI 응답이 잘렸습니다. TC 가 많은 경우 발생 — 수동 정리 필요"}), 500
+
+        # 새 tc_final.md 저장 (원본은 그대로 둠 — 백업용으로 _v1 보존)
+        merged_path = sess["workspace"] / "tc_final_merged.md"
+        merged_path.write_text(new_tc_md, encoding="utf-8")
+
+        # TC 개수 재계산
+        new_tc_count = len(re.findall(r"^###\s", new_tc_md, re.MULTILINE))
+        old_tc_count = len(re.findall(r"^###\s", tc_md, re.MULTILINE))
+        actual_removed = max(0, old_tc_count - new_tc_count)
+        new_smoke = max(1, round(new_tc_count * 0.35))
+
+        # Excel 재빌드 — 임시로 tc_final.md 를 새 내용으로 교체했다가 빌드 후 복원
+        original_tc_md = tc_md
+        try:
+            tc_final_path.write_text(new_tc_md, encoding="utf-8")
+            # build_excel 호출 시 _merged suffix 가 붙도록 sess 에 마킹
+            sess["_excel_filename_suffix"] = "_merged"
+            project_name = sess.get("project_name", "프로젝트")
+            new_excel_path = step_build_excel(sess, new_tc_md, project_name, new_tc_count, new_smoke)
+        finally:
+            # 원본 tc_final.md 복원 (재시도 등을 위해)
+            tc_final_path.write_text(original_tc_md, encoding="utf-8")
+            sess.pop("_excel_filename_suffix", None)
+
+        # sess["result"] 갱신 (병합본을 새 결과로)
+        sess["result"] = new_excel_path
+
+        push_log(sess, f"[TC 통합] 자동 통합 완료 — {actual_removed}개 TC 제거 (총 {old_tc_count} → {new_tc_count}). 새 Excel: {new_excel_path.name}")
+
+        reply_text = reply_match.group(1).strip() if reply_match else f"{actual_removed}개 TC 통합 완료"
+
+        return jsonify({
+            "ok": True,
+            "filename": new_excel_path.name,
+            "removed_count": actual_removed,
+            "new_total_tc": new_tc_count,
+            "new_smoke_tc": new_smoke,
+            "reply": reply_text,
+            "size": new_excel_path.stat().st_size if new_excel_path.exists() else 0,
+        })
+
+    except Exception as e:
+        import traceback
+        push_log(sess, f"[TC 통합] 실패: {e}")
+        push_log(sess, traceback.format_exc()[:500])
+        return jsonify({"ok": False, "error": f"TC 통합 실패: {e}"}), 500
+
+
 @app.route("/export-gate", methods=["POST"])
 def export_gate():
     """Human Gate 분류표를 Excel로 내보내기 (범위 선택 포함)"""
@@ -6913,6 +7309,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- 입력 소스 화면 식별자 안내 (v0.9.13~) — gate 이벤트 도착 시 채워짐 -->
     <div id="sourceScrNotice" style="display:none;margin:10px 0;padding:10px 14px;border-radius:8px;font-size:12.5px;line-height:1.55;"></div>
+
+    <!-- v0.9.22 Stage 1 — 분류표 단계 중복 가능성 예측 알림 -->
+    <div id="classifyDuplicateNotice" style="display:none;margin:10px 0;padding:14px 16px;background:#FFFBEB;border:1.5px solid #FCD34D;border-radius:10px;"></div>
 
     <!-- TC ID 생성 방식 선택 패널 (독립 영역, 항상 표시) -->
     <div id="tcIdModePanel" style="background:linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%);border:2px solid #3B82F6;border-radius:12px;padding:16px 20px;margin:14px 0 18px 0;box-shadow:0 2px 8px rgba(59, 130, 246, 0.15);">
@@ -8846,6 +9245,9 @@ function handleEvent(evt) {
     window._sourceScrMap = evt.data.source_scr_map || {};
     // 사용자 안내: 입력 소스에서 화면 식별자 발견 여부
     renderSourceScrNotice(window._sourceScrMap);
+    // v0.9.22 Stage 1 — 분류표 중복 가능성 예측 알림
+    window._classifyPrediction = evt.data.duplicate_prediction || { predictions: [], high_risk_count: 0 };
+    try { renderClassifyDuplicateNotice(window._classifyPrediction); } catch (_) {}
     // Gate 진입 시 입력/파이프라인 카드는 숨기고 Gate 패널에 집중
     document.getElementById('card1').classList.add('hidden');
     document.getElementById('card2').classList.add('hidden');
@@ -9183,48 +9585,98 @@ function renderDuplicateNotice(report) {
   });
   html += '</div>';
 
-  // ── v0.9.21: 명확한 사용 단계 가이드 ──
-  html += '<div style="margin-top:14px;padding:12px;background:#FFFFFF;border:1.5px solid #FBBF24;border-radius:8px;">';
-  html += '<div style="font-size:12.5px;font-weight:700;color:#92400E;margin-bottom:8px;display:flex;align-items:center;gap:6px;">';
-  html += '<span>💡</span><span>이 분석을 어떻게 활용하나요?</span>';
+  // ── v0.9.22: 자동 통합 액션 (단계 가이드 단순화) ──
+  html += '<div style="margin-top:14px;padding:12px;background:#ECFDF5;border:1.5px solid #6EE7B7;border-radius:8px;">';
+  html += '<div style="font-size:12.5px;font-weight:700;color:#065F46;margin-bottom:6px;display:flex;align-items:center;gap:6px;">';
+  html += '<span>💡</span><span>지금 바로 정리하시겠어요?</span>';
   html += '</div>';
-  html += '<div style="font-size:11.5px;color:#374151;line-height:1.7;">';
-
-  // 단계 1
-  html += '<div style="margin-bottom:8px;"><strong style="color:#1E3A5F;">단계 1.</strong> 위 내용 검토 — 통합이 필요한 패턴 결정 (스펙 명시 케이스는 그대로 두기)</div>';
-
-  // 단계 2 — 가장 권장하는 방법
-  html += '<div style="margin-bottom:8px;padding:8px 10px;background:#ECFDF5;border-left:3px solid #10B981;border-radius:4px;">';
-  html += '<strong style="color:#065F46;">단계 2-A. 지금 바로 통합 (권장)</strong> — Excel 다시 만들 필요 있을 때<br>';
-  html += '① <strong>📋 분석 결과 복사</strong> 버튼 클릭<br>';
-  html += '② 아래 <strong>"🔄 추가 TC 생성"</strong> 또는 <strong>"📝 범위만 변경하여 재시작"</strong> 버튼 클릭<br>';
-  html += '③ 분류표 검토(Step 3) 화면 진입 → <strong>하단 AI 도우미 채팅창에 Cmd+V (붙여넣기)</strong><br>';
-  html += '④ 채팅 끝에 <em>"위 분석에 따라 통합 후보 TC 들을 제거해줘"</em> 추가 입력 → 전송<br>';
-  html += '⑤ AI 가 분류표 정리 → 승인 → 새 Excel 생성';
+  html += '<div style="font-size:11.5px;color:#374151;line-height:1.55;margin-bottom:10px;">';
+  html += '아래 <strong>"🔁 자동 통합 + Excel 재생성"</strong> 버튼을 누르면 AI 가 통합 후보 TC 들을 제거하고 새 Excel 을 만들어줍니다. <strong>원본 Excel 은 보존</strong>됩니다 (파일명에 <code style="background:#FFFFFF;padding:1px 4px;border-radius:3px;">_merged</code> 추가).';
   html += '</div>';
-
-  // 단계 2-B — 보조 방법
-  html += '<div style="margin-bottom:6px;padding:8px 10px;background:#F3F4F6;border-left:3px solid #6B7280;border-radius:4px;">';
-  html += '<strong style="color:#374151;">단계 2-B. 다음 신규 작업 시 활용</strong> — 비슷한 입력으로 새로 만들 때<br>';
-  html += '① 📋 분석 결과 복사<br>';
-  html += '② 신규 작업 시작 → <strong>"TC 생성 범위"</strong> 입력란에 붙여넣기 후 다음 추가:<br>';
-  html += '<code style="display:block;margin-top:4px;padding:6px 8px;background:#FFFFFF;border:1px solid #D1D5DB;border-radius:4px;font-size:10.5px;color:#374151;">';
-  html += '⚠️ 위 패턴들은 그룹당 1개 대표 화면(Entry 성격)에만 작성. 같은 비기능 TC 를 여러 화면에 반복 금지 (원칙 G).';
-  html += '</code>';
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
+  html += '<button onclick="autoMergeTcs()" id="autoMergeTcsBtn" style="padding:9px 16px;background:#10B981;color:#FFFFFF;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;">🔁 자동 통합 + Excel 재생성</button>';
+  html += '<button onclick="copyDuplicateReportToClipboard()" style="padding:9px 14px;background:#FFFFFF;color:#065F46;border:1.5px solid #6EE7B7;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">📋 수동 — 분석 결과 복사</button>';
   html += '</div>';
-
-  html += '</div></div>';
-
-  // 액션 버튼
-  html += '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">';
-  html += '<button onclick="copyDuplicateReportToClipboard()" style="padding:7px 14px;background:#10B981;color:#FFFFFF;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">📋 분석 결과 복사</button>';
-  html += '<span style="font-size:11px;color:#78350F;align-self:center;">';
-  html += '복사 후 위 단계 2-A 또는 2-B 따라 활용하세요.';
-  html += '</span>';
+  html += '<div style="font-size:10.5px;color:#6B7280;margin-top:8px;">자동 통합이 실패하거나 직접 검토하고 싶을 때만 복사 버튼을 사용하세요.</div>';
   html += '</div>';
 
   el.innerHTML = html;
   el.style.display = '';
+}
+
+// ── v0.9.22 Stage 2 — TC 자동 통합 + Excel 재생성 ──
+async function autoMergeTcs() {
+  var report = window._duplicateReport;
+  if (!report || !report.patterns || report.patterns.length === 0) {
+    alert('통합할 중복 패턴이 없습니다.');
+    return;
+  }
+  if (!currentSid) { alert('세션이 없습니다.'); return; }
+
+  var totalRemove = report.total_duplicates || 0;
+  if (!confirm('AI 가 통합 후보 TC ' + totalRemove + '개를 제거하고 새 Excel 을 생성합니다.\\n원본 Excel 은 보존됩니다 (별도 파일).\\n약 30~60초 소요.\\n계속할까요?')) return;
+
+  var btn = document.getElementById('autoMergeTcsBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ 통합 중... (30~60초)';
+    btn.style.background = '#9CA3AF';
+    btn.style.cursor = 'wait';
+  }
+
+  try {
+    var r = await fetch('/merge-tcs/' + currentSid, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ duplicate_report: report }),
+    });
+    var d = await r.json();
+    if (!d.ok) {
+      alert('통합 실패: ' + (d.error || 'unknown'));
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '🔁 자동 통합 + Excel 재생성';
+        btn.style.background = '#10B981';
+        btn.style.cursor = 'pointer';
+      }
+      return;
+    }
+
+    // 결과 카드 갱신 — 새 파일명, 새 TC 수
+    var fileEl = document.getElementById('resultFilename');
+    var metaEl = document.getElementById('resultMeta');
+    var totalEl = document.getElementById('statTotal');
+    var smokeEl = document.getElementById('statSmoke');
+    if (fileEl) fileEl.textContent = d.filename;
+    if (metaEl) metaEl.textContent = (d.size ? (d.size / 1024).toFixed(1) + ' KB' : '—') + ' · 통합본';
+    if (totalEl) totalEl.textContent = d.new_total_tc;
+    if (smokeEl) smokeEl.textContent = d.new_smoke_tc;
+    currentFilename = d.filename;
+
+    // 알림 박스 → 녹색 완료 표시
+    var notice = document.getElementById('duplicateNotice');
+    if (notice) {
+      notice.style.background = '#ECFDF5';
+      notice.style.borderColor = '#6EE7B7';
+      notice.innerHTML = '<div style="display:flex;align-items:center;gap:10px;color:#065F46;font-size:13px;">';
+      notice.innerHTML += '<span style="font-size:24px;">✅</span>';
+      notice.innerHTML += '<div><strong>자동 통합 완료</strong><br>';
+      notice.innerHTML += '<span style="font-size:11.5px;">';
+      notice.innerHTML += '제거된 TC: <strong>' + d.removed_count + '개</strong> · ';
+      notice.innerHTML += '새 Excel: <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;">' + escapeHtml(d.filename) + '</code><br>';
+      notice.innerHTML += '원본 Excel 은 폴더에 그대로 보존되어 있습니다.';
+      notice.innerHTML += '</span></div></div>';
+    }
+    showToast('✅ ' + d.removed_count + '개 TC 통합 완료 — 새 Excel: ' + d.filename, 'success');
+  } catch (e) {
+    alert('네트워크 오류: ' + e.message);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🔁 자동 통합 + Excel 재생성';
+      btn.style.background = '#10B981';
+      btn.style.cursor = 'pointer';
+    }
+  }
 }
 
 function copyDuplicateReportToClipboard() {
@@ -9273,6 +9725,117 @@ if (typeof escapeHtml === 'undefined') {
       return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
     });
   };
+}
+
+// ── v0.9.22 Stage 1 — 분류표 중복 가능성 예측 알림 ──
+function renderClassifyDuplicateNotice(prediction) {
+  var el = document.getElementById('classifyDuplicateNotice');
+  if (!el) return;
+  prediction = prediction || { predictions: [], high_risk_count: 0 };
+  if (!prediction.high_risk_count || !prediction.predictions || prediction.predictions.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+  var html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">';
+  html += '<span style="font-size:18px;">⚠️</span>';
+  html += '<strong style="font-size:13.5px;color:#92400E;">중복 가능성 ' + prediction.predictions.length + '개 그룹 발견 (Stage 1 — TC 작성 전)</strong>';
+  html += '</div>';
+  html += '<div style="font-size:11.5px;color:#78350F;margin-bottom:10px;line-height:1.55;">';
+  html += '같은 대분류 내에 중분류가 많거나 동일 비기능 키워드가 반복되어, AI 가 TC 작성 시 비기능 TC 를 여러 화면에 반복 작성할 가능성이 있습니다. 미리 분류표를 정리하면 TC 결과가 깔끔해집니다.';
+  html += '</div>';
+
+  // 예측별 상세
+  html += '<div style="background:#FFFFFF;border:1px solid #FBBF24;border-radius:8px;overflow:hidden;margin-bottom:10px;">';
+  prediction.predictions.forEach(function(p, idx) {
+    var border = idx > 0 ? 'border-top:1px solid #FCD34D;' : '';
+    html += '<div style="padding:10px 12px;' + border + '">';
+    html += '<div style="font-size:12.5px;font-weight:700;color:#92400E;margin-bottom:4px;">';
+    if (p.type === 'shared_minor') {
+      html += '🔁 "' + escapeHtml(p.shared_keyword) + '" 키워드 — ' + escapeHtml(p.major);
+    } else {
+      html += '🔁 그룹 크기 — ' + escapeHtml(p.major) + ' (중분류 ' + p.middle_count + '개)';
+    }
+    html += '</div>';
+    html += '<div style="font-size:11px;color:#374151;line-height:1.5;">';
+    html += '<div>' + escapeHtml(p.predicted_pattern || '') + '</div>';
+    html += '<div style="margin-top:2px;color:#6B7280;">→ ' + escapeHtml(p.recommendation || '') + '</div>';
+    if (p.shared_in_middles && p.shared_in_middles.length) {
+      html += '<div style="margin-top:4px;font-size:10.5px;color:#6B7280;">└ 영향 중분류: ' + p.shared_in_middles.map(escapeHtml).join(', ') + '</div>';
+    }
+    html += '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // 액션 버튼
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">';
+  html += '<button onclick="autoMergeClassification()" style="padding:8px 14px;background:#10B981;color:#FFFFFF;border:none;border-radius:6px;font-size:12.5px;font-weight:700;cursor:pointer;">🔁 분류표 자동 정리</button>';
+  html += '<button onclick="dismissClassifyDuplicateNotice()" style="padding:8px 14px;background:#FFFFFF;color:#92400E;border:1.5px solid #FCD34D;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">✕ 무시 (그대로 진행)</button>';
+  html += '<span style="font-size:11px;color:#78350F;margin-left:6px;">자동 정리 실패 시 미니 채팅에서 직접 수정 가능합니다.</span>';
+  html += '</div>';
+
+  el.innerHTML = html;
+  el.style.display = '';
+}
+
+function dismissClassifyDuplicateNotice() {
+  var el = document.getElementById('classifyDuplicateNotice');
+  if (el) el.style.display = 'none';
+}
+
+async function autoMergeClassification() {
+  var prediction = window._classifyPrediction;
+  if (!prediction || !prediction.predictions || prediction.predictions.length === 0) {
+    alert('통합할 예측 정보가 없습니다.');
+    return;
+  }
+  if (!currentSid) { alert('세션이 없습니다.'); return; }
+  if (!confirm('AI 가 분류표를 정리합니다.\\n비기능 소분류(네트워크/타임아웃/로딩 등)를 그룹 대표 화면 1개에 통합합니다.\\n계속할까요?')) return;
+
+  var notice = document.getElementById('classifyDuplicateNotice');
+  if (notice) {
+    notice.innerHTML = '<div style="display:flex;align-items:center;gap:10px;color:#92400E;font-size:13px;font-weight:600;">⏳ AI 가 분류표를 정리하고 있어요... (10~30초)</div>';
+  }
+
+  try {
+    var currentDoc = document.getElementById('gateContent').value || '';
+    var r = await fetch('/merge-classification/' + currentSid, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        current_doc: currentDoc,
+        predictions: prediction.predictions,
+      }),
+    });
+    var d = await r.json();
+    if (!d.ok) {
+      alert('분류표 정리 실패: ' + (d.error || 'unknown'));
+      // 알림 박스 복원
+      renderClassifyDuplicateNotice(prediction);
+      return;
+    }
+    // 분류표 갱신
+    document.getElementById('gateContent').value = d.updated_doc;
+    renderGateViewer(d.updated_doc);
+    // 미니 채팅에 안내 메시지 추가
+    if (typeof addGateChatMsg === 'function') {
+      addGateChatMsg('system', '✅ 분류표 자동 정리 완료 — ' + (d.predictions_resolved || 0) + '개 패턴 처리. ' + (d.reply || ''));
+    }
+    // 알림 박스 → 녹색 완료 표시로 변경
+    if (notice) {
+      notice.style.background = '#ECFDF5';
+      notice.style.borderColor = '#6EE7B7';
+      notice.innerHTML = '<div style="display:flex;align-items:center;gap:10px;color:#065F46;font-size:13px;">';
+      notice.innerHTML += '<span style="font-size:18px;">✅</span>';
+      notice.innerHTML += '<div><strong>분류표 자동 정리 완료</strong><br>';
+      notice.innerHTML += '<span style="font-size:11.5px;">' + escapeHtml(d.reply || '') + ' 분류표를 검토 후 승인하세요.</span></div>';
+      notice.innerHTML += '</div>';
+    }
+    showToast('✅ 분류표 자동 정리 완료', 'success');
+  } catch (e) {
+    alert('네트워크 오류: ' + e.message);
+    renderClassifyDuplicateNotice(prediction);
+  }
 }
 
 function renderSourceScrNotice(scrMap) {
