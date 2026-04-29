@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.15"
+APP_VERSION         = "v0.9.16"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "Gate 수정 사항 TC 미반영 버그 fix (분류표 우선 + 본문 자동 동기화)"
+APP_VERSION_TAGLINE = "수정 플로우에도 영향도 우선 원칙 적용 (Gate 수정 사항 신뢰성 일관화)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 [중대] Gate 채팅에서 분류표 수정 → Viewer 반영 → 그러나 Excel 결과는 원본 기준이던 버그 fix",
-    "🆕 옵션 C: TC 작성 프롬프트에 '분류표 우선 원칙' 절대 규칙 추가 — 본문에 있어도 분류표에 없으면 TC 만들지 말 것",
-    "🆕 옵션 B: Gate 채팅이 분류표 수정 시 features/policy 본문도 AI 로 자동 동기화 — 일관된 컨텍스트",
-    "💡 동기화 결과를 사용자에게 안내 (✅ 본문 동기화 완료 / ⚠️ 본문 동기화 실패)",
-    "🔁 v0.9.14 마침표 규칙 / v0.9.13 화면 코드 입력 소스 기반 모두 포함",
+    "🆕 기존 TC 수정 플로우(run_modify_pipeline)의 system_modify 프롬프트에 '영향도 분석 우선 원칙' 추가",
+    "🛡 사용자가 Gate 에서 영향도 분석을 수정하면, AI 가 그것을 최종 진실로 따름 — 임의 환상 금지",
+    "💡 user_modify 의 '기존 TC 전체' 섹션에도 '참고용' 명시 — 승인된 지시사항 우선",
+    "🔄 신규 TC 생성(v0.9.15) 과 수정 플로우 모두 동일한 신뢰성 기준 적용",
+    "🔁 v0.9.15 분류표 우선 원칙 + 본문 동기화 / v0.9.14 마침표 규칙 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -3748,7 +3748,30 @@ TC 형식 규칙:
 
         system_modify = f"""당신은 QA 엔지니어입니다. 기존 TC를 수정 계획에 따라 정확히 수정하세요.
 
-TC 형식 규칙:
+## 🎯 영향도 분석 우선 원칙 (절대 규칙 — 반드시 준수)
+
+⚠️ **사용자가 검토·승인한 영향도 분석(approved_plan)이 최종 진실 소스입니다.**
+
+영향도 분석은 단순 참고가 아닙니다. 사용자가 Gate 검토 단계에서 다음과 같은 수정을 했을 수 있습니다:
+- 삭제 대상에서 일부 TC 제외 (보존)
+- 수정 대상에 추가 TC 포함 또는 제외
+- 신규 추가 항목 변경
+- 변경 범위 조정
+
+**그러므로**:
+
+1. **approved_plan 에 명시된 변경(삭제/수정/추가)만 정확히 적용하세요.**
+2. **approved_plan 에 없는 TC 는 변경하지 마세요** — 기존 TC 그대로 유지.
+3. **기존 TC (existing_tc) 의 내용을 보고 영향이 있어 보여도, approved_plan 에 없으면 건드리지 마세요.**
+4. **임의로 추가 TC 를 생성하지 마세요** — 영향도 분석의 "신규 추가" 항목만 추가.
+5. 만약 approved_plan 의 지시가 모호하면 보수적으로 판단 (변경 최소화 우선).
+
+예시:
+- approved_plan: "SCR-003-001 삭제, SCR-005-002 수정 (Given 단계에 OTP 추가)"
+- → 정확히 그 두 TC 만 변경, 나머지 모든 TC 는 그대로 유지
+- 사용자가 "SCR-007-003 도 비슷해 보이니까 같이 수정" 식의 환상 금지
+
+## TC 형식 규칙
 - bold heading (### **SC-XXX-YYY-NNN**) = 최소 TC (smoke test 대상)
 - plain heading (### SC-XXX-YYY-NNN) = 일반 TC
 - Given(사전 조건)은 번호 매긴 목록
@@ -3756,15 +3779,18 @@ TC 형식 규칙:
 
 {tc_rules if tc_rules else ""}"""
 
-        user_modify = f"""## 수정 지시사항
+        user_modify = f"""## 수정 지시사항 (사용자 승인 — 최종 진실 소스)
 
 {approved_plan}
 
-## 변경 배경
+## 변경 배경 (참고)
 
 {change_desc}
 
-## 기존 TC 전체
+## 기존 TC 전체 (참고용 — 승인된 수정 지시사항이 우선)
+
+⚠️ 아래 기존 TC 들은 **참고용**입니다. 위 수정 지시사항에 명시된 변경만 적용하세요.
+지시사항에 없는 TC 는 임의로 변경하지 마세요.
 
 {existing_tc[:15000]}
 
@@ -3774,7 +3800,7 @@ TC 형식 규칙:
 - 삭제 대상 TC는 완전히 제거
 - 수정 대상 TC는 내용 업데이트 (TC ID 유지)
 - 신규 TC는 기존 ID 체계에 맞춰 추가 (마지막 번호 이어서)
-- 변경되지 않은 TC는 그대로 유지
+- **수정 지시사항에 없는 TC는 그대로 유지** (임의 변경 금지)
 - 기존 TC 형식(### heading, Given/When/Then)을 반드시 유지"""
 
         modified_tc = call_claude(system_modify, user_modify, max_tokens=16000)
