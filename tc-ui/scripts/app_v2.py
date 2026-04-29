@@ -53,15 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.19"
+APP_VERSION         = "v0.9.20"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "이어서 작업 시 화면 식별자 매핑 복원"
+APP_VERSION_TAGLINE = "Gate 채팅 신뢰성 — 명령형 적극 수용 + 변경 여부 정확한 안내"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 [중요] '이어서 작업' 시 화면 식별자(SCR) 매핑이 사라지던 버그 fix — 체크포인트에 source_scr_map 저장/복원",
-    "🛡 옛 체크포인트(v0.9.18 이하) 호환 — raw_text 에서 SCR 패턴 자동 재추출 폴백",
-    "💡 복원 시 매핑 개수 로그 출력 (몇 개 복원됐는지 명확)",
-    "🔁 v0.9.18 gate_waiting 보호 / v0.9.17 원칙 G + 중복 탐지 모두 포함",
+    "🐛 [중대] '삭제' 명령에도 AI가 '질문 모호' 라며 거부하던 문제 fix — system_prompt 적극 수용 모드",
+    "🐛 변경 없는데 '✅ 업데이트되었습니다' 라며 거짓 안내하던 버그 fix — 변경 여부 명시",
+    "🔧 max_tokens 4096 → 16384 — 긴 분류표 출력 잘림 방지",
+    "🛡 잘림 감지 시 원본 보존 + 사용자에게 '더 작은 단위로 나눠 요청' 안내",
+    "🔁 v0.9.19 SCR 매핑 복원 / v0.9.18 gate_waiting 보호 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -5242,15 +5243,32 @@ def gate_chat(sid):
 - 문서 형식(마크다운, 헤딩, 목록 등)을 유지하세요."""
     else:
         system_prompt = """당신은 TC(Test Case) 분류 전문가입니다.
-현재 AI가 생성한 '분류표' 문서를 사용자의 요청에 따라 수정합니다.
+현재 AI가 생성한 '분류표' 문서를 사용자의 요청에 따라 적극적으로 수정합니다.
 
-규칙:
-- 사용자의 수정 요청을 정확히 반영하여 분류표를 업데이트하세요.
-- 응답은 반드시 두 부분으로 구성하세요:
-  1. [REPLY] 태그: 수정 내용에 대한 간단한 설명 (1-3문장)
-  2. [DOCUMENT] 태그: 수정된 전체 문서 내용 (마크다운 형식 유지)
-- 수정 요청이 없거나 질문인 경우, [DOCUMENT] 태그에는 기존 문서를 그대로 포함하세요.
-- 분류표 형식(## 대분류, ### 중분류, TC ID 패턴 등)을 유지하세요."""
+## 절대 규칙
+
+1. **짧은 명령형 요청도 명확한 수정 의도로 해석하세요** (한국어 특성).
+   - "splash 케이스 삭제" → Splash 관련 중분류/소분류를 모두 제거
+   - "이메일 입력 빼줘" → Email Input 중분류 제거
+   - "AUTH 도메인 3번 지워" → AUTH 대분류의 3번째 항목 제거
+   - "체크박스 기능 빼" → 체크박스 관련 항목 모두 제거
+
+2. **삭제 요청을 절대 거부하지 마세요**. 사용자가 "X 삭제/제거/빼줘" 라고 하면 X 와 관련된 항목을 분류표에서 모두 찾아 제거하세요.
+
+3. **모호한 경우에도 일단 수정 시도하고, [REPLY] 에 어떤 해석을 했는지 명시**하세요. 거부 대신 "Splash 관련 항목을 모두 제거했습니다. 다른 의도였으면 알려주세요." 식으로.
+
+4. **수정이 필요 없는 진짜 질문(단순 문의)** 일 때만 기존 문서 그대로 반환:
+   - "Splash 가 뭐야?" — 질문이므로 [DOCUMENT] 그대로
+   - "이 분류표 잘 만든 거 같아?" — 평가 질문이므로 그대로
+   - "splash 삭제" — 명령이므로 반드시 수정
+
+## 응답 형식 (반드시 준수)
+
+응답은 정확히 두 부분으로 구성:
+1. [REPLY] 태그: 수정 내용 명확히 (예: "Onboarding 대분류의 Splash 중분류 1개를 제거했습니다.")
+2. [DOCUMENT] 태그: 수정된 **전체** 분류표 (마크다운 형식 유지, 잘리지 않게 끝까지)
+
+분류표 형식(## 대분류, ### 중분류, 표 컬럼, TC ID 패턴) 유지."""
 
     # 메시지 구성 — 히스토리 + 현재 문서 컨텍스트 + 사용자 메시지
     messages = []
@@ -5261,19 +5279,22 @@ def gate_chat(sid):
     full_user_msg = f"""현재 문서:\n```\n{current_doc}\n```\n\n사용자 요청: {user_msg}"""
     messages.append({"role": "user", "content": full_user_msg})
 
+    # v0.9.20: max_tokens 4096 → 16384 (긴 분류표 출력 잘림 방지)
     try:
         resp = client.messages.create(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=16384,
             temperature=0,
             system=system_prompt,
             messages=messages
         )
         ai_text = resp.content[0].text
+        stop_reason = getattr(resp, "stop_reason", None)
 
         # [REPLY]와 [DOCUMENT] 파싱
         reply_text = ""
         updated_doc = current_doc  # 기본값: 변경 없음
+        truncated = False
 
         reply_match = re.search(r'\[REPLY\](.*?)(?=\[DOCUMENT\]|$)', ai_text, re.DOTALL)
         doc_match   = re.search(r'\[DOCUMENT\](.*?)$', ai_text, re.DOTALL)
@@ -5286,9 +5307,18 @@ def gate_chat(sid):
             if updated_doc.startswith("```"):
                 lines = updated_doc.split("\n")
                 updated_doc = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+            # 잘림 감지: stop_reason == "max_tokens" 또는 출력이 비정상적으로 짧음
+            if stop_reason == "max_tokens":
+                truncated = True
+                push_log(sess, "[Gate] AI 응답이 max_tokens 도달 — 분류표가 잘렸을 수 있음")
 
         if not reply_text:
             reply_text = ai_text.strip()
+
+        # 잘림 감지 시 사용자 알림 + 원본 유지 (잘린 문서로 덮어쓰기 방지)
+        if truncated:
+            updated_doc = current_doc
+            reply_text = "⚠️ 응답이 너무 길어 잘렸습니다. 더 작은 단위로 나눠서 요청해 주세요. (예: 'Splash 한 번에' 대신 'Splash 중분류 1개만 삭제')\n\n" + reply_text
 
         # ── v0.9.15: 분류표 모드에서 변경이 감지되면 features/policy 도 동기화 ──
         # 사용자가 "체크박스 기능 제거" 등 의미 있는 수정을 했을 때, 본문(features/policy)에서도
@@ -5311,6 +5341,8 @@ def gate_chat(sid):
             "reply": reply_text,
             "updated_doc": updated_doc,
             "sync_status": sync_status,
+            "changed": updated_doc != current_doc,  # v0.9.20: 변경 여부 명시
+            "truncated": truncated,                  # v0.9.20: 잘림 여부
         })
 
     except Exception as e:
@@ -9766,12 +9798,20 @@ async function sendGateChat() {
       // 히스토리 추가 (컨텍스트 유지용 — 축약 버전)
       gateChatHistory.push({ role: 'user', content: '요청: ' + msg });
       gateChatHistory.push({ role: 'assistant', content: d.reply });
-      // 변경 알림 — 동기화 결과(v0.9.15) 에 따라 다른 메시지
-      var statusMsg = '✅ 분류표가 업데이트되었습니다. 아래 표에서 확인하세요.';
-      if (d.sync_status === 'synced') {
-        statusMsg += ' 본문 정책·기능 문서도 자동 동기화 완료 — TC 작성 시 일관됨.';
-      } else if (d.sync_status === 'failed') {
-        statusMsg += ' (⚠️ 본문 동기화 실패 — 분류표 변경만 반영됨. TC 결과에 분류표 외 항목이 포함될 수 있음.)';
+      // v0.9.20: 변경 여부에 따라 다른 메시지
+      var statusMsg = '';
+      if (d.changed) {
+        statusMsg = '✅ 분류표가 업데이트되었습니다. 아래 표에서 확인하세요.';
+        if (d.sync_status === 'synced') {
+          statusMsg += ' 본문 정책·기능 문서도 자동 동기화 완료 — TC 작성 시 일관됨.';
+        } else if (d.sync_status === 'failed') {
+          statusMsg += ' (⚠️ 본문 동기화 실패 — 분류표 변경만 반영됨.)';
+        }
+      } else if (d.truncated) {
+        statusMsg = '⚠️ AI 응답이 너무 길어 잘렸습니다. 분류표는 변경되지 않았어요. 더 작은 단위로 나눠 다시 요청해 주세요.';
+      } else {
+        // 변경 없음 — 명령이 모호했거나 AI 가 질문으로 해석한 경우
+        statusMsg = 'ℹ️ 분류표가 변경되지 않았습니다. 요청이 모호했을 수 있어요. 더 명확하게 다시 요청해 주세요. (예: "Splash 중분류 삭제해줘", "AUTH 도메인의 3번 케이스 삭제")';
       }
       addGateChatMsg('system', statusMsg);
     } else {
