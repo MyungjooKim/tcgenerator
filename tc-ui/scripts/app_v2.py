@@ -53,15 +53,15 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.18"
+APP_VERSION         = "v0.9.19"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "Gate 검토 중 재시작 보호 + 우측 Viewer 안내 문구 정리"
+APP_VERSION_TAGLINE = "이어서 작업 시 화면 식별자 매핑 복원"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 [중요] gate_waiting 상태가 active_sessions 에서 빠져있던 버그 fix — 분류표 검토 중에 재시작 시 세션 보호",
-    "💡 '세션 없음' 404 에러 메시지 친화적으로 변경 — 새로고침 + 이어서 작업 안내",
-    "🆕 안내 문구 정리 — 더 이상 존재하지 않는 '우측 Viewer' 표현 제거 (4곳)",
-    "🔁 v0.9.17 원칙 G + 중복 탐지 / v0.9.16 영향도 우선 모두 포함",
+    "🐛 [중요] '이어서 작업' 시 화면 식별자(SCR) 매핑이 사라지던 버그 fix — 체크포인트에 source_scr_map 저장/복원",
+    "🛡 옛 체크포인트(v0.9.18 이하) 호환 — raw_text 에서 SCR 패턴 자동 재추출 폴백",
+    "💡 복원 시 매핑 개수 로그 출력 (몇 개 복원됐는지 명확)",
+    "🔁 v0.9.18 gate_waiting 보호 / v0.9.17 원칙 G + 중복 탐지 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -3631,13 +3631,44 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         if resumed and resumed.get("stage") in ("policy", "features", "classifying", "gate_waiting", "tc_writing"):
             raw_text = resumed["data"].get("raw_text", "")
             push_log(sess, f"[이어서] 파싱 결과 복원됨 ({len(raw_text):,}자)")
+            # v0.9.19: 입력 소스 SCR 매핑 복원 (체크포인트에 있으면 그것을, 없으면 raw_text 에서 자동 재추출)
+            saved_scr_map = resumed["data"].get("source_scr_map") or {}
+            if saved_scr_map:
+                sess["_source_scr_map"] = dict(saved_scr_map)
+                push_log(sess, f"[이어서] 화면 식별자 매핑 복원됨 ({len(saved_scr_map)}개)")
+            else:
+                # 폴백 — raw_text 에서 자동 재추출 (체크포인트가 v0.9.18 이하 버전이면 매핑 없음)
+                fallback_map = {}
+                # 입력 소스 정보가 있으면 파일별로 SCR 추출
+                for src_info in (_sources_info or []):
+                    if src_info.get("type") == "md":
+                        fname = src_info.get("content", "")
+                        if fname and raw_text:
+                            # raw_text 안에서 해당 파일 섹션 찾기 — 헤더 패턴 사용
+                            scr_id = extract_scr_from_source(fname, raw_text)
+                            if scr_id:
+                                fallback_map[fname] = scr_id
+                # raw_text 전체에서 SCR 패턴 모두 수집 (파일 매핑 안 되도 표시)
+                if not fallback_map and raw_text:
+                    found = re.findall(r'SCR-\d+[A-Z]?', raw_text)
+                    if found:
+                        # unique 보존, 순서 유지
+                        unique_scrs = list(dict.fromkeys(found))
+                        # 가상 키로 보관 — UI 안내용
+                        fallback_map = {f"(소스 #{i+1})": scr for i, scr in enumerate(unique_scrs[:10])}
+                if fallback_map:
+                    sess["_source_scr_map"] = fallback_map
+                    push_log(sess, f"[이어서] 화면 식별자 자동 재추출 ({len(fallback_map)}개) — 옛 체크포인트 보강")
+                else:
+                    sess["_source_scr_map"] = {}
+                    push_log(sess, "[이어서] 화면 식별자 매핑 없음 — Excel 화면 코드 컬럼 빈 칸 출력 (정상)")
         else:
             sess["status"] = "parsing"
             push_stage(sess, 1, "문서 파싱", 5)
             raw_text = step_parse_sources(sess, sources)
             check_stop(sess)
             sources_info = [{"type": s.get("type",""), "content": s.get("content",""), "selected_files": s.get("selected_files")} for s in sources]
-            save_pipeline_state(project_name, "parsed", {"raw_text": raw_text[:20000], "focus_area": focus_area, "sources_info": sources_info})
+            save_pipeline_state(project_name, "parsed", {"raw_text": raw_text[:20000], "focus_area": focus_area, "sources_info": sources_info, "source_scr_map": sess.get("_source_scr_map") or {}})
             save_project(project_name, last_sources=sources_info, last_focus_area=focus_area)
 
         if focus_area:
@@ -3666,7 +3697,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
                 push_stage(sess, 2, "인벤토리 추출 (Quick 1/3)", 18)
                 inventory_text = step_quick_inventory(sess, raw_text, project_name, focus_area)
                 check_stop(sess)
-                save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": raw_text[:20000], "features_text": inventory_text, "inventory_text": inventory_text, "focus_area": focus_area, "sources_info": _sources_info})
+                save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": raw_text[:20000], "features_text": inventory_text, "inventory_text": inventory_text, "focus_area": focus_area, "sources_info": _sources_info, "source_scr_map": sess.get("_source_scr_map") or {}})
 
                 # 2단계: 인벤토리 → 분류표
                 sess["status"] = "classifying"
@@ -3675,7 +3706,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
                 check_stop(sess)
                 # features_text 자리에 inventory_text를 세팅 — TC 작성 시 참고 목록으로 사용
                 features_text = inventory_text
-                save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": raw_text[:20000], "features_text": inventory_text, "inventory_text": inventory_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info})
+                save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": raw_text[:20000], "features_text": inventory_text, "inventory_text": inventory_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info, "source_scr_map": sess.get("_source_scr_map") or {}})
             # sess에 flag 저장 — step_write_tc가 섹션 발췌 모드로 동작하도록
             sess["_quick_mode"] = True
             sess["_raw_text"] = raw_text
@@ -3691,7 +3722,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
                 push_stage(sess, 2, "정책·기능 통합 추출", 22, eta_sec=90)
                 policy_text, features_text = step_policy_features_combined(sess, raw_text, project_name, focus_area)
                 check_stop(sess)
-                save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "focus_area": focus_area, "sources_info": _sources_info})
+                save_pipeline_state(project_name, "features", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "focus_area": focus_area, "sources_info": _sources_info, "source_scr_map": sess.get("_source_scr_map") or {}})
 
             # 분류표
             if resumed and resumed.get("stage") in ("gate_waiting", "tc_writing"):
@@ -3702,7 +3733,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
                 push_stage(sess, 2, "분류표 생성", 38)
                 classification = step_classify(sess, features_text, project_name, focus_area)
                 check_stop(sess)
-                save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info})
+                save_pipeline_state(project_name, "gate_waiting", {"raw_text": raw_text[:20000], "policy_text": policy_text, "features_text": features_text, "classification": classification, "focus_area": focus_area, "sources_info": _sources_info, "source_scr_map": sess.get("_source_scr_map") or {}})
 
             # 정책 반영 모드도 TC 작성 시 원문 섹션 발췌 적용 (Quick 모드와 동일)
             sess["_raw_text"] = raw_text

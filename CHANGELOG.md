@@ -9,6 +9,64 @@
 
 ---
 
+## v0.9.19 — 2026-04-29 (이어서 작업 시 화면 식별자 매핑 복원)
+
+> **요약**: 사용자 보고 — "이어서 작업하기 눌렀더니 상단에 화면 코드가 없다는데 말이 안 된다." 진짜 원인: `_source_scr_map` 이 체크포인트에 저장 안 됐던 v0.9.13 누락 버그.
+
+### 🐛 사용자 보고
+
+> "이어서 작업하기 눌렀더니.. 상단에 화면 코드가 없다는데.. 이게 말이 안 되는 거 같아."
+
+스크린샷:
+- 노란 박스: `📌 화면 코드 안내 — 입력 소스에서 화면 식별자(SCR-NNN 형식)가 발견되지 않았습니다.`
+- 그러나 사용자는 명백히 SCR-001 / SCR-013 등을 입력했음
+
+### 🔍 원인
+
+흐름:
+1. 사용자가 SCR-013 등 입력 → `step_parse_sources` 가 `sess["_source_scr_map"]` 캡처 ✓
+2. Gate 진입 → `save_pipeline_state(stage="gate_waiting", data=...)` 호출
+3. **그러나 `data` 페이로드에 `source_scr_map` 이 빠져 있음** ❌
+4. 서버 재시작 → `SESSIONS` 메모리 사라짐 (`_source_scr_map` 도 함께)
+5. "이어서 작업" 클릭 → 체크포인트(disk)에서 복원
+6. 체크포인트엔 `source_scr_map` 없음 → `sess["_source_scr_map"] = {}` 빈 dict
+7. Gate UI 가 매핑 없는 상태로 떠서 노란 안내 박스 노출
+
+이 누락은 v0.9.13 (화면 코드 입력 소스 기반 추출) 시점부터 잠재돼 있었음. 새 기능 추가했으나 체크포인트 직렬화에 포함 누락.
+
+### 🛡 해결
+
+**1) `save_pipeline_state` 5곳 모두 `source_scr_map` 포함**:
+- `parsed` / `features` (정책 모드) / `gate_waiting` (정책 모드)
+- `features` (Quick 모드) / `gate_waiting` (Quick 모드)
+
+```python
+save_pipeline_state(project_name, "gate_waiting", {
+    "raw_text": ..., "policy_text": ..., "features_text": ...,
+    "classification": ..., "focus_area": ..., "sources_info": ...,
+    "source_scr_map": sess.get("_source_scr_map") or {},  # ← v0.9.19
+})
+```
+
+**2) 복원 시 `_source_scr_map` 복구**:
+- 체크포인트에 매핑 있으면 그대로 복원
+- 없으면 `raw_text` 에서 SCR 패턴 자동 재추출 (옛 체크포인트 호환)
+- 모두 실패 시 빈 dict (정상 — Excel 화면 코드 컬럼 빈 칸)
+
+**3) 복원 로그 출력**:
+- `[이어서] 화면 식별자 매핑 복원됨 (N개)` 또는
+- `[이어서] 화면 식별자 자동 재추출 (N개) — 옛 체크포인트 보강` 또는
+- `[이어서] 화면 식별자 매핑 없음 — Excel 화면 코드 컬럼 빈 칸 출력 (정상)`
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.19, `save_pipeline_state` 5곳에 `source_scr_map` 추가, resume 분기에 `_source_scr_map` 복원 + raw_text 재스캔 폴백 |
+| `CHANGELOG.md` | v0.9.19 섹션 추가 |
+
+---
+
 ## v0.9.18 — 2026-04-29 (Gate 검토 중 재시작 보호 + 안내 문구 정리)
 
 > **요약**: 사용자가 분류표 검토 중 (gate_waiting 상태) 인데 서버 재시작으로 세션이 사라져 "승인 오류: 세션 없음" 404 발생 — 활성 세션 가드에 gate_waiting 누락이 원인.
