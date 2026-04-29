@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.16"
+APP_VERSION         = "v0.9.17"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "수정 플로우에도 영향도 우선 원칙 적용 (Gate 수정 사항 신뢰성 일관화)"
+APP_VERSION_TAGLINE = "원칙 G — 그룹 단위 에러 패턴 통합 + 중복 자동 탐지"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 기존 TC 수정 플로우(run_modify_pipeline)의 system_modify 프롬프트에 '영향도 분석 우선 원칙' 추가",
-    "🛡 사용자가 Gate 에서 영향도 분석을 수정하면, AI 가 그것을 최종 진실로 따름 — 임의 환상 금지",
-    "💡 user_modify 의 '기존 TC 전체' 섹션에도 '참고용' 명시 — 승인된 지시사항 우선",
-    "🔄 신규 TC 생성(v0.9.15) 과 수정 플로우 모두 동일한 신뢰성 기준 적용",
-    "🔁 v0.9.15 분류표 우선 원칙 + 본문 동기화 / v0.9.14 마침표 규칙 모두 포함",
+    "🆕 [예방] tc-rules.md 원칙 G — 같은 그룹 내 동일 비기능 TC (네트워크/타임아웃/로딩 등) 그룹당 1개 통합 규칙",
+    "🆕 [탐지] detect_duplicate_error_tcs() — TC 작성 후 패턴 자동 감지 (6가지 비기능 패턴)",
+    "💡 결과 화면에 '중복 의심 패턴 N개' 노란 알림 박스 + 대표/통합 후보 TC ID 표시",
+    "📋 분석 결과 클립보드 복사 버튼 — 다음 실행 시 분류표/범위 지정에 활용",
+    "🔁 v0.9.16 수정 플로우 영향도 우선 / v0.9.15 분류표 우선 원칙 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -1924,6 +1924,118 @@ def resolve_screen_navigation(middle_name: str, screen_map: dict) -> str:
     return ""
 
 
+def detect_duplicate_error_tcs(tc_md: str) -> dict:
+    """원칙 G — 같은 그룹 내 동일 비기능 패턴 TC 가 여러 화면에 반복되는 경우 검출.
+
+    탐지 패턴 (제목 + 분류 기반):
+      - 네트워크 끊김 / 연결 실패
+      - 타임아웃
+      - 3G / 저사양 / 로딩 시간
+      - 백그라운드 / 포그라운드
+      - 화면 회전
+      - 메모리 부족 / 강제 종료
+
+    Returns:
+        {
+          "patterns": [
+            {
+              "pattern": "네트워크 끊김",
+              "major": "01.로그인_Gmail",
+              "tcs": [
+                {"id": "SM-LGI-007", "title": "...", "middle": "Google Sign-in"},
+                {"id": "SM-LGI-013", "title": "...", "middle": "OAuth Confirm"},
+              ],
+              "count": 2,
+            },
+            ...
+          ],
+          "total_duplicates": 12,    # 통합 시 줄어들 TC 수
+          "suggested_keep": [...],    # 유지 권장 TC IDs (대표 화면)
+          "suggested_remove": [...],  # 제거 권장 TC IDs
+        }
+
+    중복 패턴이 없으면 patterns=[], total_duplicates=0.
+    """
+    # 패턴 키워드 — 한글/영문 모두 매칭
+    patterns_def = [
+        ("네트워크 끊김", [r"네트워크\s*(끊김|차단|단절|장애|불안정)", r"연결\s*실패", r"오프라인", r"network\s*(disconnect|fail)", r"connection\s*(lost|fail)"]),
+        ("타임아웃", [r"타임\s*아웃", r"응답\s*지연", r"timeout"]),
+        ("3G/저사양 로딩 시간", [r"3G\s*(환경|네트워크)?", r"저사양", r"로딩\s*시간", r"loading\s*time"]),
+        ("백그라운드/포그라운드", [r"백그라운드", r"포그라운드", r"background", r"foreground"]),
+        ("화면 회전", [r"화면\s*회전", r"orientation\s*change"]),
+        ("메모리/강제 종료", [r"메모리\s*부족", r"앱\s*(강제\s*)?종료", r"out\s*of\s*memory", r"force\s*(close|quit|kill)"]),
+    ]
+
+    if not tc_md:
+        return {"patterns": [], "total_duplicates": 0, "suggested_keep": [], "suggested_remove": []}
+
+    # TC 블록 분할 — `### ` 또는 `### **` 헤더 기준
+    blocks = re.split(r'(?=^###\s)', tc_md, flags=re.MULTILINE)
+
+    detected = {}  # {(pattern, major): [tc_info, ...]}
+
+    for block in blocks:
+        if not block.strip().startswith("###"):
+            continue
+        # TC ID 추출
+        m_id = re.match(r'###\s+\*?\*?([A-Z0-9-]+(?:-\d+)+)\*?\*?\s*(?:—|-)?\s*(.*?)(?:\n|$)', block)
+        if not m_id:
+            continue
+        tc_id = m_id.group(1).strip()
+        title = m_id.group(2).strip().rstrip('*').strip()
+        # 대분류 / 중분류 추출 (테이블 형식)
+        m_major = re.search(r'\|\s*대분류\s*\|\s*([^|]+?)\s*\|', block)
+        m_middle = re.search(r'\|\s*중분류\s*\|\s*([^|]+?)\s*\|', block)
+        major = m_major.group(1).strip() if m_major else ""
+        middle = m_middle.group(1).strip() if m_middle else ""
+        if not major:
+            continue
+
+        # 패턴 매칭 (title + middle 텍스트 합쳐서 검색)
+        search_text = f"{title}\n{middle}".lower()
+        for pattern_label, regexes in patterns_def:
+            matched = any(re.search(rgx, search_text, re.IGNORECASE) for rgx in regexes)
+            if matched:
+                key = (pattern_label, major)
+                detected.setdefault(key, []).append({
+                    "id": tc_id,
+                    "title": title,
+                    "middle": middle,
+                })
+                break  # 한 TC 가 여러 패턴 매칭돼도 가장 먼저 잡힌 것만
+
+    # 결과 가공: 같은 (패턴, 대분류) 에 2개 이상 있으면 중복으로 간주
+    patterns_out = []
+    suggested_keep = []
+    suggested_remove = []
+    total_duplicates = 0
+    for (pattern_label, major), tcs in detected.items():
+        if len(tcs) < 2:
+            continue
+        # TC ID 의 가장 작은 번호를 대표(유지) 로 — 일반적으로 entry 화면이 먼저 등장
+        tcs_sorted = sorted(tcs, key=lambda t: t["id"])
+        keep = tcs_sorted[0]
+        remove_list = tcs_sorted[1:]
+        suggested_keep.append(keep["id"])
+        suggested_remove.extend([t["id"] for t in remove_list])
+        total_duplicates += len(remove_list)
+        patterns_out.append({
+            "pattern": pattern_label,
+            "major": major,
+            "tcs": tcs_sorted,
+            "count": len(tcs_sorted),
+            "keep": keep["id"],
+            "remove": [t["id"] for t in remove_list],
+        })
+
+    return {
+        "patterns": patterns_out,
+        "total_duplicates": total_duplicates,
+        "suggested_keep": suggested_keep,
+        "suggested_remove": suggested_remove,
+    }
+
+
 def disambiguate_duplicate_minors(tc_md: str) -> str:
     """같은 (대분류, 중분류) 안에서 동일한 소분류 이름이 여러 TC에 쓰인 경우,
     각 TC의 제목(### 헤더 뒤 — 이후 부분)에서 핵심 키워드를 추출하여
@@ -2292,6 +2404,39 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
   → 본문의 로그인 관련 상세 시나리오를 참고하여 TC 작성 (정상)
 """
 
+    # 그룹 단위 에러 패턴 통합 안내 (tc-rules.md 원칙 G 보강)
+    dedup_hint = """
+## 🔁 에러/예외 패턴 통합 규칙 (tc-rules.md 원칙 G — 반드시 준수)
+
+⚠️ **같은 그룹/대분류의 여러 화면에 동일 패턴 비기능 TC 를 반복 작성하지 마세요.**
+
+### 보존 (스펙 명시)
+- 기획서의 "에러 케이스" 표에 **명시된** 에러 → 해당 화면 TC 로 보존
+  (예: SCR-013 의 "권한 거부 Modal", "토큰 수신 실패 Modal")
+
+### 통합 (AI 추가)
+다음 패턴은 **그룹당 1개 대표 화면에만** 작성:
+- 네트워크 끊김 / 연결 실패
+- 타임아웃 처리
+- 3G/저사양 환경 로딩 시간
+- 백그라운드 → 포그라운드 복귀
+- 화면 회전 / 메모리 부족
+
+### 대표 화면 선택
+1. entry 성격 화면 우선 (그룹의 진입 지점)
+2. entry 가 없으면 그룹의 첫 번째 화면
+3. 사용자가 입력한 화면 중에서만 선택
+
+### 통합 TC 형식
+```
+**비고**
+- [통합] 그룹 단위 비기능 검증 — 같은 패턴을 다른 화면별로 반복 작성하지 않음 (원칙 G).
+```
+
+### ❌ 금지 예시
+같은 그룹 SCR-010, 011, 012, 013, 014 모두에 "네트워크 끊김" TC 5개 작성 → 1개로 통합 필수
+"""
+
     # 마침표 종결 강화 안내 (tc-rules.md 9-2 절 보강)
     period_hint = """
 ## ✍️ 문장 종결 규칙 (tc-rules.md 9-2 — 반드시 준수)
@@ -2326,6 +2471,7 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 {nav_instruction}
 {screen_code_hint}
 {classification_priority_hint}
+{dedup_hint}
 {period_hint}
 ## 이 도메인의 분류 구조 (사용자 승인 — 최종 진실 소스)
 {domain_section}
@@ -3607,6 +3753,16 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
                 min_tc = max(1, round(total_tc * 0.35))
 
         push_stage(sess, 4, "TC 검토 완료 · Excel 준비", 88, eta_sec=10)
+
+        # 원칙 G — 그룹 단위 에러 패턴 중복 탐지 (v0.9.17~)
+        try:
+            dup_report = detect_duplicate_error_tcs(tc_content)
+            if dup_report["total_duplicates"] > 0:
+                push_log(sess, f"[원칙 G] 중복 의심 패턴 {len(dup_report['patterns'])}개, 통합 시 약 {dup_report['total_duplicates']}개 TC 감소 예상")
+                # SSE 로 프론트에 알림 — 사용자가 검토할 수 있게
+                push(sess, "duplicate_warning", dup_report)
+        except Exception as _e:
+            push_log(sess, f"[원칙 G] 중복 탐지 스킵: {_e}")
 
         # Excel 빌드 — tc_final.md 생성(즉시) + build_excel.py 호출(60초 내외)
         sess["status"] = "building"
@@ -6866,6 +7022,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </button>
     </div>
 
+    <!-- 원칙 G — 중복 의심 TC 알림 (v0.9.17~). duplicate_warning SSE 이벤트로 채워짐 -->
+    <div id="duplicateNotice" style="display:none;margin:12px 0;padding:14px 16px;background:#FFFBEB;border:1.5px solid #FCD34D;border-radius:10px;"></div>
+
     <!-- TC 통계 -->
     <div class="tc-stats" style="margin-bottom:16px">
       <div class="tc-stat">
@@ -8655,6 +8814,12 @@ function handleEvent(evt) {
     document.getElementById('card3').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
+  // 원칙 G — 중복 의심 TC 발견 알림 (v0.9.17~). 결과 카드(card5) 에서 표시되도록 sess에 보관.
+  if (evt.type === 'duplicate_warning') {
+    window._duplicateReport = evt.data;  // {patterns, total_duplicates, suggested_keep, suggested_remove}
+    addLog('⚠️ 중복 의심 패턴 ' + (evt.data.patterns || []).length + '개 발견 — 결과 화면에서 상세 확인');
+  }
+
   if (evt.type === 'done') {
     stopCountdown();
     const { filename, size, sid, total_tc, min_tc, smoke_tc } = evt.data;
@@ -8677,6 +8842,8 @@ function handleEvent(evt) {
     document.getElementById('statSmoke').textContent = (smokeVal !== undefined && smokeVal !== null) ? smokeVal : '—';
     setStepBar(5);
     setStopButtonsDisabled(true);
+    // 원칙 G — 중복 의심 TC 알림 렌더링 (있을 경우)
+    try { renderDuplicateNotice(window._duplicateReport); } catch (_) {}
     document.getElementById('card5').scrollIntoView({ behavior: 'smooth', block: 'start' });
     showToast('🎉 TC 생성 완료!');
     if (eventSource) eventSource.close();
@@ -8896,6 +9063,98 @@ async function exportGateExcel() {
 }
 
 // ── 입력 소스 화면 식별자 (v0.9.13) — gate 이벤트로 받은 source_scr_map 안내 ──
+// ── 원칙 G — 중복 의심 TC 알림 (v0.9.17~) ──
+// duplicate_warning SSE 이벤트로 받은 결과를 결과 카드(card5) 에 렌더링
+function renderDuplicateNotice(report) {
+  var el = document.getElementById('duplicateNotice');
+  if (!el) return;
+  if (!report || !report.patterns || report.patterns.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+  var patterns = report.patterns;
+  var totalDup = report.total_duplicates || 0;
+
+  var html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">';
+  html += '<span style="font-size:18px;">⚠️</span>';
+  html += '<strong style="font-size:14px;color:#92400E;">중복 의심 패턴 ' + patterns.length + '개 발견 (원칙 G)</strong>';
+  html += '<span style="font-size:11px;color:#78350F;">통합 시 약 ' + totalDup + '개 TC 감소 가능</span>';
+  html += '</div>';
+  html += '<div style="font-size:12px;color:#78350F;margin-bottom:10px;line-height:1.55;">';
+  html += '같은 그룹 내에 동일한 비기능/에러 패턴이 여러 화면에 반복 작성되었습니다. ';
+  html += '아래 패턴 중 통합이 필요한 것을 검토하세요. ';
+  html += '<strong>스펙 표에 명시된 에러 케이스는 보존</strong>하고, AI 가 추가한 일반 비기능 TC 만 통합하는 것이 원칙입니다.';
+  html += '</div>';
+
+  // 패턴별 상세
+  html += '<div style="background:#FFFFFF;border:1px solid #FBBF24;border-radius:8px;overflow:hidden;">';
+  patterns.forEach(function(p, idx) {
+    var border = idx > 0 ? 'border-top:1px solid #FCD34D;' : '';
+    html += '<div style="padding:10px 12px;' + border + '">';
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">';
+    html += '<span style="font-size:13px;font-weight:700;color:#92400E;">🔁 ' + escapeHtml(p.pattern) + '</span>';
+    html += '<span style="font-size:11px;color:#78350F;">— ' + escapeHtml(p.major) + '</span>';
+    html += '<span style="margin-left:auto;font-size:11px;background:#FEF3C7;color:#92400E;padding:2px 8px;border-radius:4px;font-weight:600;">' + p.count + '개 TC</span>';
+    html += '</div>';
+    html += '<div style="font-size:11.5px;color:#374151;line-height:1.6;">';
+    html += '<strong>유지 권장</strong> (대표 화면): <code style="background:#D1FAE5;padding:1px 5px;border-radius:3px;color:#065F46;">' + escapeHtml(p.keep) + '</code><br>';
+    html += '<strong>통합 후보</strong>: ';
+    html += (p.remove || []).map(function(id) {
+      return '<code style="background:#FEE2E2;padding:1px 5px;border-radius:3px;color:#991B1B;">' + escapeHtml(id) + '</code>';
+    }).join(' ');
+    html += '<br><span style="font-size:10px;color:#6B7280;">└ TC: ';
+    html += (p.tcs || []).map(function(t) { return escapeHtml(t.id) + ' ' + escapeHtml(t.title || '').substring(0, 40); }).join(' / ');
+    html += '</span>';
+    html += '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // 액션 버튼
+  html += '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">';
+  html += '<button onclick="copyDuplicateReportToClipboard()" style="padding:6px 12px;background:#FFFFFF;color:#92400E;border:1.5px solid #FCD34D;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">📋 분석 결과 복사</button>';
+  html += '<span style="font-size:11px;color:#78350F;align-self:center;">';
+  html += '검토 후 다음 실행에서 더 명확한 분류표 / 화면 범위 지정으로 중복을 줄이세요.';
+  html += '</span>';
+  html += '</div>';
+
+  el.innerHTML = html;
+  el.style.display = '';
+}
+
+function copyDuplicateReportToClipboard() {
+  var report = window._duplicateReport;
+  if (!report || !report.patterns) return;
+  var text = '# 중복 의심 패턴 분석 (원칙 G)\\n\\n';
+  text += '총 ' + report.patterns.length + '개 패턴, 통합 시 약 ' + (report.total_duplicates || 0) + '개 TC 감소 가능\\n\\n';
+  report.patterns.forEach(function(p) {
+    text += '## ' + p.pattern + ' — ' + p.major + ' (' + p.count + '개)\\n';
+    text += '- 유지 권장: ' + p.keep + '\\n';
+    text += '- 통합 후보: ' + (p.remove || []).join(', ') + '\\n';
+    (p.tcs || []).forEach(function(t) {
+      text += '  - ' + t.id + ' / ' + (t.middle || '') + ' / ' + (t.title || '') + '\\n';
+    });
+    text += '\\n';
+  });
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function() {
+      showToast('📋 분석 결과가 클립보드에 복사되었습니다');
+    });
+  } else {
+    alert(text);
+  }
+}
+
+// 헬퍼 — 안전한 HTML escape (이미 있으면 재사용 가능)
+if (typeof escapeHtml === 'undefined') {
+  window.escapeHtml = function(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  };
+}
+
 function renderSourceScrNotice(scrMap) {
   var el = document.getElementById('sourceScrNotice');
   if (!el) return;
