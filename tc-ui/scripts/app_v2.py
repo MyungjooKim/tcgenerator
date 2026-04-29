@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.23"
+APP_VERSION         = "v0.9.24"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "원칙 G 강화 — 그룹 정의 + 의미 기반 우선순위 + AI 자기점검"
+APP_VERSION_TAGLINE = "한글 IME Enter 다중 처리 버그 fix (메시지 잘림)"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 G-0 그룹 정의 명확화 — '그룹 = 같은 대분류, ≠ 화면' 모호성 제거",
-    "🆕 G-3 의미 기반 대표 화면 우선순위 — Start/Splash/Entry 키워드 + character=entry (번호 의존 X)",
-    "🆕 G-7 협력 관계 명시 — AI/시스템/사용자 역할 분담 (위협 X, 안내 O)",
-    "🆕 G-8 AI 자기 점검 가이드 — 출력 직전 체크리스트 + 흔한 함정 4가지 명시",
-    "🔁 v0.9.22 양 단계 자동 통합 / v0.9.21 가이드 단계 모두 포함",
+    "🐛 [중대] 한글 입력 후 Enter 시 마지막 글자가 별도 메시지로 한 번 더 전송되던 버그 fix",
+    "💡 사용자가 보낸 의도와 다른 메시지가 AI 에게 전달돼 답변이 부정확했던 원인",
+    "🛡 모든 입력창에 IME composition 가드 추가 (event.isComposing / keyCode 229)",
+    "📌 적용 위치: 메인 채팅 / Floating bar / 모달 / 신규 프로젝트 입력 (총 4곳)",
+    "🔁 v0.9.23 원칙 G 강화 / v0.9.22 양 단계 자동 통합 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -7094,7 +7094,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
     <div class="project-new-inline" id="newProjectInline">
       <input type="text" id="newDashProjectName" placeholder="새 프로젝트명 입력"
-        onkeydown="if(event.key==='Enter')createDashProject();">
+        onkeydown="if(event.isComposing||event.keyCode===229)return;if(event.key==='Enter')createDashProject();">
       <button class="btn-new-project" onclick="createDashProject()">생성</button>
       <button style="padding:7px 10px;background:none;border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;" onclick="toggleNewProjectInline()">취소</button>
     </div>
@@ -7346,7 +7346,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="gate-chat-input-row">
         <textarea class="gate-chat-input" id="gateChatInput"
           placeholder="수정 요청을 입력하세요. 예) AUTH 도메인 케이스 3번 삭제해줘"
-          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGateChat();}"></textarea>
+          onkeydown="if((event.isComposing||event.keyCode===229))return;if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGateChat();}"></textarea>
         <button class="gate-chat-send" id="gateChatSend" onclick="sendGateChat()">전송</button>
       </div>
     </div>
@@ -11098,6 +11098,10 @@ async function pollServerAlive() {
   }
   sendBtn.addEventListener('click', () => submitFromInput(input));
   input.addEventListener('keydown', function(e) {
+    // v0.9.24: IME (한글/일본어/중국어 등) 조합 중 Enter 무시
+    // - keyCode === 229: 일부 브라우저에서 IME composition 중 표시
+    // - e.isComposing: 표준 (Chrome/Firefox/Safari)
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submitFromInput(input);
@@ -11105,6 +11109,7 @@ async function pollServerAlive() {
   });
   modalSend.addEventListener('click', () => submitFromInput(modalInput));
   modalInput.addEventListener('keydown', function(e) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submitFromInput(modalInput);

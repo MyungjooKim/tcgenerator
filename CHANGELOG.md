@@ -9,6 +9,73 @@
 
 ---
 
+## v0.9.24 — 2026-04-29 (한글 IME Enter 다중 처리 버그 fix)
+
+> **요약 (중대)**: 사용자 보고 — "대화창에서 마지막으로 입력한 단어가 한 번 더 입력되는 버그", "그래서 AI 가 답변을 정확하게 하지 못해". 한글 IME composition 처리 누락이 원인.
+
+### 🐛 사용자 보고
+
+> "대화창에서 내가 마지막으로 입력한 단어가 한 번 더 입력이 되는 버그가 있어. 그래서 AI 가 답변을 정확하게 하지 못해"
+
+스크린샷 분석:
+- 사용자 입력: "Splash 기능은 이번에 삭제되었어... 각 화면별 정리가 필요해"
+- 실제 전송 1: "Splash 기능은... 정리가 필요해" (정상) → AI 처리 중
+- **실제 전송 2: "해" 한 글자만** ← 버그
+- AI 응답: "'해'라는 요청이 모호합니다... 1. 해줘 2. 해(海/sun) 3. 단순 입력 실수..."
+
+→ AI 가 답변을 못한 게 아니라 **잘못 들은 메시지("해")에 정확히 답변**한 것. 진짜 문제는 IME 버그로 잘린 메시지가 전송된 것.
+
+### 🔍 원인
+
+한글 입력기(IME) 동작:
+1. 사용자가 "필요해" 입력 후 Enter
+2. **첫 번째 Enter** → IME 가 마지막 글자 "해" 를 confirm (한글 조합 완료)
+   - 이 시점: `event.key === 'Enter'` 이지만 `event.isComposing === true`
+   - textarea value 는 아직 "필요" 상태일 수 있음
+3. Enter handler 발동 → "필요" 또는 "필요해" 일부 전송
+4. IME composition 완료 → "해" 가 textarea 에 잔류
+5. 어떤 추가 이벤트로 다시 Enter 처리 → "해" 단독 전송
+
+**기존 코드** (line 7349, 11100, 11107, 7097):
+```javascript
+if (e.key === 'Enter' && !e.shiftKey) {
+  e.preventDefault();
+  submitFromInput(input);
+}
+```
+→ IME composition 중 Enter 도 처리해버려서 한글 마지막 글자가 잘림.
+
+### 🛡 해결 — 표준 IME 가드 추가
+
+```javascript
+// v0.9.24: IME (한글/일본어/중국어) 조합 중 Enter 무시
+// - e.isComposing: 표준 (Chrome/Firefox/Safari)
+// - keyCode === 229: 일부 브라우저에서 IME composition 중 표시
+if (e.isComposing || e.keyCode === 229) return;
+if (e.key === 'Enter' && !e.shiftKey) {
+  e.preventDefault();
+  submitFromInput(input);
+}
+```
+
+### 📌 적용 위치 (4곳)
+
+| 위치 | 용도 |
+|------|------|
+| 메인 채팅 입력 (`#gateChatInput`) | 분류표 검토 미니 채팅 본체 |
+| Floating bar 입력 (`#floatingAiInput`) | 하단 sticky 채팅 |
+| 모달 채팅 입력 (`#floatingAiModalInput`) | 확대 모달 채팅 |
+| 신규 프로젝트명 (`#newDashProjectName`) | 프로젝트 생성 입력 |
+
+### 📁 파일 변경
+
+| 파일 | 변경 내용 |
+|---|---|
+| `tc-ui/scripts/app_v2.py` | `APP_VERSION` v0.9.24, 4곳 IME 가드 추가 (`event.isComposing` / `keyCode === 229`) |
+| `CHANGELOG.md` | v0.9.24 섹션 추가 |
+
+---
+
 ## v0.9.23 — 2026-04-29 (원칙 G 강화 — 그룹 정의 + 의미 기반 우선순위 + AI 자기점검)
 
 > **요약**: 사용자 통찰 — "중복 처리 규칙은 이미 tc-rules.md 에 있는데 (원칙 G), AI 가 100% 안 따른다." 검토 후 원칙 G 의 모호한 부분을 정량화 + AI 행동 지시 강화.
