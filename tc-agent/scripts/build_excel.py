@@ -1006,8 +1006,7 @@ def _sheet_title_for_major(major_name: str, existing: list) -> str:
     s = re.sub(r'[:\\/\?\*\[\]]', ' ', major_name).strip() or "Sheet"
     # 괄호 코드 제거 — 시트명은 사람 친화형
     s = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", s).strip()
-    # 이모지 prefix — 폴더 느낌
-    candidate = f"📑 {s}"
+    candidate = s
     if len(candidate) > 31:
         candidate = candidate[:31]
     base = candidate
