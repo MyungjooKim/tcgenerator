@@ -3036,9 +3036,9 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
                           bold=(ci == 2 and is_min), color="1E2761" if is_min else "222222")
         ws.row_dimensions[ri].height = max(30, min(120, len(str(row_data[8])) // 3 + 20))
 
-    # 🔥 Smoke Test 시트 — Smoke 마킹된 TC만 모아 동일 구조로 렌더
+    # Smoke Test 시트 — Smoke 마킹된 TC만 모아 동일 구조로 렌더
     smoke_tcs = [t for t in tcs if t.get("_smoke")]
-    ws_sm = wb.create_sheet("🔥 Smoke Test")
+    ws_sm = wb.create_sheet("Smoke Test")
     ws_sm.freeze_panes = "A3"
     for ci, (h, w) in enumerate(zip(HEADERS, COL_W), 1):
         c = ws_sm.cell(1, ci, h)

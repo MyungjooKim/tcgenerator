@@ -1032,17 +1032,17 @@ def run_build(phase: str, tc_path, output_dir,
         tc_path:    tc_final.md 파일 경로 (str | Path)
         output_dir: 출력 디렉토리 (str | Path). 없으면 생성.
         verbose:    True면 진행 메시지 print (subprocess 호출 시 유용)
-        include_change_columns: True면 상태/수정 사유 컬럼 + 🔄 변경 이력 시트 포함.
+        include_change_columns: True면 상태/수정 사유 컬럼 + 변경 이력 시트 포함.
             기본 False — 신규 TC 생성에는 이 정보가 없으므로 생략.
             「기존 TC 수정」 플로우(/update-tc)에서만 True로 호출.
         sheets:     포함할 시트 선택 dict. None 이면 전체(Full Set) 생성.
             Keys (모두 bool):
-              - "cover":          📋 표지
-              - "stats":          📊 TC 통계
-              - "smoke":          🔥 Smoke Test
-              - "traceability":   🔗 Traceability Matrix
-              - "tc_list":        📌 TC 전체 목록 (필수 — False여도 항상 True 처리)
-              - "change_history": 🔄 변경 이력 (include_change_columns 와 AND 조건)
+              - "cover":          표지
+              - "stats":          TC 통계
+              - "smoke":          Smoke Test
+              - "traceability":   Traceability Matrix
+              - "tc_list":        TC 전체 목록 (필수 — False여도 항상 True 처리)
+              - "change_history": 변경 이력 (include_change_columns 와 AND 조건)
             예) Light 모드: {"cover":False, "stats":False, "smoke":False,
                             "traceability":False, "tc_list":True, "change_history":False}
 
@@ -1097,25 +1097,25 @@ def run_build(phase: str, tc_path, output_dir,
     placeholder_ws = wb.active
     placeholder_ws.title = "_placeholder"
 
-    # 📋 표지
+    # 표지
     if sheets.get("cover"):
-        ws_cover = wb.create_sheet("📋 표지", 0)  # 항상 첫 번째 위치
+        ws_cover = wb.create_sheet("표지", 0)  # 항상 첫 번째 위치
         build_cover(ws_cover, tcs, config, date_str, version)
 
-    # 📊 TC 통계
+    # TC 통계
     if sheets.get("stats"):
-        ws_stats = wb.create_sheet("📊 TC 통계")
+        ws_stats = wb.create_sheet("TC 통계")
         build_stats(ws_stats, tcs, version)
 
-    # 🔥 Smoke Test
+    # Smoke Test
     if sheets.get("smoke"):
-        ws_smoke = wb.create_sheet("🔥 Smoke Test")
+        ws_smoke = wb.create_sheet("Smoke Test")
         build_smoke(ws_smoke, tcs, config, include_change_columns=include_change_columns)
 
-    # 🔗 Traceability Matrix
+    # Traceability Matrix
     scr_count = 0
     if sheets.get("traceability"):
-        ws_trace = wb.create_sheet("🔗 Traceability")
+        ws_trace = wb.create_sheet("Traceability")
         scr_count = build_traceability(ws_trace, tcs)
         if verbose:
             if scr_count > 0:
@@ -1123,11 +1123,11 @@ def run_build(phase: str, tc_path, output_dir,
             else:
                 print(f"  → Traceability Matrix 생성 — 화면 코드 없음 (TC 전체 '(화면 코드 없음)' 그룹)")
 
-    # 🔄 변경 이력 시트: 사용자가 켰고 + include_change_columns=True 이고 + 변경된 TC 가 있어야 생성
+    # 변경 이력 시트: 사용자가 켰고 + include_change_columns=True 이고 + 변경된 TC 가 있어야 생성
     changed_tc = 0
     if (sheets.get("change_history") and include_change_columns
             and any((t.get("status") or "").strip() for t in tcs)):
-        ws_changes = wb.create_sheet("🔄 변경 이력")
+        ws_changes = wb.create_sheet("변경 이력")
         changed_tc = build_change_history(ws_changes, tcs)
         if verbose:
             print(f"  → 변경 이력 시트 생성 — {changed_tc}개 변경 TC")
