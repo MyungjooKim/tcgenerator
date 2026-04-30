@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.25"
+APP_VERSION         = "v0.9.26"
 APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "시스템 점검용 샘플 기능 제거 (실 워크플로우 정착)"
+APP_VERSION_TAGLINE = "입력 소스 부록 표 자동 제거 + 입력 범위 엄격 준수"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🗑 시스템 점검용 샘플 PDF / 직접입력으로 채우기 기능 제거 (초기 검증용 → 역할 종료)",
-    "📐 푸터 영역 제거 — 화면이 더 깔끔해짐",
-    "🧹 코드 정리 — SAMPLE_DOC_CONTENT, build_sample_pdf, _find_korean_font 등 ~280줄 제거",
-    "🚀 시작 시 PDF 사전 생성 단계 제거 — 서버 기동 약간 빨라짐",
-    "🔁 v0.9.24 한글 IME fix / v0.9.23 원칙 G 강화 모두 포함",
+    "🐛 [중대] SCR-810.md 끝 부록 표(SCR-403/221/410 의 에러 케이스)로 인해 무관한 분류 생성되던 버그 fix",
+    "🛡 옵션 B — strip_appendix_tables() 자동 감지/제거 — 본문 끝 다른 화면 부록 표 차단",
+    "🚨 옵션 A — 프롬프트에 '입력 파일명 일치 SCR 만' 절대 규칙 + 부록/navigateTo 무시 안내",
+    "💡 부록 자동 제거 시 사용자에게 로그로 안내 (예: 'SCR-810.md 의 ... 부록 자동 제거')",
+    "🔁 v0.9.25 샘플 기능 제거 / v0.9.24 한글 IME fix 모두 포함",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -339,6 +339,87 @@ def extract_scr_from_source(filename: str, content: str) -> str:
     return ''
 
 
+def strip_appendix_tables(filename: str, content: str, primary_scr: str) -> tuple[str, list]:
+    """입력 소스 본문에서 다른 SCR 화면의 부록 표를 자동 감지하여 제거 — v0.9.26.
+
+    동료 보고 케이스: SCR-810.md 본문 끝에 SCR-403/SCR-221/SCR-410 의 에러 케이스
+    부록 표가 붙어있어 AI 가 무관한 분류를 만드는 문제.
+
+    감지 패턴:
+      1. 부록 헤더: '**에러 케이스 (...)**:' 또는 '## 부록' 또는 '---' 다음에
+         '| 화면 |' 컬럼이 있는 표
+      2. 표 안의 '화면' 컬럼이 입력 파일의 primary_scr 와 다른 SCR 코드
+      3. '---' 구분자 + 별도 SCR 코드들이 연이어 등장
+
+    안전장치 (제거 안 함):
+      - primary_scr 가 비어있으면 (식별자 없는 임의 마크다운) 부록 감지 시도 안 함
+      - 표 안에 primary_scr 가 다수 등장하면 본문 핵심으로 판단해 보존
+
+    Returns:
+        (정제된 content, [{"reason": str, "scr_codes": [...]}, ...] 제거 정보)
+    """
+    if not content or not primary_scr:
+        return content, []
+
+    pattern_scr = re.compile(r'SCR-\d+[A-Z]?')
+
+    # 줄 단위로 쪼개서 부록 후보 찾기
+    lines = content.split('\n')
+    removed_segments = []  # 제거된 정보 (사용자 안내용)
+    keep_lines = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+
+        # 부록 헤더 패턴 — 본문 끝에서 자주 발견되는 형식
+        is_appendix_header = (
+            re.match(r'^\*\*에러\s*케이스\s*\(.+?\)\*\*\s*:?\s*$', line.strip()) or
+            re.match(r'^\*\*부록.+?\*\*\s*:?\s*$', line.strip()) or
+            re.match(r'^##\s+부록', line.strip()) or
+            re.match(r'^##\s+다른\s*화면.+', line.strip())
+        )
+
+        # 부록 헤더 발견 → 다음 표의 SCR 들이 primary_scr 와 다른지 검사
+        if is_appendix_header:
+            # 헤더부터 표 끝까지 (또는 다음 ---) 의 영역 미리보기
+            preview_end = min(n, i + 50)
+            preview_block = '\n'.join(lines[i:preview_end])
+            scrs_in_block = set(pattern_scr.findall(preview_block))
+            other_scrs = [s for s in scrs_in_block if s != primary_scr]
+            if other_scrs and primary_scr not in scrs_in_block:
+                # 부록 영역이 다른 화면만 다룸 → 제거
+                removed_segments.append({
+                    "reason": "부록 표 — 다른 화면의 정보",
+                    "scr_codes": sorted(other_scrs),
+                    "header": line.strip(),
+                })
+                # 다음 빈 줄 + '---' 까지 또는 다음 H1/H2 까지 skip
+                j = i + 1
+                while j < n:
+                    nxt = lines[j].strip()
+                    # 다음 ---  / 다음 H1 / 다음 H2 / 다음 부록 헤더 만나면 종료 (그 줄은 keep 로 진입)
+                    if nxt == '---':
+                        # --- 자체는 보존하지 말고 skip (부록 마무리 구분선)
+                        j += 1
+                        break
+                    if re.match(r'^#{1,2}\s+', nxt) and not re.match(r'^##\s+부록', nxt):
+                        break  # 다음 일반 섹션 — keep 시작
+                    j += 1
+                i = j
+                continue
+
+        # 일반 라인 — 보존
+        keep_lines.append(line)
+        i += 1
+
+    cleaned = '\n'.join(keep_lines)
+    # 연속 빈 줄 정리 (3개 이상 → 2개)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned, removed_segments
+
+
 def step_parse_sources(sess: dict, sources: list) -> str:
     """복수 소스를 각각 파싱한 뒤 하나의 텍스트로 합친다."""
     parts = []
@@ -378,6 +459,17 @@ def step_parse_sources(sess: dict, sources: list) -> str:
             if scr_id:
                 sess["_source_scr_map"][content] = scr_id
                 push_log(sess, f"[파싱] 화면 식별자 발견: {content} → {scr_id}")
+                # v0.9.26: 부록 표 자동 감지 + 제거 — 다른 화면의 무관한 정보 차단
+                cleaned_text, removed = strip_appendix_tables(content, text, scr_id)
+                if removed:
+                    text = cleaned_text
+                    sess.setdefault("_appendix_removed", []).append({
+                        "filename": content,
+                        "primary_scr": scr_id,
+                        "removed": removed,
+                    })
+                    for r in removed:
+                        push_log(sess, f"[파싱] 부록 자동 제거 — {content} 의 '{r['header']}' (다른 화면: {', '.join(r['scr_codes'])})")
         else:
             text  = content
             label = "✏️ 텍스트 입력"
@@ -2169,6 +2261,8 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
         if scr_table_lines:
             scr_table = "\n".join(scr_table_lines)
             primary_example = list(source_scr_map.values())[0]
+            allowed_scrs = list(source_scr_map.values())
+            allowed_scrs_str = ", ".join(f"`{s}`" for s in allowed_scrs)
             screen_code_hint = f"""
 ## 📱 화면 코드 매핑 (입력 소스 기반 — 반드시 준수)
 
@@ -2178,12 +2272,34 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 |---|---|
 {scr_table}
 
-⚠️ **규칙**:
+## 🚨 입력 소스 범위 엄격 준수 (v0.9.26~ 절대 규칙)
+
+**이 작업의 입력 화면 코드 = {allowed_scrs_str} — 이 외에는 절대 다루지 마세요.**
+
+⚠️ 다음과 같은 상황에 주의하세요:
+
+- 입력 파일 본문에 다른 SCR 코드(예: SCR-403, SCR-221, SCR-410)가 표/참고/링크로 언급될 수 있습니다
+- 본문 끝의 부록 표("**에러 케이스 (프로필/알림/PnL)**" 같은 형식) 에 다른 화면들의 정보가 있을 수 있습니다
+- 인터랙션 설명에서 navigateTo('scr-XXX') 같은 다른 화면 참조가 있을 수 있습니다
+
+**위 모든 경우에 다른 화면들의 분류/TC 는 만들지 마세요.**
+
+✅ **올바른 행동**:
+- 위 매핑 표의 SCR 코드만 분류표/TC ID 에 사용
+- 다른 SCR 이 본문에 등장해도 무시
+- "Notifications", "PnL", "Profile" 등 무관한 키워드는 명시적으로 입력 파일에 없으면 분류 금지
+
+❌ **금지 행동**:
+- 본문 부록에 SCR-221 (알림) 정보가 있다고 "Notifications" 중분류 추가 금지
+- navigateTo('scr-403') 참조 봤다고 "Profile" 분류 추가 금지
+- 매핑 표에 없는 SCR 코드를 임의로 만들기 금지
+
+규칙:
 1. 각 TC 메타 테이블에 `| 연관 화면 | SCR-NNN |` 형식 정확히 사용 (예: `| 연관 화면 | {primary_example} |`)
 2. 화면명 없이 코드만: "SCR-001" ✅ / "Splash (SCR-001)" ❌
-3. 한 TC 가 여러 화면에 걸치면 쉼표 구분: `SCR-001, SCR-003`
-4. **임의 코드 생성 금지**: 위 매핑 표에 없는 화면 코드(예: SCR-999, LGI, ABC)는 절대 만들지 마세요
-5. **해당 TC 의 출처 입력 소스에 화면 코드가 매핑돼 있지 않으면 `| 연관 화면 |` 필드를 비워두세요** (`| 연관 화면 |  |` 형식). 추측해서 만들지 마세요.
+3. 한 TC 가 여러 화면에 걸치면 쉼표 구분: `SCR-001, SCR-003` (단, 둘 다 위 매핑 표에 있어야 함)
+4. **임의 코드 생성 금지**: 위 매핑 표에 없는 화면 코드(SCR-999, LGI, ABC, 또는 입력 외 다른 SCR)는 절대 만들지 마세요
+5. 출처 입력 소스에 매핑이 없으면 `| 연관 화면 |  |` 빈 칸으로 두세요
 """
         elif detected:
             # source_scr_map 은 비어있지만 features_text 에서 SCR 패턴 발견 (예: 본문에 SCR-NNN 언급)
