@@ -86,7 +86,7 @@ def new_session() -> dict:
         "events":           queue.Queue(),
         "gate_event":       threading.Event(),
         "approved":         None,
-        "selected_domains": None,  # None=전체, list=선택된 도메인 코드
+        "selected_domains": None,  # None=전체, list=선택된 대분류 코드
         "status":           "idle",
         "result":           None,
         "thread":           None,
@@ -664,8 +664,8 @@ def step_policy(sess: dict, raw_text: str, project_name: str, focus_area: str = 
 (Splash, 진입 화면, 정적 화면, 브랜딩 화면, 빈 상태 화면 등 단순 화면도 반드시 포함)
 (SCR-xxx, SCREEN-xxx 같은 코드가 있으면 그대로 사용)
 
-## 도메인별 정책
-(각 도메인별로 테스트 가능한 정책을 구체적으로 나열)
+## 대분류별 정책
+(각 대분류별로 테스트 가능한 정책을 구체적으로 나열)
 
 ## 핵심 비즈니스 규칙
 (서비스의 핵심 로직과 검증 포인트)
@@ -686,7 +686,7 @@ def step_policy(sess: dict, raw_text: str, project_name: str, focus_area: str = 
 ⚠️ 중요: 사용자가 다음 기능에 대한 TC만 생성하려고 합니다. 해당 기능과 관련된 정책/규칙에 집중하세요:
 → {focus_area}
 
-관련 없는 도메인이나 기능의 정책은 간략하게만 다루고, 위 범위의 정책을 상세하게 분석하세요."""
+관련 없는 대분류나 기능의 정책은 간략하게만 다루고, 위 범위의 정책을 상세하게 분석하세요."""
     user = f"""프로젝트: {project_name}
 
 다음 문서에서 TC 작성에 필요한 모든 정책과 규칙을 추출해주세요:
@@ -715,14 +715,14 @@ def step_features(sess: dict, policy_text: str, project_name: str, focus_area: s
 
 # Feature List — {프로젝트명}
 
-## 도메인코드 — 도메인명
+## 대분류코드 — 대분류명
 
 ### FT-001 기능명
 - 설명: (기능 설명)
 - 테스트 포인트: (주요 검증 항목)
 - 우선순위: High/Medium/Low
 
-각 도메인의 모든 기능을 빠짐없이 나열하세요.
+각 대분류의 모든 기능을 빠짐없이 나열하세요.
 
 ⛔ 필수: 정책 분석의 "화면/페이지 인벤토리"에 나열된 모든 화면을 각각 별도 기능으로 반드시 포함하세요.
 - Splash 같은 단순 진입 화면도 "화면 진입/표시/버튼 동작" 같은 테스트 포인트로 기능화
@@ -745,7 +745,7 @@ def step_features(sess: dict, policy_text: str, project_name: str, focus_area: s
 {policy_text}
 ---
 
-모든 주요 기능을 도메인별로 분류하여 나열하고, 각 기능의 테스트 포인트를 구체적으로 서술하세요.{focus_instruction}
+모든 주요 기능을 대분류별로 분류하여 나열하고, 각 기능의 테스트 포인트를 구체적으로 서술하세요.{focus_instruction}
 
 ⚠️ 정책 분석에 등장한 모든 화면/기능을 빠짐없이 나열하세요. 선별하지 말고 전체를 다루세요.
 """
@@ -775,8 +775,8 @@ def step_policy_features_combined(sess: dict, raw_text: str, project_name: str,
 (Splash, 진입 화면, 정적 화면, 브랜딩 화면, 빈 상태 화면 등 단순 화면도 반드시 포함)
 (SCR-xxx, SCREEN-xxx 같은 코드가 있으면 그대로 사용)
 
-## [SECTION: POLICY] 도메인별 정책
-(각 도메인별로 테스트 가능한 정책을 구체적으로 나열)
+## [SECTION: POLICY] 대분류별 정책
+(각 대분류별로 테스트 가능한 정책을 구체적으로 나열)
 
 ## [SECTION: POLICY] 핵심 비즈니스 규칙
 (서비스의 핵심 로직과 검증 포인트)
@@ -788,14 +788,14 @@ def step_policy_features_combined(sess: dict, raw_text: str, project_name: str,
 
 # Feature List — {프로젝트명}
 
-## [SECTION: FEATURES] 도메인코드 — 도메인명
+## [SECTION: FEATURES] 대분류코드 — 대분류명
 
 ### FT-001 기능명
 - 설명: (기능 설명)
 - 테스트 포인트: (주요 검증 항목)
 - 우선순위: High/Medium/Low
 
-(각 도메인·화면의 모든 기능을 빠짐없이 나열)
+(각 대분류·화면의 모든 기능을 빠짐없이 나열)
 
 ⛔ 다음을 절대 드롭하지 마세요:
 - 단순 UI 진입 화면 (Splash, Welcome, Landing, 브랜딩)
@@ -860,7 +860,7 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 - {소분류명}: {설명}
 
 규칙:
-- 대분류는 도메인 단위
+- 대분류는 비즈니스 영역 단위 (예: Onboarding, Authentication, Trading)
 - 중분류는 주요 기능 단위
 - 소분류는 세부 케이스 단위
 - ⛔ 대분류/중분류/소분류 이름에 괄호 코드를 붙이지 마세요. 예: "FOOTER (FOOT)" ❌ → "Footer" ✅
@@ -984,7 +984,7 @@ def step_classify_from_inventory(sess: dict, inventory_text: str,
 - {소분류명}: {설명}
 
 규칙:
-- 대분류는 도메인 단위 (예: Onboarding, Authentication, Trading)
+- 대분류는 비즈니스 영역 단위 (예: Onboarding, Authentication, Trading)
 - 중분류는 화면/주요 기능 단위 (인벤토리의 각 화면/기능이 중분류가 됨)
 - 소분류는 해당 중분류의 테스트 가능한 세부 케이스
 - ⛔ 대분류/중분류/소분류 이름에 괄호 코드를 붙이지 마세요. 예: "FOOTER (FOOT)" ❌ → "Footer" ✅
@@ -1145,7 +1145,7 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
     if fewshot:
         push_log(sess, f"[TC 작성] Few-shot 예시 로드됨")
 
-    # 도메인 목록 추출
+    # 대분류 목록 추출
     all_domains = extract_domains(approved_classification)
 
     # 범위 필터 적용
@@ -1153,12 +1153,12 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
         domains = [d for d in all_domains if d["code"] in selected_domain_codes]
         skipped = [d["code"] for d in all_domains if d["code"] not in selected_domain_codes]
         if skipped:
-            push_log(sess, f"[TC 작성] 범위 제외 도메인: {', '.join(skipped)}")
+            push_log(sess, f"[TC 작성] 범위 제외 대분류: {', '.join(skipped)}")
     else:
         domains = all_domains
 
     if not domains:
-        raise RuntimeError("선택된 도메인이 없습니다. 범위를 다시 확인하세요.")
+        raise RuntimeError("선택된 대분류가 없습니다. 범위를 다시 확인하세요.")
 
     # SuiteCode 매핑 (Human Gate에서 검토자가 입력한 코드)
     suite_codes = sess.get("suite_codes", [])
@@ -1168,7 +1168,7 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
     if suite_codes:
         push_log(sess, f"[TC 작성] SuiteCode 매핑: {', '.join(d.get('suite_code', '?') for d in domains)}")
 
-    push_log(sess, f"[TC 작성] 생성 대상 도메인 {len(domains)}개: {', '.join(d['code'] for d in domains)}")
+    push_log(sess, f"[TC 작성] 생성 대상 대분류 {len(domains)}개: {', '.join(d['code'] for d in domains)}")
 
     all_tc_parts = []
     total_tc = 0
@@ -1356,7 +1356,7 @@ def step_write_tc(sess: dict, approved_classification: str, features_text: str,
             domain_tc_parts.append(tc_draft)
             check_stop(sess)
 
-        # 도메인별 병합 저장
+        # 대분류별 병합 저장
         merged = "\n\n---\n\n".join(domain_tc_parts)
         draft_path = sess["workspace"] / f"tc_draft_{domain_code}.md"
         draft_path.write_text(merged, encoding="utf-8")
@@ -1419,7 +1419,7 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 
 {fewshot[:5000]}
 """
-    return f"""당신은 전문 소프트웨어 QA 엔지니어입니다. 주어진 도메인의 테스트 케이스를 작성합니다.
+    return f"""당신은 전문 소프트웨어 QA 엔지니어입니다. 주어진 대분류의 테스트 케이스를 작성합니다.
 
 ## TC 작성 규칙
 
@@ -1430,7 +1430,7 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 
 ## TC 생성 카테고리 (4가지 — 순서대로 작성, 비율 준수)
 
-각 도메인(중분류)에 대해 아래 4가지 카테고리 순서로 TC를 작성하세요.
+각 중분류에 대해 아래 4가지 카테고리 순서로 TC를 작성하세요.
 해당 카테고리에 만들 TC가 없으면 skip 합니다.
 ⚠️ 카테고리 3(예외)과 4(에러)를 반드시 포함하세요. Positive만으로 구성하지 마세요.
 
@@ -2158,7 +2158,7 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
                           screen_character: str = "",
                           screen_navigation: str = "",
                           source_scr_map: dict | None = None) -> str:
-    # 해당 도메인의 분류 섹션 추출
+    # 해당 대분류의 분류 섹션 추출
     domain_section = extract_domain_section(classification, domain["code"])
     project_code = _detect_project_code(project_name)
 
@@ -2417,7 +2417,7 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 """
 
     return f"""프로젝트: {project_name}
-도메인: {domain['name']} ({domain['code']})
+대분류: {domain['name']} ({domain['code']})
 {tc_id_instruction}
 {middle_instruction}
 {nfr_instruction}
@@ -2426,7 +2426,7 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 {classification_priority_hint}
 {dedup_hint}
 {period_hint}
-## 이 도메인의 분류 구조 (사용자 승인 — 최종 진실 소스)
+## 이 대분류의 분류 구조 (사용자 승인 — 최종 진실 소스)
 {domain_section}
 
 ## 전체 기능 목록 (참고용 — 분류표가 우선)
@@ -2437,7 +2437,7 @@ def build_tc_user_prompt(domain: dict, features_text: str, policy_text: str,
 ⚠️ 아래 정책은 **TC 의 사전조건/예상결과 작성에 참고**합니다. 분류표에 없는 기능은 정책이 있어도 TC 만들지 마세요.
 {policy_text[:15000]}
 
-위 도메인({domain['name']}){' 중 "' + focus_middle + '" 중분류' if focus_middle else ''}에 속하는 TC를 아래 4가지 카테고리 순서로 상세하게 작성해주세요.
+위 대분류({domain['name']}){' 중 "' + focus_middle + '" 중분류' if focus_middle else ''}에 속하는 TC를 아래 4가지 카테고리 순서로 상세하게 작성해주세요.
 해당 카테고리에 만들 TC가 없으면 skip합니다.
 
 1. UI/UX 체크: 화면 표시, 초기 상태, 레이아웃 (Positive, Medium~High) — 약 20%
@@ -5142,7 +5142,7 @@ def approve(sid):
     content = data.get("content", "").strip()
     if not content:
         return jsonify({"ok": False, "error": "승인할 내용이 없습니다."}), 400
-    # 선택된 도메인 코드 저장 (None이면 전체 생성)
+    # 선택된 대분류 코드 저장 (None이면 전체 생성)
     selected = data.get("selected_domains")  # list of codes or null
     sess["selected_domains"] = selected if selected else None
     # SuiteCode 저장 (검토자가 Human Gate에서 입력)
@@ -5215,7 +5215,7 @@ def gate_chat(sid):
 1. **짧은 명령형 요청도 명확한 수정 의도로 해석하세요** (한국어 특성).
    - "splash 케이스 삭제" → Splash 관련 중분류/소분류를 모두 제거
    - "이메일 입력 빼줘" → Email Input 중분류 제거
-   - "AUTH 도메인 3번 지워" → AUTH 대분류의 3번째 항목 제거
+   - "AUTH 대분류 3번 지워" → AUTH 대분류의 3번째 항목 제거
    - "체크박스 기능 빼" → 체크박스 관련 항목 모두 제거
 
 2. **삭제 요청을 절대 거부하지 마세요**. 사용자가 "X 삭제/제거/빼줘" 라고 하면 X 와 관련된 항목을 분류표에서 모두 찾아 제거하세요.
@@ -5701,7 +5701,7 @@ def export_gate():
         s = Side(style="thin", color="CCCCCC")
         return Border(left=s, right=s, top=s, bottom=s)
 
-    headers = ["도메인 코드", "도메인명", "TC 생성 포함 (Y/N)", "비고"]
+    headers = ["대분류 코드", "대분류명", "TC 생성 포함 (Y/N)", "비고"]
     col_w   = [16, 30, 20, 40]
     for ci, (h, w) in enumerate(zip(headers, col_w), 1):
         c = ws1.cell(1, ci, h)
@@ -7127,7 +7127,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div class="gate-chat-input-row">
         <textarea class="gate-chat-input" id="gateChatInput"
-          placeholder="수정 요청을 입력하세요. 예) AUTH 도메인 케이스 3번 삭제해줘"
+          placeholder="수정 요청을 입력하세요. 예) AUTH 대분류 케이스 3번 삭제해줘"
           onkeydown="if((event.isComposing||event.keyCode===229))return;if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGateChat();}"></textarea>
         <button class="gate-chat-send" id="gateChatSend" onclick="sendGateChat()">전송</button>
       </div>
@@ -9650,7 +9650,7 @@ function initGateChat(docContent) {
   msgs.innerHTML = '';
   addGateChatMsg('assistant',
     'AI가 문서를 준비했습니다. 수정이 필요한 부분을 채팅으로 알려주세요. ' +
-    '예) "AUTH 도메인의 비밀번호 변경 케이스 삭제해줘" / "PROD 도메인 이름을 상품관리로 바꿔줘"');
+    '예) "AUTH 대분류의 비밀번호 변경 케이스 삭제해줘" / "PROD 대분류 이름을 상품관리로 바꿔줘"');
   document.getElementById('gateChatInput').focus();
 }
 
@@ -9857,7 +9857,7 @@ function setTcIdMode(systemGenerated) {
     } else {
       desc.innerHTML =
         '✏️ <strong style="color:#B45309;">Manual 모드</strong> — ' +
-        '아래 <strong>TC 분류 요약</strong> 표에서 각 도메인의 <strong>SuiteCode</strong>를 직접 입력하세요. ' +
+        '아래 <strong>TC 분류 요약</strong> 표에서 각 대분류의 <strong>SuiteCode</strong>를 직접 입력하세요. ' +
         '입력한 값으로 <code style="background:#FFFFFF;padding:1px 5px;border-radius:3px;border:1px solid #FCD34D;font-family:monospace;">SM-{SuiteCode}-001</code> 형태의 TC ID가 생성됩니다.';
     }
   }
@@ -9998,7 +9998,7 @@ function renderGateViewer(mdText) {
     // 본문 영역 (접히는 부분)
     summaryHtml += '<div style="padding:0 16px 14px 16px;">';
     // 도움말 — 모드별 2종 (display toggle)
-    summaryHtml += '<div id="suiteCodeHelpNormal" style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 도메인의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code> ...</div>';
+    summaryHtml += '<div id="suiteCodeHelpNormal" style="font-size:12px;color:#4B5563;margin-bottom:10px;">각 대분류의 <strong>SuiteCode</strong>를 입력하세요. 순번(001, 002...)은 자동 생성됩니다.<br>예: SuiteCode에 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">GNBF</code> 입력 → TC ID: <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-GNBF-001</code> ...</div>';
     summaryHtml += '<div id="suiteCodeHelpAuto" style="display:none;font-size:12px;color:#4B5563;margin-bottom:10px;">🤖 <strong>시스템 규칙 자동 적용</strong> — 각 중분류(화면)가 <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">screen_code_map.md</code>에 등록된 ScreenCode로 자동 매핑됩니다.<br>예: Splash → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-SPL-001</code>, Login Options → <code style="background:#DBEAFE;padding:1px 4px;border-radius:3px;">' + _pcode + '-LGI-001</code> ... (화면별 독립 001~)</div>';
     // 표 상단 컨트롤 — 전체 펼치기/접기
     summaryHtml += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap;">';
@@ -10180,7 +10180,7 @@ async function sendGateChat() {
         statusMsg = '⚠️ AI 응답이 너무 길어 잘렸습니다. 분류표는 변경되지 않았어요. 더 작은 단위로 나눠 다시 요청해 주세요.';
       } else {
         // 변경 없음 — 명령이 모호했거나 AI 가 질문으로 해석한 경우
-        statusMsg = 'ℹ️ 분류표가 변경되지 않았습니다. 요청이 모호했을 수 있어요. 더 명확하게 다시 요청해 주세요. (예: "Splash 중분류 삭제해줘", "AUTH 도메인의 3번 케이스 삭제")';
+        statusMsg = 'ℹ️ 분류표가 변경되지 않았습니다. 요청이 모호했을 수 있어요. 더 명확하게 다시 요청해 주세요. (예: "Splash 중분류 삭제해줘", "AUTH 대분류의 3번 케이스 삭제")';
       }
       addGateChatMsg('system', statusMsg);
     } else {
@@ -10353,7 +10353,7 @@ async function approveGate() {
   });
   // Auto 모드에서는 SuiteCode 입력 검증 생략 (screen_code_map이 중분류별로 자동 매핑)
   if (!autoScreenCode && suiteCodeInputs.length > 0 && hasEmpty) {
-    alert('모든 도메인의 SuiteCode를 입력해주세요.\\n(또는 "🤖 시스템 규칙 자동 적용" 체크박스를 켜면 자동 매핑됩니다.)'); return;
+    alert('모든 대분류의 SuiteCode를 입력해주세요.\\n(또는 "🤖 시스템 규칙 자동 적용" 체크박스를 켜면 자동 매핑됩니다.)'); return;
   }
   // SuiteCode 목록 (순서대로) — Auto 모드에서도 백엔드 로그 표시용으로 전송
   var suiteCodeList = [];
@@ -10714,8 +10714,8 @@ async function pollServerAlive() {
   // localStorage 'tc_ui_lang' 우선, 없으면 navigator.language 자동 감지
   const I18N = {
     ko: {
-      placeholder: '예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈',
-      placeholderModal: '예) AUTH 도메인 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈',
+      placeholder: '예) AUTH 대분류 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈',
+      placeholderModal: '예) AUTH 대분류 케이스 3번 삭제해줘 — Enter로 전송, Shift+Enter 줄바꿈',
       labelMain: '💬 AI 도우미',
       labelHint: '표 검토 중에도 바로 대화하세요',
       btnLarge: '⛶ 크게',
