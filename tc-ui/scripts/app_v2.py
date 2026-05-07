@@ -9261,6 +9261,8 @@ function startNextIteration(focusOnly) {
   });
   document.getElementById('card1').classList.remove('hidden');
   document.querySelectorAll('.stopped-banner, .error-banner').forEach(function(el) { el.remove(); });
+  // Drive 버튼 라벨 reset — 이전 업로드 완료 상태 잔존 방지
+  if (typeof resetDriveBtn === 'function') resetDriveBtn();
   // 상단 card2 요소 복원
   var logBox = document.getElementById('logBox');
   if (logBox) { logBox.style.display = ''; logBox.innerHTML = ''; }
@@ -11007,6 +11009,9 @@ function handleEvent(evt) {
     // Smoke TC: 서버가 smoke_tc를 보내면 우선 사용, 없으면 min_tc 폴백 (하위호환)
     const smokeVal = (typeof smoke_tc === 'number') ? smoke_tc : min_tc;
     document.getElementById('statSmoke').textContent = (smokeVal !== undefined && smokeVal !== null) ? smokeVal : '—';
+    // Drive 업로드 버튼 라벨 reset — 이전 결과의 'Drive 업로드 완료' 상태가 새 결과에
+    // 그대로 남는 버그 차단. 새 파일은 아직 업로드 전이므로 원래 라벨로 복귀.
+    resetDriveBtn();
     setStepBar(5);
     setStopButtonsDisabled(true);
     // 원칙 G — 중복 의심 TC 알림 렌더링 (있을 경우)
@@ -12478,6 +12483,19 @@ function selectDriveFolder(id, name, element) {
   if (element) element.classList.add('selected');
   document.getElementById('driveUploadBtn').disabled = false;
   document.getElementById('driveSelectedFolder').textContent = '✓ 선택됨: ' + name;
+}
+
+// Drive 업로드 버튼을 원래 라벨/스타일로 복귀 — 새 결과 도착 또는 새 파이프라인 시작 시 호출
+function resetDriveBtn() {
+  const btn = document.getElementById('driveBtn');
+  if (!btn) return;
+  // SVG + "Google Drive에 올리기" 라벨 복원
+  if (typeof DRIVE_SVG !== 'undefined') {
+    btn.innerHTML = DRIVE_SVG + ' Google Drive에 올리기';
+  } else {
+    btn.textContent = 'Google Drive에 올리기';
+  }
+  btn.style.borderColor = '';
 }
 
 async function confirmDriveUpload() {
