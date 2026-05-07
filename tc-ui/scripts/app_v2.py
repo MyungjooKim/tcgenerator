@@ -261,6 +261,26 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 8192) ->
     except Exception as e:
         raise RuntimeError(f"Claude API 오류: {e}")
 
+
+def call_claude_cached(system_blocks: list, user_prompt: str, max_tokens: int = 8192) -> str:
+    """system_blocks: list of {"type":"text","text":..., "cache_control":{"type":"ephemeral"} 선택}.
+    첫 호출은 캐시 미스(오버헤드 ~25%), 이후 5분 내 동일 블록 호출은 캐시 히트(약 90% 비용↓).
+    화면별 1:1 호출처럼 system 부분이 동일하고 user만 바뀔 때 효과 큼.
+    """
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            temperature=0,
+            system=system_blocks,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return msg.content[0].text
+    except Exception as e:
+        raise RuntimeError(f"Claude API 오류 (cached): {e}")
+
 # ── TC 규칙 로딩 ───────────────────────────────────────────────────────────────
 FEWSHOT_FILE = AGENT_DIR / "common" / "tc-sample-fewshot.md"
 
@@ -486,6 +506,360 @@ def step_parse_sources(sess: dict, sources: list) -> str:
     else:
         push_log(sess, "[파싱] 입력 소스에서 화면 식별자(SCR-NNN) 미발견 — 화면 코드 컬럼은 빈 칸으로 출력됩니다")
     return raw_text
+
+
+# ── 구조화 spec 폴더 처리 (v0.10.0+) ─────────────────────────────────────────
+# 새 기획서 형식: 폴더 1개에 overview/policy/design/scr/*.md 가 역할별로 분리됨.
+# 기존 "raw_text concat" 모드와 병행. 사용자가 폴더 경로로 입력하면 이 흐름을 탄다.
+
+def classify_spec_files(folder: Path) -> dict:
+    """spec 폴더 안의 md 파일들을 역할별로 자동 분류.
+    반환: {"overview": Path|None, "policy": [Path...], "design": [Path...], "screens": [Path...]}
+    분류 규칙(파일명/경로 우선순위):
+      - scr/ 또는 SCR-* 패턴 → screens
+      - *error*, *policy*, *biz*, *rule* → policy
+      - *design*, *ux*, *theme*, *token* → design
+      - 01_*, *spec*, *overview* → overview (첫 매칭 1개)
+      - 그 외 .md → overview 폴백 (있으면 policy 으로)
+    """
+    out = {"overview": None, "policy": [], "design": [], "screens": []}
+    if not folder.exists() or not folder.is_dir():
+        return out
+
+    # 1) screens — scr/ 하위 또는 파일명이 SCR-* 패턴
+    scr_dir = folder / "scr"
+    if scr_dir.exists() and scr_dir.is_dir():
+        out["screens"] = sorted([p for p in scr_dir.glob("*.md") if p.is_file()])
+    # 루트에 SCR-XXX.md 가 직접 있는 경우도 수용
+    for p in sorted(folder.glob("SCR-*.md")):
+        if p.is_file() and p not in out["screens"]:
+            out["screens"].append(p)
+
+    # 2) 루트 md 분류 (scr/ 안의 파일은 위에서 처리됨)
+    for p in sorted(folder.glob("*.md")):
+        if not p.is_file():
+            continue
+        name = p.name.lower()
+        # 생성물(generated) 은 참고용으로만 — design 으로 분류
+        if "error" in name or "policy" in name or "biz-rule" in name or "business-rule" in name:
+            out["policy"].append(p)
+        elif "design" in name or name.startswith("02_ux") or "theme" in name or "token" in name or "ux_design" in name:
+            out["design"].append(p)
+        elif name.startswith("01_") or "spec" in name or "overview" in name:
+            if out["overview"] is None:
+                out["overview"] = p
+            else:
+                out["policy"].append(p)
+        else:
+            # 미상 → policy 폴백 (overview 가 없으면 overview 로)
+            if out["overview"] is None:
+                out["overview"] = p
+            else:
+                out["policy"].append(p)
+    return out
+
+
+def parse_screen_list_table(overview_md_text: str) -> list[dict]:
+    """01_spec.md 의 '화면 목록' 표를 파싱해 분류표 시드를 만든다.
+    헤더 형식: | ID | 화면명 | 대분류 | 중분류 | 상태 | 설명 | 진입 경로 |
+    상태(status) 컬럼이 'deprecated'/'미사용' 같으면 제외.
+    반환: [{"id":"SCR-001","name":"Login","major":"Onboarding","middle":"Login","status":"active","desc":"...","entry":"..."}]
+    """
+    rows = []
+    in_table = False
+    headers: list[str] = []
+    for line in overview_md_text.splitlines():
+        line = line.rstrip()
+        # 표 시작 감지: ID/화면명/대분류 같은 헤더가 있어야 함
+        if line.startswith("|") and "ID" in line and ("대분류" in line or "Major" in line):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            headers = [c.lower() for c in cells]
+            in_table = True
+            continue
+        if in_table and line.startswith("|---"):
+            continue
+        if in_table:
+            if not line.startswith("|"):
+                in_table = False
+                headers = []
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 4:
+                continue
+            row = {}
+            for i, h in enumerate(headers):
+                if i >= len(cells):
+                    break
+                row[h] = cells[i]
+            # 키 정규화
+            sid = row.get("id") or row.get("화면id") or ""
+            name = row.get("화면명") or row.get("name") or ""
+            major = row.get("대분류") or row.get("major") or ""
+            middle = row.get("중분류") or row.get("middle") or ""
+            status = row.get("상태") or row.get("status") or "active"
+            desc = row.get("설명") or row.get("description") or ""
+            entry = row.get("진입 경로") or row.get("진입경로") or row.get("entry") or ""
+            if not sid or not re.match(r"^SCR[-_]?\w+", sid, re.IGNORECASE):
+                continue
+            if status.lower() in ("deprecated", "미사용", "obsolete", "삭제"):
+                continue
+            rows.append({
+                "id": sid.upper().replace("_", "-"),
+                "name": name,
+                "major": major,
+                "middle": middle,
+                "status": status,
+                "desc": desc,
+                "entry": entry,
+            })
+    return rows
+
+
+def build_classification_from_screen_list(screen_rows: list[dict], project_name: str) -> str:
+    """parse_screen_list_table() 의 결과를 분류표 마크다운(extract_domains() 가 읽는 형식)으로 변환.
+    LLM 호출 없이 바로 Human Gate 로 갈 수 있는 분류표를 생성한다.
+    """
+    # 대분류 → 중분류 → [화면 ID + name]
+    from collections import defaultdict
+    tree: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for r in screen_rows:
+        major = r["major"] or "공통"
+        middle = r["middle"] or r["name"] or "기본"
+        tree[major][middle].append(r)
+
+    lines = [f"# TC 분류표 — {project_name}", ""]
+    for major, mids in tree.items():
+        lines.append(f"## 대분류: {major}")
+        lines.append("")
+        for middle, screens in mids.items():
+            lines.append(f"### 중분류: {middle}")
+            lines.append("")
+            lines.append("#### 소분류")
+            for s in screens:
+                # SCR-001 — Login: ... 형식. 소분류 1개당 화면 1개로 시드.
+                short_desc = s["desc"][:80] if s["desc"] else ""
+                lines.append(f"- {s['id']} {s['name']}: {short_desc}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def parse_screen_md(md_path: Path) -> dict:
+    """SCR-XXX.md 한 파일을 파싱해 메타 정보 추출.
+    반환: {
+      "id": "SCR-001",
+      "title": "Login",
+      "group": "로그인_공통",
+      "description": "...",
+      "states": [{"case":"Normal","cond":"...","desc":"..."}, ...],
+      "ref_keywords": ["error.network", ...],   # cross-ref 감지용
+      "raw": <원문 전체>
+    }
+    """
+    text = md_path.read_text(encoding="utf-8")
+    # ID — 파일명 우선, 본문 H1 보조
+    m = re.match(r"^(SCR[-_]?\w+)", md_path.stem, re.IGNORECASE)
+    sid = m.group(1).upper().replace("_", "-") if m else md_path.stem.upper()
+
+    # H1 제목
+    title = ""
+    h1 = re.search(r"^#\s+([^\n]+)", text, re.MULTILINE)
+    if h1:
+        # "SCR-001: Login" → "Login"
+        t = h1.group(1).strip()
+        t = re.sub(r"^SCR[-_]?\w+\s*[:\-]\s*", "", t, flags=re.IGNORECASE)
+        title = t.strip()
+
+    # 그룹/설명 — **그룹**: xxx, **설명**: xxx 패턴
+    group = ""
+    g = re.search(r"\*\*그룹\*\*\s*[:：]\s*([^\n]+)", text)
+    if g:
+        group = g.group(1).strip()
+    desc = ""
+    d = re.search(r"\*\*설명\*\*\s*[:：]\s*([^\n]+(?:\n(?![*#\-|]).+)*)", text)
+    if d:
+        desc = d.group(1).strip()[:300]
+
+    # 상태(Status) 표 — | 케이스 | 조건 | 설명 / 동작 |
+    states: list[dict] = []
+    in_status_tbl = False
+    status_headers: list[str] = []
+    for line in text.splitlines():
+        if not in_status_tbl:
+            # "**상태 (Status)**" 또는 "## 상태" 등 키워드 뒤의 첫 표
+            if re.search(r"상태\s*\(\s*Status\s*\)|^##+\s*상태", line):
+                in_status_tbl = "header_pending"
+            continue
+        if in_status_tbl == "header_pending":
+            if line.strip().startswith("|") and ("케이스" in line or "case" in line.lower()):
+                cells = [c.strip().lower() for c in line.strip("|").split("|")]
+                status_headers = cells
+                in_status_tbl = "rows"
+            continue
+        if in_status_tbl == "rows":
+            if line.strip().startswith("|---"):
+                continue
+            if not line.strip().startswith("|"):
+                in_status_tbl = False
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 2:
+                continue
+            row = {}
+            for i, h in enumerate(status_headers):
+                if i < len(cells):
+                    row[h] = cells[i]
+            states.append({
+                "case": row.get("케이스") or row.get("case") or "",
+                "cond": row.get("조건") or row.get("condition") or "",
+                "desc": (row.get("설명 / 동작") or row.get("설명") or row.get("동작")
+                         or row.get("description") or ""),
+            })
+
+    # cross-ref 키워드 감지 (정책/디자인 자동 inject 용)
+    ref_kw = []
+    if re.search(r"error\.\w+|에러|네트워크|타임아웃|세션", text, re.IGNORECASE):
+        ref_kw.append("error")
+    if re.search(r"세션|토큰|로그아웃|만료", text):
+        ref_kw.append("session")
+    if re.search(r"toast|modal|alert|inline error|full-?screen error", text, re.IGNORECASE):
+        ref_kw.append("error_ui")
+    if re.search(r"empty\s*state|빈\s*상태", text, re.IGNORECASE):
+        ref_kw.append("empty_state")
+    if re.search(r"loading|로딩|skeleton", text, re.IGNORECASE):
+        ref_kw.append("loading")
+
+    return {
+        "id": sid,
+        "title": title,
+        "group": group,
+        "description": desc,
+        "states": states,
+        "ref_keywords": ref_kw,
+        "raw": text,
+    }
+
+
+def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code: str,
+                              suite_code: str, starting_seq: int,
+                              policy_excerpts: list[str] = None,
+                              design_excerpts: list[str] = None) -> str:
+    """화면별 1:1 호출용 user prompt. 정책/디자인은 시스템 프롬프트(캐시)에 들어가고,
+    여기엔 해당 화면 전문 + 자동 추출한 cross-ref 인용만 포함.
+    """
+    seq_str = f"{starting_seq:03d}"
+    next_str = f"{starting_seq+1:03d}"
+    example_id = f"{project_code}-{suite_code}-{seq_str}"
+
+    states_block = ""
+    if screen_meta["states"]:
+        lines = ["## 이 화면의 상태 케이스 (각각 TC 후보)"]
+        for st in screen_meta["states"]:
+            lines.append(f"- **{st['case']}**: 조건={st['cond']} / 동작={st['desc']}")
+        states_block = "\n".join(lines) + "\n"
+
+    refs_block = ""
+    if policy_excerpts or design_excerpts:
+        parts = ["## 이 화면에 적용되는 정책·디자인 발췌 (자동 cross-ref)"]
+        if policy_excerpts:
+            parts.append("### 관련 정책")
+            for x in policy_excerpts:
+                parts.append(x)
+        if design_excerpts:
+            parts.append("### 관련 디자인")
+            for x in design_excerpts:
+                parts.append(x)
+        refs_block = "\n".join(parts) + "\n"
+
+    return f"""프로젝트: {project_name}
+화면: {screen_meta['id']} — {screen_meta['title']}
+그룹: {screen_meta['group']}
+
+⚠️ TC ID 형식: `{example_id}`, `{project_code}-{suite_code}-{next_str}`, ... (시작 번호 `{seq_str}`부터 연속 증가)
+
+## 화면 명세 (전문 — 이 문서의 내용에서만 TC 작성)
+
+{screen_meta['raw']}
+
+{states_block}
+{refs_block}
+위 화면의 모든 상태 케이스와 인터랙션에 대해 TC를 빠짐없이 작성하세요.
+- Normal 상태 → Positive TC (UI/UX 체크 + 주요 기능)
+- Error.* 상태 → Negative TC (에러 처리 패턴은 위 정책 발췌 따라 명시)
+- 비고에 [정책]/[제약]/[접근성] 마커가 있으면 해당 검증 TC도 포함
+"""
+
+
+def extract_policy_excerpts(policy_full_text: str, ref_keywords: list[str]) -> list[str]:
+    """정책 전문에서 화면이 참조할 섹션만 발췌. 키워드별 최대 800자.
+    너무 길면 화면별 호출이 무거워지므로 압축해서 user prompt 에 넣는다.
+    """
+    if not ref_keywords or not policy_full_text:
+        return []
+
+    excerpts = []
+    sections = re.split(r"\n(?=#{1,3}\s)", policy_full_text)
+    seen_titles = set()
+    for kw in ref_keywords:
+        kw_pat = {
+            "error": r"error|에러|패턴",
+            "session": r"세션|토큰|만료|로그아웃",
+            "error_ui": r"toast|modal|alert|inline|full-?screen",
+            "empty_state": r"empty|빈\s*상태",
+            "loading": r"loading|로딩|skeleton",
+        }.get(kw, kw)
+        for sec in sections:
+            head = sec.split("\n", 1)[0]
+            if head in seen_titles:
+                continue
+            if re.search(kw_pat, sec, re.IGNORECASE):
+                excerpt = sec.strip()[:800]
+                excerpts.append(excerpt)
+                seen_titles.add(head)
+                if len(excerpts) >= 4:  # 너무 많으면 잘라냄
+                    return excerpts
+    return excerpts
+
+
+def step_parse_structured_spec(sess: dict, folder_path: str) -> dict:
+    """구조화 spec 폴더 1개를 받아 overview/policy/design/screens 로 분리하고 메타 추출.
+    반환: {
+      "overview_text": str,
+      "policy_text":   str,    # 모든 정책 md concat
+      "design_text":   str,    # 모든 디자인 md concat
+      "screens":       [parse_screen_md() 결과 ...],
+      "screen_rows":   [parse_screen_list_table() 결과 ...],
+    }
+    LLM 호출은 0회 — 순수 파싱만.
+    """
+    folder = Path(folder_path).expanduser()
+    if not folder.exists():
+        raise FileNotFoundError(f"폴더 없음: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"폴더가 아님: {folder}")
+
+    push_log(sess, f"[구조화 spec] 폴더 스캔 중: {folder}")
+    cls = classify_spec_files(folder)
+
+    overview_text = cls["overview"].read_text(encoding="utf-8") if cls["overview"] else ""
+    policy_text = "\n\n".join(p.read_text(encoding="utf-8") for p in cls["policy"])
+    design_text = "\n\n".join(p.read_text(encoding="utf-8") for p in cls["design"])
+
+    screens = [parse_screen_md(p) for p in cls["screens"]]
+    screen_rows = parse_screen_list_table(overview_text) if overview_text else []
+
+    push_log(sess,
+        f"[구조화 spec] 분류 완료 — overview={'있음' if cls['overview'] else '없음'} / "
+        f"policy={len(cls['policy'])}개 / design={len(cls['design'])}개 / "
+        f"화면 md={len(cls['screens'])}개 / 화면 목록 표={len(screen_rows)}행")
+
+    return {
+        "overview_text": overview_text,
+        "policy_text":   policy_text,
+        "design_text":   design_text,
+        "screens":       screens,
+        "screen_rows":   screen_rows,
+        "_files":        cls,  # 디버깅용
+    }
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
@@ -1133,6 +1507,147 @@ def step_gate(sess: dict, classification: str):
 
 
 # ── 6단계: TC 작성 ────────────────────────────────────────────────────────────
+def step_write_tc_per_screen(sess: dict, approved_classification: str,
+                              spec_data: dict, project_name: str,
+                              selected_domain_codes=None) -> tuple:
+    """구조화 spec 모드 전용 — 화면(SCR) 1개당 LLM 1회 호출.
+
+    Args:
+        approved_classification: Human Gate 통과한 분류표 (build_classification_from_screen_list 결과).
+        spec_data:               step_parse_structured_spec() 반환값.
+        selected_domain_codes:   대분류 필터 (None=전체).
+    Returns: (merged_tc_md, total_tc_count)
+
+    핵심 차이점 (vs step_write_tc):
+      - 정책/디자인을 시스템 프롬프트에 cache_control 로 1회만 전송 → 화면 N개 호출에 캐시 히트
+      - 화면별 user prompt 는 해당 SCR 본문 전문 + 자동 추출한 cross-ref 인용만 포함
+      - 화면 단위 매핑이 정확 (휴리스틱 발췌 X)
+    """
+    push_log(sess, "[화면별 TC 작성] 시작 — 구조화 spec 모드")
+    tc_rules = load_tc_rules()
+    fewshot = load_fewshot_examples()
+    project_policies = load_project_policies(project_name)
+
+    # 1) 시스템 프롬프트 블록 구성 — cache_control 적용
+    sys_blocks = []
+    base_sys = f"""당신은 전문 소프트웨어 QA 엔지니어입니다. 화면 단위로 정밀한 테스트 케이스를 작성합니다.
+
+## TC 작성 규칙
+{tc_rules if tc_rules else '표준 TC 형식을 따릅니다.'}
+"""
+    sys_blocks.append({"type": "text", "text": base_sys})
+    if project_policies:
+        sys_blocks.append({
+            "type": "text",
+            "text": f"\n## 프로젝트별 정책 (반드시 준수)\n{project_policies[:6000]}\n",
+            "cache_control": {"type": "ephemeral"},
+        })
+    if fewshot:
+        sys_blocks.append({
+            "type": "text",
+            "text": f"\n## 참고 예시 (이 형식과 수준을 따라 작성)\n{fewshot[:5000]}\n",
+            "cache_control": {"type": "ephemeral"},
+        })
+    if spec_data.get("policy_text"):
+        sys_blocks.append({
+            "type": "text",
+            "text": f"\n## 공통 정책 문서 (전문 — 화면이 참조하는 정책)\n{spec_data['policy_text'][:20000]}\n",
+            "cache_control": {"type": "ephemeral"},
+        })
+    if spec_data.get("design_text"):
+        sys_blocks.append({
+            "type": "text",
+            "text": f"\n## 디자인 시스템 문서 (전문 — 토큰/컴포넌트 참조)\n{spec_data['design_text'][:20000]}\n",
+            "cache_control": {"type": "ephemeral"},
+        })
+    sys_blocks.append({
+        "type": "text",
+        "text": f"\n## 분류표 (사용자 승인 — 최종 진실 소스)\n{approved_classification[:10000]}\n",
+        "cache_control": {"type": "ephemeral"},
+    })
+
+    # 2) 처리 대상 화면 필터링 (selected_domain_codes)
+    all_domains = extract_domains(approved_classification)
+    if selected_domain_codes:
+        domain_codes_set = set(selected_domain_codes)
+        # 분류표의 대분류명 → 화면 매핑
+    else:
+        domain_codes_set = None
+
+    # screen_rows 의 major(대분류) 와 domain 의 name 매칭으로 SuiteCode 결정
+    suite_codes = sess.get("suite_codes", [])
+    domain_to_suite: dict[str, str] = {}
+    for i, dom in enumerate(all_domains):
+        if i < len(suite_codes) and suite_codes[i]:
+            domain_to_suite[dom["name"]] = suite_codes[i].strip().strip("-")
+        else:
+            domain_to_suite[dom["name"]] = dom["code"]
+
+    # screens 와 screen_rows 를 ID 로 조인
+    rows_by_id = {r["id"]: r for r in spec_data.get("screen_rows", [])}
+    target_screens = []
+    for sc in spec_data["screens"]:
+        check_stop(sess)
+        meta_row = rows_by_id.get(sc["id"], {})
+        major = meta_row.get("major") or ""
+        if domain_codes_set is not None:
+            # selected_domain_codes 는 코드 기반이므로 코드/이름 매칭 모두 시도
+            matched_dom = next((d for d in all_domains if d["name"] == major or d["code"] == major), None)
+            if not matched_dom or matched_dom["code"] not in domain_codes_set:
+                continue
+        target_screens.append((sc, meta_row, major))
+
+    if not target_screens:
+        raise RuntimeError("처리할 화면이 없습니다. 분류표/필터를 확인하세요.")
+
+    push_log(sess, f"[화면별 TC 작성] 대상 화면 {len(target_screens)}개")
+    project_code = _detect_project_code(project_name)
+
+    tc_parts: list[str] = []
+    seq_per_suite: dict[str, int] = {}
+    total_tc = 0
+
+    for idx, (sc, meta_row, major) in enumerate(target_screens, 1):
+        check_stop(sess)
+        suite_code = domain_to_suite.get(major, "FUNC") or "FUNC"
+        starting = seq_per_suite.get(suite_code, 1)
+
+        # cross-ref 인용 추출
+        policy_excerpts = extract_policy_excerpts(spec_data.get("policy_text", ""), sc["ref_keywords"])
+
+        user = build_screen_user_prompt(
+            screen_meta=sc,
+            project_name=project_name,
+            project_code=project_code,
+            suite_code=suite_code,
+            starting_seq=starting,
+            policy_excerpts=policy_excerpts,
+            design_excerpts=None,  # 디자인은 system 캐시에 들어가 있어서 별도 발췌 불필요
+        )
+
+        push(sess, "stage", {
+            "stage": 4, "label": f"[{idx}/{len(target_screens)}] {sc['id']} TC 작성 중...",
+            "pct": 55 + int(25 * (idx / max(len(target_screens), 1))),
+        })
+
+        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=8192)
+
+        # TC 개수 카운트 → 다음 화면의 starting seq 계산
+        scr_tc_count = count_unique_tc_ids(tc_draft)
+        seq_per_suite[suite_code] = starting + scr_tc_count
+        total_tc += scr_tc_count
+
+        # 화면 헤더 + 본문
+        tc_parts.append(f"<!-- {sc['id']} — {sc['title']} -->\n\n{tc_draft.strip()}")
+        push_log(sess, f"[화면별 TC 작성] [{idx}/{len(target_screens)}] {sc['id']} 완료 — TC {scr_tc_count}개 (누적 {total_tc})")
+
+    merged = "\n\n---\n\n".join(tc_parts)
+    draft_path = sess["workspace"] / "tc_draft_per_screen.md"
+    draft_path.write_text(merged, encoding="utf-8")
+    push_log(sess, f"[화면별 TC 작성] 전체 완료 — 화면 {len(target_screens)}개, TC {total_tc}개")
+    return merged, total_tc
+
+
 def step_write_tc(sess: dict, approved_classification: str, features_text: str,
                   policy_text: str, project_name: str,
                   selected_domain_codes=None) -> tuple:
@@ -4174,6 +4689,187 @@ def upload_md():
     })
 
 
+def run_pipeline_structured(sess: dict, folder_path: str, project_name: str):
+    """구조화 spec 폴더 파이프라인 — LLM 분류 단계 스킵, 화면별 1:1 호출."""
+    focus_area = sess.get("focus_area", "")
+    try:
+        # ── 1) 폴더 파싱 (LLM 호출 없음) ──
+        sess["status"] = "parsing"
+        push_stage(sess, 1, "구조화 spec 폴더 파싱", 8)
+        spec_data = step_parse_structured_spec(sess, folder_path)
+        check_stop(sess)
+
+        if not spec_data["screens"]:
+            raise RuntimeError(f"화면 md 가 없습니다: {folder_path}/scr/")
+        if not spec_data["screen_rows"]:
+            push_log(sess, "[경고] overview 의 화면 목록 표를 찾지 못함 — 화면 파일명/H1만으로 분류표 생성")
+            # screen_rows fallback
+            for sc in spec_data["screens"]:
+                spec_data["screen_rows"].append({
+                    "id": sc["id"], "name": sc["title"], "major": "공통",
+                    "middle": sc["title"], "status": "active",
+                    "desc": sc["description"], "entry": "",
+                })
+
+        # raw_text 호환용 (resume/체크포인트용 — 전체 텍스트)
+        raw_text = "\n\n".join([
+            spec_data["overview_text"],
+            spec_data["policy_text"],
+            spec_data["design_text"],
+        ])
+        # SCR 매핑 — 화면 파일에서 ID 그대로
+        sess["_source_scr_map"] = {sc["id"]: sc["id"] for sc in spec_data["screens"]}
+
+        # ── 2) 분류표 자동 생성 (LLM 호출 없음) ──
+        sess["status"] = "classifying"
+        push_stage(sess, 2, "분류표 자동 생성 (LLM 호출 없음)", 25)
+        classification = build_classification_from_screen_list(spec_data["screen_rows"], project_name)
+        classify_path = sess["workspace"] / "04_classification_draft.md"
+        classify_path.write_text(classification, encoding="utf-8")
+        push_log(sess, f"[분류] 화면 목록 표에서 분류표 자동 생성 — {len(classification):,}자")
+
+        # 체크포인트 저장
+        sources_info = [{"type": "spec_folder", "content": folder_path}]
+        save_pipeline_state(project_name, "gate_waiting", {
+            "raw_text": raw_text[:20000],
+            "classification": classification,
+            "focus_area": focus_area,
+            "sources_info": sources_info,
+            "source_scr_map": sess["_source_scr_map"],
+            "structured_spec_folder": folder_path,
+        })
+        save_project(project_name, last_sources=sources_info, last_focus_area=focus_area)
+
+        # spec_data 보관 — Human Gate 통과 후 step_write_tc_per_screen 에서 사용
+        sess["_structured_spec_data"] = spec_data
+
+        # ── 3) Human Gate ──
+        sess["status"] = "gate_waiting"
+        push_stage(sess, 3, "분류표 검토 대기 (Human Gate)", 50)
+        approved = step_gate(sess, classification)
+        check_stop(sess)
+
+        # ── 4) 화면별 1:1 TC 작성 ──
+        sess["status"] = "tc_writing"
+        push_stage(sess, 4, "화면별 TC 작성 (cache 활용)", 55)
+        selected = sess.get("selected_domains")
+        merged_tc, total_tc = step_write_tc_per_screen(
+            sess, approved, spec_data, project_name,
+            selected_domain_codes=selected,
+        )
+
+        # ── 5) Review (선택) — 기존 step_review 그대로 재사용 ──
+        sess["status"] = "reviewing"
+        push_stage(sess, 5, "TC 검토 / 정리", 82)
+        reviewed = step_review(sess, merged_tc, project_name) if 'step_review' in globals() else merged_tc
+
+        tc_final_path = sess["workspace"] / "tc_final.md"
+        tc_final_path.write_text(reviewed, encoding="utf-8")
+
+        # ── 6) Excel 빌드 ──
+        sess["status"] = "building_excel"
+        push_stage(sess, 6, "Excel 빌드", 92)
+        result_file = step_build_excel(sess, reviewed, project_name)
+        sess["result"] = str(result_file)
+
+        sess["status"] = "done"
+        push_stage(sess, 7, "완료", 100)
+        push(sess, "done", {"result": str(result_file), "tc_count": total_tc})
+        push_log(sess, f"[완료] 화면 {len(spec_data['screens'])}개 → TC {total_tc}개 → {result_file}")
+
+        # 체크포인트 정리
+        clear_pipeline_state(project_name)
+    except Exception as e:
+        sess["status"] = "error"
+        push_error(sess, f"구조화 spec 파이프라인 오류: {e}")
+
+
+@app.route("/start-spec-folder", methods=["POST"])
+def start_spec_folder():
+    """구조화 spec 폴더 1개를 받아 파이프라인 실행.
+    POST body: {project_name, folder_path, focus_area?}
+    기존 /start 와 분리 — 새 모드는 LLM 호출이 화면별로만 발생.
+    """
+    data = request.get_json(force=True) or {}
+    project_name = data.get("project_name", "프로젝트").strip() or "프로젝트"
+    focus_area   = (data.get("focus_area") or "").strip()
+    folder_path  = (data.get("folder_path") or "").strip()
+
+    if not folder_path:
+        return jsonify({"ok": False, "error": "folder_path 가 비어 있습니다."}), 400
+    folder = Path(folder_path).expanduser()
+    if not folder.exists() or not folder.is_dir():
+        return jsonify({"ok": False, "error": f"폴더가 없거나 디렉토리가 아닙니다: {folder}"}), 400
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY가 설정되지 않았습니다."}), 500
+
+    # 사전 검증 — 화면 md 가 있어야 함
+    cls_check = classify_spec_files(folder)
+    if not cls_check["screens"]:
+        return jsonify({
+            "ok": False,
+            "error": f"화면 md 를 찾지 못했습니다. {folder}/scr/SCR-*.md 형식이 필요합니다.",
+            "detail": {
+                "overview": cls_check["overview"].name if cls_check["overview"] else None,
+                "policy": [p.name for p in cls_check["policy"]],
+                "design": [p.name for p in cls_check["design"]],
+                "screens_count": 0,
+            },
+        }), 400
+
+    sess = new_session()
+    sess["project_name"] = project_name
+    sess["focus_area"] = focus_area
+    sess["generation_mode"] = "structured_spec"
+
+    sources_to_save = [{"type": "spec_folder", "content": str(folder)}]
+    save_project(project_name, last_sources=sources_to_save, last_focus_area=focus_area)
+
+    t = threading.Thread(
+        target=run_pipeline_structured,
+        args=(sess, str(folder), project_name),
+        daemon=True,
+    )
+    sess["thread"] = t
+    t.start()
+    return jsonify({
+        "ok": True,
+        "sid": sess["id"],
+        "summary": {
+            "overview": cls_check["overview"].name if cls_check["overview"] else None,
+            "policy_count": len(cls_check["policy"]),
+            "design_count": len(cls_check["design"]),
+            "screens_count": len(cls_check["screens"]),
+        },
+    })
+
+
+@app.route("/preview-spec-folder", methods=["POST"])
+def preview_spec_folder():
+    """폴더 경로만 받아 미리 분류 결과 반환 (시작 전 검증용)."""
+    data = request.get_json(force=True) or {}
+    folder_path = (data.get("folder_path") or "").strip()
+    if not folder_path:
+        return jsonify({"ok": False, "error": "folder_path 가 비어 있습니다."}), 400
+    folder = Path(folder_path).expanduser()
+    if not folder.exists() or not folder.is_dir():
+        return jsonify({"ok": False, "error": f"폴더 없음: {folder}"}), 400
+
+    cls = classify_spec_files(folder)
+    overview_text = cls["overview"].read_text(encoding="utf-8") if cls["overview"] else ""
+    rows = parse_screen_list_table(overview_text) if overview_text else []
+    return jsonify({
+        "ok": True,
+        "folder": str(folder),
+        "overview": cls["overview"].name if cls["overview"] else None,
+        "policy": [p.name for p in cls["policy"]],
+        "design": [p.name for p in cls["design"]],
+        "screens": [p.name for p in cls["screens"]],
+        "screen_rows_count": len(rows),
+        "majors": sorted(set(r["major"] for r in rows if r["major"])),
+    })
+
+
 @app.route("/start", methods=["POST"])
 def start():
     data = request.get_json(force=True) or {}
@@ -6925,6 +7621,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           소스를 추가하세요.<br>
           <span style="font-size:12px">PDF · GitHub URL · 웹페이지 · 마크다운 파일 · 텍스트 등을 자유롭게 조합할 수 있습니다.</span>
         </div>
+
+        <!-- 구조화 spec 폴더 입력 (v0.10.0+) -->
+        <div style="margin-top:14px;padding:12px;border:1px dashed #94A3B8;border-radius:8px;background:#F8FAFC;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+            <div style="font-weight:600;font-size:13px;color:#1E293B;">
+              📁 구조화 spec 폴더 모드 (신규)
+              <span style="font-size:11px;color:#64748B;font-weight:400;margin-left:6px;">overview/policy/design/scr 분리 폴더 1개로 화면별 정밀 TC</span>
+            </div>
+            <button type="button" id="btnSpecFolderToggle" onclick="toggleSpecFolderMode()"
+                    style="padding:4px 10px;font-size:11px;border:1px solid #94A3B8;background:#FFFFFF;border-radius:4px;cursor:pointer;">사용</button>
+          </div>
+          <div id="specFolderBox" style="display:none;">
+            <input type="text" id="specFolderPath" class="form-input" style="font-size:13px;font-family:monospace;"
+                   placeholder="예: /Users/me/projects/specs/v0.47.2-2026-05-07"
+                   oninput="onSpecFolderChanged()"/>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <button type="button" onclick="previewSpecFolder()" style="padding:6px 12px;font-size:12px;background:#3B82F6;color:#FFF;border:none;border-radius:4px;cursor:pointer;">🔍 미리보기</button>
+              <span id="specFolderHint" style="font-size:11px;color:#64748B;align-self:center;">폴더 경로를 입력하고 미리보기로 분류 결과를 확인하세요.</span>
+            </div>
+            <div id="specFolderPreview" style="display:none;margin-top:8px;padding:8px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:4px;font-size:12px;"></div>
+          </div>
+        </div>
       </div>
 
       <div class="form-group">
@@ -8831,7 +9549,15 @@ async function startPipeline() {
   const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
   const focusArea = document.getElementById('focusArea').value.trim();
 
-  if (sources.length === 0) { alert('소스를 하나 이상 추가해주세요.'); return; }
+  // 구조화 spec 폴더 모드 분기
+  const specBox = document.getElementById('specFolderBox');
+  const specPathEl = document.getElementById('specFolderPath');
+  const specFolderActive = specBox && specBox.style.display !== 'none' && specPathEl && specPathEl.value.trim();
+  if (specFolderActive) {
+    return startPipelineSpecFolder(projectName, focusArea, specPathEl.value.trim());
+  }
+
+  if (sources.length === 0) { alert('소스를 하나 이상 추가하거나 구조화 spec 폴더를 사용하세요.'); return; }
 
   const typeNames = { pdf: 'PDF', url: 'GitHub URL', web: '웹 URL', md: '마크다운', text: '텍스트' };
   for (const s of sources) {
@@ -8870,6 +9596,94 @@ async function startPipeline() {
   } catch(e) {
     alert('서버 오류: ' + e.message);
     document.getElementById('startBtn').disabled = false;
+  }
+}
+
+async function startPipelineSpecFolder(projectName, focusArea, folderPath) {
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('card1').classList.add('hidden');
+  document.getElementById('card2').classList.remove('hidden');
+  setStepBar(2);
+  document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setStopButtonsDisabled(false);
+
+  try {
+    const resp = await fetch('/start-spec-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name: projectName, focus_area: focusArea || null, folder_path: folderPath })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      alert('오류: ' + data.error);
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('card1').classList.remove('hidden');
+      document.getElementById('card2').classList.add('hidden');
+      return;
+    }
+    currentSid = data.sid;
+    if (data.summary) {
+      showToast(`📁 폴더 분류: overview ${data.summary.overview ? '✓' : '✗'} · policy ${data.summary.policy_count} · design ${data.summary.design_count} · 화면 ${data.summary.screens_count}개`, 'success');
+    }
+    connectStream(data.sid);
+  } catch(e) {
+    alert('서버 오류: ' + e.message);
+    document.getElementById('startBtn').disabled = false;
+  }
+}
+
+function toggleSpecFolderMode() {
+  const box = document.getElementById('specFolderBox');
+  const btn = document.getElementById('btnSpecFolderToggle');
+  if (!box || !btn) return;
+  const enabled = box.style.display === 'none';
+  box.style.display = enabled ? '' : 'none';
+  btn.textContent = enabled ? '사용 중 ✓' : '사용';
+  btn.style.background = enabled ? '#DBEAFE' : '#FFFFFF';
+  btn.style.borderColor = enabled ? '#3B82F6' : '#94A3B8';
+}
+
+function onSpecFolderChanged() {
+  const prev = document.getElementById('specFolderPreview');
+  if (prev) { prev.style.display = 'none'; prev.innerHTML = ''; }
+  const hint = document.getElementById('specFolderHint');
+  if (hint) hint.textContent = '경로가 변경됐습니다. 미리보기를 다시 실행하세요.';
+}
+
+async function previewSpecFolder() {
+  const path = document.getElementById('specFolderPath').value.trim();
+  if (!path) { alert('폴더 경로를 입력하세요.'); return; }
+  const prev = document.getElementById('specFolderPreview');
+  prev.style.display = '';
+  prev.innerHTML = '⏳ 폴더 스캔 중...';
+  try {
+    const r = await fetch('/preview-spec-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder_path: path })
+    });
+    const d = await r.json();
+    if (!d.ok) { prev.innerHTML = '<span style="color:#DC2626;">❌ ' + d.error + '</span>'; return; }
+    let html = '<div style="line-height:1.7;">';
+    html += `<div><strong>📂 폴더:</strong> <code>${d.folder}</code></div>`;
+    html += `<div><strong>📑 overview:</strong> ${d.overview || '<span style="color:#DC2626;">없음 (분류표 자동 생성 불가)</span>'}</div>`;
+    html += `<div><strong>📋 policy:</strong> ${d.policy.length === 0 ? '<span style="color:#9CA3AF;">없음</span>' : d.policy.join(', ')}</div>`;
+    html += `<div><strong>🎨 design:</strong> ${d.design.length === 0 ? '<span style="color:#9CA3AF;">없음</span>' : d.design.join(', ')}</div>`;
+    html += `<div><strong>🖥️ 화면 md:</strong> ${d.screens.length}개`;
+    if (d.screens.length > 0) html += ` <span style="color:#64748B;">(${d.screens.slice(0, 5).join(', ')}${d.screens.length > 5 ? ', ...' : ''})</span>`;
+    html += '</div>';
+    html += `<div><strong>📊 화면 목록 표 행:</strong> ${d.screen_rows_count}행`;
+    if (d.majors.length > 0) html += ` · 대분류: ${d.majors.join(', ')}`;
+    html += '</div>';
+    if (d.screens.length === 0) {
+      html += '<div style="margin-top:6px;color:#DC2626;">⚠️ scr/SCR-*.md 형식의 화면 파일이 필요합니다.</div>';
+    } else {
+      html += '<div style="margin-top:6px;color:#059669;">✅ 시작 준비 완료. 화면 ' + d.screens.length + '개에 대해 LLM 호출이 발생합니다.</div>';
+    }
+    html += '</div>';
+    prev.innerHTML = html;
+  } catch(e) {
+    prev.innerHTML = '<span style="color:#DC2626;">❌ 서버 오류: ' + e.message + '</span>';
   }
 }
 
