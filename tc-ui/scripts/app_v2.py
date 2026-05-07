@@ -2210,11 +2210,11 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
             "pct": 55 + int(25 * (idx / max(len(target_screens), 1))),
         })
 
-        # max_tokens=32000 — Opus 4.5 출력 한도(64K) 의 절반.
-        # 16000 으로는 화면당 TC 56개 이상 만들면 잘림 빈발 (체크리스트 강제 + 카테고리
-        # 4가지 비율로 갯수 늘어난 결과). 32000 까지 풀어줘서 끝까지 작성 가능.
-        # 비용은 실사용 토큰만큼만 과금되므로 한도 상향 자체로 비용 증가 없음.
-        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=32000)
+        # max_tokens=20000 — Anthropic SDK 의 'Streaming required >10min' 임계 회피.
+        # 32000 까지 올렸더니 SDK 가 streaming 강제 → 21333 (≈ 8K tps × 약 9분) 이하로 유지.
+        # 안전 마진 + 미래 모델 속도 변화 고려해 20000.
+        # 현재 사용량: TC 56개 시 ~14K 토큰 → 20K 한도로도 충분히 여유.
+        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=20000)
 
         # 잘림 감지 + 자동 보충 호출 (기존 step_write_tc 와 동등 처리).
         # 증상 예시: 마지막 TC 가 '| 플랫' 같이 표 중간에서 끊기면 사전조건/스텝/기대결과
