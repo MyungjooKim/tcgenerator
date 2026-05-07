@@ -43,8 +43,9 @@
 
 | Middle Name | ScreenCode | 성격 | 네비 | SCR-ID | 설명 |
 |-------------|------------|------|------|--------|------|
-| Splash | SPL | entry | tab-root | SCR-001 | 앱 시작 화면 (진입점) |
-| Login Options | LGI | entry | sequential | SCR-002 | 로그인 옵션 선택 |
+| Splash | SPL | entry | tab-root | SCR-001 | 앱 시작 화면 (진입점) — v0.32 이전 별칭 |
+| Login Options | LGI | entry | sequential | SCR-002 | 로그인 옵션 선택 — v0.32 이전 별칭 |
+| Login | LGN | entry | sequential | SCR-001 | 첫 진입 화면 (v0.32+ 통합 — 슬로건+로고+로그인 옵션 3개 병렬) |
 | Email Input | EML | form | sequential | SCR-003 | 이메일 입력 |
 | Email 로그인 | EML | form | sequential | SCR-003 | Email Input 별칭 |
 | Verification Code | VCD | form | sequential | SCR-005 | 인증 코드 입력 |
@@ -55,7 +56,13 @@
 | Verifying Code | VFY | entry | one-way | SCR-008 | 검증 로딩 (뒤로가기 차단) |
 | Login Complete | LGC | entry | one-way | SCR-009 | 로그인 완료 (**뒤로가기 차단** — 인증 재실행 방지) |
 | Google Sign-in | GGL | entry | sequential | SCR-010 | Google OAuth 흐름 |
+| Google Sign-in Start | GGL | entry | sequential | SCR-010 | Google OAuth 흐름 — Google Sign-in 별칭 (spec v0.47+ 명칭) |
+| Google Account Select | GAS | form | sequential | SCR-011 | Google 계정 선택 웹뷰 |
+| Google Account List | GAL | form | sequential | SCR-012 | Google 계정 목록 (다수 계정) |
+| Supercycl OAuth Confirm | SOC | form | sequential | SCR-013 | Google OAuth 권한 확인 웹뷰 |
+| Google Sign-in Complete | GSC | entry | one-way | SCR-014 | Google 로그인 완료 (SCR-009 와 동일 패턴 — 인증 재실행 방지) |
 | QR Code Login | QRL | form | sequential | SCR-017 | QR 스캔 로그인 변형 |
+| QR Scan (Login) | QRL | form | sequential | SCR-017 | QR Code Login 별칭 (spec v0.47+ 명칭) |
 | QR Scan Complete | QRS | entry | one-way | SCR-021 | QR 연결 성공 (**뒤로가기 차단**) |
 
 ### Trade (Lite Mode)
@@ -63,6 +70,7 @@
 | Middle Name | ScreenCode | 성격 | 네비 | SCR-ID | 설명 |
 |-------------|------------|------|------|--------|------|
 | Trade Lite | TLT | realtime | tab-root | SCR-102 | 탭바 Trade 진입점 |
+| Trade (Lite) | TLT | realtime | tab-root | SCR-102 | Trade Lite 별칭 (spec v0.47+ 명칭) |
 | Order Confirm | ORC | overlay | overlay | SCR-104 | 주문 확인 시트 |
 | Trade Lite Alert | TLA | realtime | tab-root | SCR-105 | 알림 배너 변형 |
 | Positions | POS | realtime | detail | SCR-106 | 포지션 카드 (Trade Lite 하위) |
@@ -72,6 +80,7 @@
 | Margin Mode Sheet | MMS | overlay | overlay | SCR-114 | Isolated/Cross 선택 |
 | Cancel Order Modal | COM | overlay | overlay | SCR-115 | 주문 취소 확인 모달 |
 | Open Orders | OPO | data-fetch | detail | SCR-116 | 미체결 주문 리스트 |
+| Open Orders List | OPO | data-fetch | detail | SCR-116 | Open Orders 별칭 (spec v0.47+ 명칭) |
 
 ### Markets / Portfolio
 
@@ -80,6 +89,7 @@
 | Markets | MKT | realtime | tab-root | SCR-401 | 탭바 Markets 진입점 |
 | Portfolio | PRT | realtime | tab-root | SCR-402 | 탭바 Portfolio 진입점 |
 | PnL Analysis | PNL | data-fetch | detail | SCR-410 | Portfolio 하위 상세 |
+| History | HIS | data-fetch | detail | SCR-411 | 거래 이력 허브 (Orders/Positions/Trades 3 탭, 최신 30일) |
 | Profile | PRF | data-fetch | tab-root | SCR-403 | 탭바 Profile 진입점 |
 | Notifications | NTF | data-fetch | detail | SCR-221 | Profile 하위 상세 |
 
@@ -90,10 +100,13 @@
 | OAuth Connect | OAC | entry | sequential | SCR-801 | OAuth 연동 안내 |
 | Connection Result | ECR | entry | one-way | SCR-802 | 연결 결과 (**재연동 방지**) |
 | Connecting | ECG | entry | one-way | SCR-803 | 연결 진행 중 (뒤로가기 차단) |
+| Connecting... | ECG | entry | one-way | SCR-803 | Connecting 별칭 (spec 의 ... 포함 명칭) |
 | Connect Exchange Onboarding | ECO | entry | sequential | SCR-807 | 온보딩 중 최초 연결 |
+| Connect Exchange (Onboarding) | ECO | entry | sequential | SCR-807 | Connect Exchange Onboarding 별칭 (spec v0.47+ 괄호 표기) |
 | OKX OAuth Webview | OKX | entry | sequential | SCR-808 | OKX 인증 웹뷰 |
 | API Key Input | API | form | sequential | SCR-809 | API Key 직접 입력 |
 | Edit API Keys | APE | form | detail | SCR-810 | API Key 수정 (Exchange Detail 하위) |
+| Fast API Key Conflict | FKC | static | one-way | SCR-811 | OKX fast API key 1개 제한 안내 (해결 가이드 + 재시도 CTA) |
 | Connect Exchange | CXM | data-fetch | detail | SCR-205 | 거래소 연결 관리 |
 | Disconnect Confirm | EDC | overlay | overlay | SCR-804 | 연결 해제 확인 |
 | Reconnect | ERC | entry | sequential | SCR-805 | 재연결 |
