@@ -2185,6 +2185,26 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         # 응답 잘림으로 누락돼 화면당 TC 갯수가 절반 수준이던 문제 해결.
         tc_draft = call_claude_cached(sys_blocks, user, max_tokens=16000)
 
+        # 잘림 감지 + 자동 보충 호출 (기존 step_write_tc 와 동등 처리).
+        # 증상 예시: 마지막 TC 가 '| 플랫' 같이 표 중간에서 끊기면 사전조건/스텝/기대결과
+        # 컬럼이 빈 채로 Excel 에 들어감. 마지막 ### 이후 본문에 필수 섹션 없으면 보충.
+        last_tc_match = list(re.finditer(r"^###\s", tc_draft, re.MULTILINE))
+        if last_tc_match:
+            last_tc_block = tc_draft[last_tc_match[-1].start():]
+            if "**테스트 단계**" not in last_tc_block or "**예상 결과**" not in last_tc_block:
+                push_log(sess, f"[화면별 TC 작성] {sc['id']} 마지막 TC 불완전 — 이어서 생성 중...")
+                try:
+                    continuation = call_claude_cached(
+                        sys_blocks,
+                        f"이전 응답이 max_tokens 한도로 잘렸습니다. 아래 미완성 TC 를 그대로 이어서 완성하세요. "
+                        f"새 TC 추가 금지, 표/사전조건/테스트 단계/예상 결과/비고 누락 없이.\n\n---\n{last_tc_block}",
+                        max_tokens=4096,
+                    )
+                    tc_draft = tc_draft[:last_tc_match[-1].start()] + continuation
+                    push_log(sess, f"[화면별 TC 작성] {sc['id']} 보충 완료")
+                except Exception as e:
+                    push_log(sess, f"[화면별 TC 작성] {sc['id']} 보충 실패: {e} — 잘린 채 진행")
+
         # C-2: 응답 말미의 '체크리스트 처리 결과' 섹션 분리 (TC 본문 영향 차단)
         tc_clean, checklist_report = _split_checklist_report(tc_draft)
         if checklist_report:

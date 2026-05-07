@@ -246,6 +246,13 @@ def parse_tc_markdown(filepath):
         tc["then"]  = extract_section(block, "예상 결과")
         tc["note"]  = extract_section(block, "비고")
 
+        # 안전망: 본문이 모두 비었다면 응답 잘림 가능성 → 시각적 경고 마커 삽입
+        # (Excel 셀이 단순 빈 칸이면 검토자가 놓치기 쉬움. 명시적 마커로 인지)
+        if not tc["given"] and not tc["when"] and not tc["then"]:
+            tc["given"] = "⚠ (원본 응답 누락 — 재생성 필요)"
+            tc["when"]  = "⚠ (원본 응답 누락 — 재생성 필요)"
+            tc["then"]  = "⚠ (원본 응답 누락 — 재생성 필요)"
+
         tc["exchange_na"] = parse_exchange_na(tc["note"])
 
         tcs.append(tc)
