@@ -4990,12 +4990,21 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
         # total_tc 는 step_write_tc_per_screen 에서 받은 값이 정확. min_tc 는 표준 35% 공식.
         min_tc = max(1, round(total_tc * 0.35))
         result_file = step_build_excel(sess, merged_tc, project_name, total_tc, min_tc)
-        sess["result"] = str(result_file)
+        excel_path = Path(result_file)
+        sess["result"] = str(excel_path)
 
         sess["status"] = "done"
         push_stage(sess, 7, "완료", 100)
-        push(sess, "done", {"result": str(result_file), "tc_count": total_tc})
-        push_log(sess, f"[완료] 화면 {len(spec_data['screens'])}개 → TC {total_tc}개 → {result_file}")
+        # 기존 파이프라인과 동일한 페이로드 — 프론트가 filename/size/total_tc/min_tc/smoke_tc 를 사용
+        push(sess, "done", {
+            "filename":  excel_path.name,
+            "size":      excel_path.stat().st_size if excel_path.exists() else 0,
+            "sid":       sess["id"],
+            "total_tc":  total_tc,
+            "min_tc":    min_tc,
+            "smoke_tc":  sess.get("smoke_tc"),
+        })
+        push_log(sess, f"[완료] 화면 {len(spec_data['screens'])}개 → TC {total_tc}개 → {excel_path.name}")
 
         # 체크포인트 정리
         clear_pipeline_state(project_name)
