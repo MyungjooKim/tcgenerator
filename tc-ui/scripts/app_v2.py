@@ -4986,7 +4986,9 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
         # ── 6) Excel 빌드 ──
         sess["status"] = "building_excel"
         push_stage(sess, 6, "Excel 빌드", 92)
-        result_file = step_build_excel(sess, reviewed, project_name)
+        # total_tc 는 step_write_tc_per_screen 에서 받은 값이 정확. min_tc 는 표준 35% 공식.
+        min_tc = max(1, round(total_tc * 0.35))
+        result_file = step_build_excel(sess, reviewed, project_name, total_tc, min_tc)
         sess["result"] = str(result_file)
 
         sess["status"] = "done"
