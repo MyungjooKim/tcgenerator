@@ -10544,13 +10544,17 @@ async function loadRecentFolders(targetInputId, panelId) {
       panel.dataset.loaded = '1';
       return;
     }
-    panel.innerHTML = d.folders.map(f =>
-      '<div onclick="pickRecentFolder(\'' + targetInputId + '\',\'' + panelId + '\',\'' +
-      f.replace(/'/g, "\\'") + '\')" ' +
-      'style="padding:8px 12px;border-bottom:1px solid #F1F5F9;cursor:pointer;font-family:monospace;color:#1E293B;" ' +
-      'onmouseover="this.style.background=\'#F1F5F9\'" onmouseout="this.style.background=\'\'">' +
-      f + '</div>'
-    ).join('');
+    // 안전한 렌더 — DOM API 사용해 onclick handler 직접 부여 (escape 함정 회피)
+    panel.innerHTML = '';
+    d.folders.forEach(function(f) {
+      var div = document.createElement('div');
+      div.style.cssText = 'padding:8px 12px;border-bottom:1px solid #F1F5F9;cursor:pointer;font-family:monospace;color:#1E293B;';
+      div.textContent = f;
+      div.onclick = function() { pickRecentFolder(targetInputId, panelId, f); };
+      div.onmouseover = function() { this.style.background = '#F1F5F9'; };
+      div.onmouseout = function() { this.style.background = ''; };
+      panel.appendChild(div);
+    });
     panel.dataset.loaded = '1';
   } catch (e) {
     panel.innerHTML = '<div style="padding:10px;color:#DC2626;">오류: ' + e.message + '</div>';
