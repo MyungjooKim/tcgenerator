@@ -661,12 +661,14 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
     row_idx = 0
     all_row_data = []  # 너비 계산용
 
-    # 그룹 키가 2개 이상일 때만 그룹 헤더 표시
+    # 그룹 헤더(회색 구분 행) 표시 여부.
+    # v0.10.x: TC 가 2개 이상이면 항상 표시 — 화면별/그룹별 시각 구분이 가독성 핵심.
+    # 이전: 그룹 1개면 미표시 → 화면 1개만 처리하는 케이스에서 구분선 사라지던 문제 해결.
     if group_by == "middle":
         unique_groups = set((tc["domain"], tc.get("middle", "")) for tc in tcs)
     else:
         unique_groups = set(tc["domain"] for tc in tcs)
-    show_group_headers = len(unique_groups) > 1
+    show_group_headers = len(tcs) >= 2
 
     for tc in tcs:
         domain = tc["domain"]
@@ -678,18 +680,20 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
         else:
             group_key = domain
 
-        # 그룹 변경 시 헤더 행 삽입
+        # 그룹 변경 시 헤더 행 삽입 — 연한 회색 통일 (v0.10.x)
         if show_group_headers and group_key != prev_group_key:
             prev_group_key = group_key
-            color  = DOMAIN_COLORS.get(domain, "636363")
+            # 연한 회색 배경 + 진한 텍스트 — 가독성 + 시각적 조용함
+            HEADER_BG = "F1F5F9"   # slate-100
+            HEADER_FG = "1F2937"   # slate-800
             if group_by == "middle":
-                # 중분류별 헤더: "📱 Email Input  ·  SM-EML"
+                # 중분류별 헤더: "Email Input  ·  SM-EML"
                 screen_code = ""
                 m_id = re.match(r"^([A-Z]{2})-([A-Z]{2,8})-", tc["id"])
                 if m_id:
                     screen_code = f"{m_id.group(1)}-{m_id.group(2)}"
                 label = middle or tc.get("major") or domain
-                text = f"📱  {label}  ·  {screen_code}" if screen_code else f"📱  {label}"
+                text = f"{label}  ·  {screen_code}" if screen_code else f"{label}"
             else:
                 # label 결정 우선순위:
                 #   1. DOMAIN_LABELS에 등록된 한글 설명 (AUTH→"인증·온보딩·자금 지급" 등)
@@ -706,10 +710,10 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                 text = f"{domain}  ·  {label}" if domain != label else domain
             for i in range(1, len(col_names) + 1):
                 set_cell(ws, r, i, text if i == 1 else "",
-                         bold=True, bg=color, font_color=C_WHITE,
+                         bold=True, bg=HEADER_BG, font_color=HEADER_FG,
                          size=10, align_h="left")
             ws.merge_cells(f"A{r}:{get_column_letter(len(col_names))}{r}")
-            ws.row_dimensions[r].height = 20
+            ws.row_dimensions[r].height = 22
             r += 1
             row_idx = 0
 
