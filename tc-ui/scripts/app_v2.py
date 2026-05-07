@@ -888,16 +888,142 @@ def parse_screen_md(md_path: Path) -> dict:
     }
 
 
+def _split_checklist_report(tc_md: str) -> tuple[str, str]:
+    """AI 응답의 말미에서 '### 체크리스트 처리 결과' 섹션을 분리.
+    반환: (TC 본문, 체크리스트 보고 텍스트)
+    못 찾으면 (원본, "") 반환.
+    """
+    # ### 체크리스트 처리 결과 헤더 찾기 (대소문자/이모지 변형 허용)
+    m = re.search(r"\n#{1,4}\s*(?:체크리스트\s*처리\s*결과|체크리스트\s*검증|Checklist\s*(?:Verification|Result))\s*\n",
+                  tc_md, re.IGNORECASE)
+    if not m:
+        return tc_md, ""
+    body = tc_md[:m.start()].rstrip()
+    report = tc_md[m.start():].strip()
+    return body, report
+
+
+def _extract_screen_classification_section(classification: str, screen_id: str, screen_name: str) -> str:
+    """전체 분류표 마크다운에서 해당 SCR 의 중분류 섹션만 추출 (A-1 분류표 동적 축소).
+
+    build_classification_from_screen_list() 결과는 다음 구조:
+      ## 대분류: Trade
+      ### 중분류: Order Confirm     ← 화면명 = screen_name
+      #### 소분류
+      - ...
+
+    찾기 우선순위: screen_name 일치 → screen_id 일치.
+    못 찾으면 빈 문자열 반환 (호출부에서 폴백 처리).
+    """
+    lines = classification.splitlines()
+    out: list[str] = []
+    in_target = False
+    current_major = ""
+    for line in lines:
+        if line.startswith("## 대분류:"):
+            current_major = line
+            in_target = False
+            continue
+        if line.startswith("### 중분류:"):
+            label = line[len("### 중분류:"):].strip()
+            # 화면명 또는 ID 매칭
+            if screen_name and label == screen_name.strip():
+                in_target = True
+                if current_major:
+                    out.append(current_major)
+                out.append(line)
+                continue
+            if screen_id and screen_id in label:
+                in_target = True
+                if current_major:
+                    out.append(current_major)
+                out.append(line)
+                continue
+            in_target = False
+            continue
+        if line.startswith("## ") or line.startswith("### "):
+            in_target = False
+            continue
+        if in_target:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def _build_checklist_from_screen_meta(screen_meta: dict) -> str:
+    """C-2 체크리스트 강제 — 화면 본문의 모든 상태/인터랙션/비고 마커에 ID 부여.
+    AI 가 응답 끝에 각 항목별 [✓ 처리 / ✗ 누락 + 사유] 보고하도록 함.
+    """
+    items: list[str] = []
+    counter_s = 0
+    counter_i = 0
+    counter_r = 0
+
+    # 상태 케이스 — S1, S2, ...
+    for st in screen_meta.get("states", []):
+        counter_s += 1
+        case = st.get("case", "").strip() or f"상태{counter_s}"
+        items.append(f"S{counter_s}. {case} 상태")
+
+    # 인터랙션 — I1, I2, ... — raw 에서 [dev] 인터랙션 bullet 발췌 (extract_minors 와 같은 패턴)
+    in_inter = False
+    for line in screen_meta.get("raw", "").splitlines():
+        if not in_inter:
+            if re.search(r"\[dev\]\s*인터랙션|\*\*인터랙션\*\*", line, re.IGNORECASE):
+                in_inter = True
+            continue
+        if line.startswith("**") or line.startswith("##") or line.startswith("---"):
+            in_inter = False
+            continue
+        m = re.match(r"^[\-\*]\s+(.+)", line)
+        if m:
+            body = m.group(1).split("→")[0]
+            body = re.sub(r"`[^`]+`", "", body)
+            body = re.sub(r"<[^>]+>", "", body)
+            body = re.sub(r"\s+", " ", body).strip(" .·:")
+            if body and len(body) >= 3:
+                counter_i += 1
+                items.append(f"I{counter_i}. {body[:50]}")
+                if counter_i >= 10:  # 너무 많으면 자름
+                    break
+
+    # 비고 마커 — R1, R2, ...
+    for m in re.finditer(r"\[(정책|제약|접근성|세션|타이밍|보안|성능)\]\s*([^\n]{5,80})",
+                         screen_meta.get("raw", "")):
+        marker, body = m.group(1), m.group(2)
+        body = re.split(r"[.。]", body)[0].strip(" ·-")
+        if body:
+            counter_r += 1
+            items.append(f"R{counter_r}. [{marker}] {body[:45]}")
+            if counter_r >= 6:
+                break
+
+    if not items:
+        return ""
+    return "\n".join(items)
+
+
 def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code: str,
                               suite_code: str, starting_seq: int,
                               policy_excerpts: list[str] = None,
-                              design_excerpts: list[str] = None) -> str:
-    """화면별 1:1 호출용 user prompt. 정책/디자인은 시스템 프롬프트(캐시)에 들어가고,
-    여기엔 해당 화면 전문 + 자동 추출한 cross-ref 인용만 포함.
+                              design_excerpts: list[str] = None,
+                              screen_classification_section: str = "") -> str:
+    """화면별 1:1 호출용 user prompt.
+
+    v0.10.x 변경:
+    - A-1: 전체 분류표 대신 해당 SCR 의 중분류 섹션만 주입 (다른 화면 정보 격리)
+    - C-2: 화면 본문에서 추출한 체크리스트 + 응답 말미 자체 검증 강제
     """
     seq_str = f"{starting_seq:03d}"
     next_str = f"{starting_seq+1:03d}"
     example_id = f"{project_code}-{suite_code}-{seq_str}"
+
+    # A-1: 분류표 — 해당 화면 섹션만
+    classification_block = ""
+    if screen_classification_section:
+        classification_block = (
+            f"## 분류표 (이 화면만 — 사용자 승인된 최종 진실 소스)\n"
+            f"{screen_classification_section}\n"
+        )
 
     states_block = ""
     if screen_meta["states"]:
@@ -919,6 +1045,29 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
                 parts.append(x)
         refs_block = "\n".join(parts) + "\n"
 
+    # C-2: 체크리스트
+    checklist = _build_checklist_from_screen_meta(screen_meta)
+    checklist_block = ""
+    if checklist:
+        checklist_block = (
+            "\n## 체크리스트 — 반드시 모두 처리 (누락 시 응답 끝에 사유 명시)\n\n"
+            "다음 항목 각각에 대해 최소 1개의 TC 를 작성하세요. 항목은 화면 명세에서 자동 추출됨.\n\n"
+            f"{checklist}\n"
+        )
+
+    selfcheck = (
+        "\n## 응답 말미 자체 검증 (필수)\n\n"
+        "TC 작성 완료 후, 응답 마지막에 아래 형식으로 체크리스트 처리 결과를 반드시 명시하세요:\n\n"
+        "```\n"
+        "### 체크리스트 처리 결과\n"
+        "- S1: ✓ TC SC-LIT-001, SC-LIT-005\n"
+        "- S2: ✓ TC SC-LIT-002\n"
+        "- I1: ✗ 누락 / 사유: 화면 명세에 충분한 정보 없음\n"
+        "- ...\n"
+        "```\n"
+        "이 자체 검증 표는 후처리에서 분리되며 TC 본문에 영향 없습니다. 누락이 발견되면 솔직히 명시하세요.\n"
+    )
+
     return f"""프로젝트: {project_name}
 화면: {screen_meta['id']} — {screen_meta['title']}
 그룹: {screen_meta['group']}
@@ -927,12 +1076,16 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
 ⚠️ 시스템 프롬프트의 'TC 생성 카테고리 4가지(UI/주요/예외/에러)'와 비율(20/35/25/20)을 반드시 따르세요.
    카테고리 3(예외)·4(에러)는 반드시 포함합니다 (Positive 만으로 구성 금지).
 
+{classification_block}
 ## 화면 명세 (전문 — 이 문서의 내용에서만 TC 작성)
 
 {screen_meta['raw']}
 
 {states_block}
 {refs_block}
+{checklist_block}
+{selfcheck}
+
 위 화면의 모든 상태 케이스·인터랙션·비고 마커를 빠짐없이 TC 로 변환하세요.
 - Normal 상태 → 카테고리 1 (UI/UX) + 카테고리 2 (주요 기능) Positive TC
 - Error.* 상태 → 카테고리 3 (예외) Negative + 카테고리 4 (에러) Edge TC
@@ -1878,21 +2031,29 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     fewshot = load_fewshot_examples()
     project_policies = load_project_policies(project_name)
 
-    # 1) 시스템 프롬프트 블록 구성 — cache_control 적용
-    # ⚠️ Anthropic 제약: cache_control 블록은 최대 4개. 큰 블록 위주로 캐시 마커 부여.
-    # ⚠️ 기존 정상 파이프라인과 동일한 가이드(TC 4가지 카테고리, ID/형식 규칙 등)를 사용하기 위해
-    #    build_tc_system_prompt() 를 그대로 호출 → 기능 동등성 보장 (TC 갯수 동일 수준 유지).
+    # 1) 시스템 프롬프트 블록 구성 — cache_control 적용 + 화면 격리 강화 (v0.10.x)
+    #
+    # 변경: 분류표는 시스템 블록에서 제거하고 user prompt 에서 화면별 축소 버전으로 주입.
+    #       이유: SCR 단독 호출 vs 일괄 호출의 결과 갯수 편차 줄이기 (다른 화면 정보가
+    #       AI 의 분배·중복 회피 동기를 만들어 갯수가 줄어드는 현상).
+    #
+    # ⚠️ Anthropic 제약: cache_control 블록은 최대 4개.
+    #    캐시 #1: tc_rules + 카테고리 가이드 + 형식 규칙 (build_tc_system_prompt 의 분류표 제외 부분)
+    #    캐시 #2: spec policy_text (전문)
+    #    캐시 #3: spec design_text (전문)
+    #    캐시 #4: 화면별 호출 모드 안내 (B-1 단독 호출 명시)
     sys_blocks = []
+    # 분류표 자리에 placeholder 만 남기고 build_tc_system_prompt() 호출 → 화면별 축소 버전은 user 로 이동.
     base_system_prompt = build_tc_system_prompt(
         tc_rules=tc_rules,
-        classification=approved_classification,
+        classification="(분류표는 user 메시지에 화면별 축소 버전으로 제공됩니다 — 그 화면만 처리하세요)",
         project_policies=project_policies,
         fewshot=fewshot,
     )
     sys_blocks.append({
         "type": "text",
         "text": base_system_prompt,
-        "cache_control": {"type": "ephemeral"},  # 캐시 #1 — 카테고리 가이드 + 분류표 + tc_rules + 프로젝트 정책 + fewshot
+        "cache_control": {"type": "ephemeral"},  # 캐시 #1
     })
     if spec_data.get("policy_text"):
         sys_blocks.append({
@@ -1906,13 +2067,22 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
             "text": f"\n## 디자인 시스템 문서 (구조화 spec 의 design md 전문 — 토큰/컴포넌트 참조)\n{spec_data['design_text'][:20000]}\n",
             "cache_control": {"type": "ephemeral"},  # 캐시 #3
         })
+    # B-1 단독 호출 명시 + 격리 강화 — AI 자기검열 차단
     sys_blocks.append({
         "type": "text",
-        "text": "\n## 화면별 호출 모드 안내\n"
-                "이 호출은 분류표의 **하나의 화면**에 대해서만 TC 를 작성합니다. "
-                "user 메시지에 주어진 SCR 화면 명세에 한정해, 위 'TC 생성 카테고리 4가지'와 비율(20/35/25/20)을 반드시 따르세요. "
-                "카테고리 3(예외)·4(에러)도 반드시 포함합니다.\n",
-        "cache_control": {"type": "ephemeral"},  # 캐시 #4 — 마지막 마커
+        "text": (
+            "\n## 화면별 단독 호출 모드 안내 (반드시 준수)\n\n"
+            "**핵심 원칙**: 이 호출은 **하나의 화면(SCR)에 대한 단독 작업** 입니다. "
+            "프로젝트에 다른 화면이 존재하더라도 이 호출에서는 **존재하지 않는 것처럼** 처리하세요. "
+            "당신은 이 화면 전담 QA 엔지니어이고, 다른 화면은 다른 사람이 담당합니다.\n\n"
+            "**금지 행동**:\n"
+            "- 다른 화면에 만들 TC 와의 중복 회피를 의식하지 마세요 (중복은 후처리에서 자동 제거됨)\n"
+            "- TC 갯수를 다른 화면들과 분배해서 줄이지 마세요\n"
+            "- 'A 도 B 도 비슷하니 하나로 묶자' 같은 통합 시도 금지\n\n"
+            "**지향**: user 메시지의 화면 명세에 등장하는 **모든** 상태/인터랙션/비고 마커를 "
+            "각각 독립적인 TC 로 변환하세요. 카테고리 4가지(20/35/25/20%)와 카테고리 3·4 의무 포함은 그대로 유지.\n"
+        ),
+        "cache_control": {"type": "ephemeral"},  # 캐시 #4
     })
 
     # 2) 처리 대상 화면 필터링 (selected_domain_codes)
@@ -1988,6 +2158,13 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         # cross-ref 인용 추출
         policy_excerpts = extract_policy_excerpts(spec_data.get("policy_text", ""), sc["ref_keywords"])
 
+        # A-1: 분류표 — 해당 화면 섹션만 추출. 못 찾으면 폴백으로 짧은 헤더만.
+        screen_section = _extract_screen_classification_section(
+            approved_classification, sc["id"], sc.get("title", "")
+        )
+        if not screen_section:
+            screen_section = f"## 대분류: {major}\n### 중분류: {sc.get('title', sc['id'])}\n"
+
         user = build_screen_user_prompt(
             screen_meta=sc,
             project_name=project_name,
@@ -1996,6 +2173,7 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
             starting_seq=starting,
             policy_excerpts=policy_excerpts,
             design_excerpts=None,  # 디자인은 system 캐시에 들어가 있어서 별도 발췌 불필요
+            screen_classification_section=screen_section,
         )
 
         push(sess, "stage", {
@@ -2007,17 +2185,30 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         # 응답 잘림으로 누락돼 화면당 TC 갯수가 절반 수준이던 문제 해결.
         tc_draft = call_claude_cached(sys_blocks, user, max_tokens=16000)
 
+        # C-2: 응답 말미의 '체크리스트 처리 결과' 섹션 분리 (TC 본문 영향 차단)
+        tc_clean, checklist_report = _split_checklist_report(tc_draft)
+        if checklist_report:
+            (per_screen_dir / f"{sc['id']}_checklist.md").write_text(checklist_report, encoding="utf-8")
+
         # 화면별 즉시 저장 — resume 시 여기서 다시 시작
-        (per_screen_dir / f"{sc['id']}.md").write_text(tc_draft, encoding="utf-8")
+        (per_screen_dir / f"{sc['id']}.md").write_text(tc_clean, encoding="utf-8")
 
         # TC 개수 카운트 → 다음 화면의 starting seq 계산
-        scr_tc_count = count_unique_tc_ids(tc_draft)
+        scr_tc_count = count_unique_tc_ids(tc_clean)
         seq_per_suite[suite_code] = starting + scr_tc_count
         total_tc += scr_tc_count
 
         # 화면 헤더 + 본문
-        tc_parts.append(f"<!-- {sc['id']} — {sc['title']} -->\n\n{tc_draft.strip()}")
-        push_log(sess, f"[화면별 TC 작성] [{idx}/{len(target_screens)}] {sc['id']} 완료 — TC {scr_tc_count}개 (누적 {total_tc})")
+        tc_parts.append(f"<!-- {sc['id']} — {sc['title']} -->\n\n{tc_clean.strip()}")
+        # 체크리스트 처리 보고 요약 — 누락 항목 카운트
+        if checklist_report:
+            n_done = checklist_report.count("✓")
+            n_miss = checklist_report.count("✗")
+            push_log(sess,
+                f"[화면별 TC 작성] [{idx}/{len(target_screens)}] {sc['id']} 완료 — TC {scr_tc_count}개 "
+                f"(체크리스트 {n_done}✓ / {n_miss}✗, 누적 {total_tc})")
+        else:
+            push_log(sess, f"[화면별 TC 작성] [{idx}/{len(target_screens)}] {sc['id']} 완료 — TC {scr_tc_count}개 (누적 {total_tc})")
 
     merged = "\n\n---\n\n".join(tc_parts)
     draft_path = sess["workspace"] / "tc_draft_per_screen.md"
