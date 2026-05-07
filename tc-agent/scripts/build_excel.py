@@ -733,6 +733,12 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
         # 중분류/소분류
         middle_display = tc.get("middle") or DOMAIN_LABELS.get(tc["domain"], tc["domain"])
         minor_display  = tc.get("minor") or ""
+        # 소분류 정규화: 'A — B' / 'A - B' / 'A – B' 형태로 두 문장 이상 연결된 경우
+        # 가독성을 위해 줄바꿈으로 분리. 한 문장이면 그대로 유지.
+        # 단, 단순 하이픈 단어(예: 'TP/SL', 'iOS Safari')는 양쪽 공백이 있는 dash 만 분리.
+        if minor_display:
+            # 양쪽 공백 있는 em/en/double dash 또는 일반 hyphen 패턴만 줄바꿈
+            minor_display = re.sub(r"\s+[—–\-]{1,2}\s+", "\n", minor_display)
 
         # 거래소 정보 추출
         exchange_text = ""
