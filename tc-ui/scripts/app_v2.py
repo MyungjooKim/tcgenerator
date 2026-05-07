@@ -820,6 +820,20 @@ def extract_policy_excerpts(policy_full_text: str, ref_keywords: list[str]) -> l
     return excerpts
 
 
+def parse_scr_filter_from_focus(focus_area: str) -> set[str] | None:
+    """focus_area 텍스트에서 SCR ID 패턴을 추출해 필터로 사용.
+    - "SCR-104", "scr-104", "scr_104", "SCR104" 모두 정규화 → "SCR-104"
+    - "SCR-102, SCR-104" 같이 여러 개 OK
+    - 하나도 못 찾으면 None (필터 미적용 = 전체 처리)
+    """
+    if not focus_area or not focus_area.strip():
+        return None
+    matches = re.findall(r"SCR[-_]?(\w+)", focus_area, re.IGNORECASE)
+    if not matches:
+        return None
+    return {f"SCR-{m.upper()}" for m in matches}
+
+
 def step_parse_structured_spec(sess: dict, folder_path: str) -> dict:
     """구조화 spec 폴더 1개를 받아 overview/policy/design/screens 로 분리하고 메타 추출.
     반환: {
@@ -4876,6 +4890,22 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
                     "desc": sc["description"], "entry": "",
                 })
 
+        # ── focus_area 에서 SCR ID 필터 추출 → 화면 한정 처리 ──
+        scr_filter = parse_scr_filter_from_focus(focus_area)
+        if scr_filter:
+            before_screens = len(spec_data["screens"])
+            before_rows = len(spec_data["screen_rows"])
+            spec_data["screens"] = [sc for sc in spec_data["screens"] if sc["id"] in scr_filter]
+            spec_data["screen_rows"] = [r for r in spec_data["screen_rows"] if r["id"] in scr_filter]
+            if not spec_data["screens"]:
+                raise RuntimeError(
+                    f"focus_area 에서 추출한 SCR ID({sorted(scr_filter)}) 가 폴더에서 매칭되지 않습니다. "
+                    f"폴더에 있는 화면 md를 확인하세요."
+                )
+            push_log(sess,
+                f"[focus] SCR 필터 적용 — {sorted(scr_filter)} → "
+                f"화면 {before_screens}→{len(spec_data['screens'])}개, 행 {before_rows}→{len(spec_data['screen_rows'])}개")
+
         # raw_text 호환용 (resume/체크포인트용 — 전체 텍스트)
         raw_text = "\n\n".join([
             spec_data["overview_text"],
@@ -4888,7 +4918,7 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
         # ── 2) 분류표 자동 생성 (LLM 호출 없음) ──
         sess["status"] = "classifying"
         push_stage(sess, 2, "분류표 자동 생성 (LLM 호출 없음)", 25)
-        # 분류표는 항상 전체 화면 기준으로 생성 (일관성 유지) — diff 라도 분류는 전체
+        # 필터링된 화면 기준으로 분류표 생성 (focus_area 가 있으면 그 화면들만)
         all_rows = spec_data["screen_rows"]
         classification = build_classification_from_screen_list(all_rows, project_name)
         classify_path = sess["workspace"] / "04_classification_draft.md"
@@ -7986,7 +8016,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <textarea id="focusArea" class="form-input" rows="5"
           style="resize:vertical; min-height:110px; font-size:13px; line-height:1.5;"
           oninput="onInputsChanged()"
-          placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리"></textarea>
+          placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리&#10;💡 구조화 spec 모드: SCR-104 또는 SCR-102, SCR-104 처럼 ID를 적으면 해당 화면만 처리"></textarea>
         <div style="font-size:11px; color:var(--muted); margin-top:3px;">
           입력하면 해당 기능에 집중하여 TC를 생성합니다. 여러 기능은 쉼표 또는 줄바꿈으로 구분하세요.
         </div>
