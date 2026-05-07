@@ -499,18 +499,46 @@ def _priority_to_kr(priority):
                "높음": "높음", "보통": "보통", "낮음": "낮음"}
     return mapping.get(priority, priority or "보통")
 
+# ── 컬럼 너비 정책 (v0.10.x — 하이브리드: 고정 + 자동) ─────────────────
+# 짧은 라벨/패턴 고정 컬럼은 모든 시트에서 동일한 너비 → 시트 간 일관성 확보.
+# 본문 멀티라인 컬럼은 콘텐츠 75 퍼센타일 + min/max 클램프 → 가독성 확보.
+FIXED_COL_WIDTHS = {
+    "상태":         12,
+    "TC ID":        16,
+    "대분류":        14,
+    "중분류":        14,
+    "중요도":        10,
+    "대상 거래소":   14,
+    "Smoke":         8,
+    "화면 코드":     13,
+}
+# 자동 계산 컬럼 — (min, max) 범위. 값이 길면 max 까지, 짧아도 min 보장.
+AUTO_COL_RANGES = {
+    "소분류":        (18, 36),
+    "사전조건":      (28, 50),
+    "테스트 스텝":   (36, 60),
+    "기대결과":      (32, 55),
+    "수정 사유":     (24, 45),
+}
+DEFAULT_AUTO_RANGE = (12, 50)  # 정의되지 않은 컬럼 폴백
+
+
 def _calc_col_widths(col_names, all_row_data, min_widths=None, max_width=60):
-    """각 컬럼의 75 퍼센타일 기반 최적 너비 계산.
-    멀티라인 셀은 모든 줄 중 가장 긴 줄 기준."""
+    """하이브리드 너비 계산.
+      - FIXED_COL_WIDTHS 에 있으면 고정 너비
+      - AUTO_COL_RANGES 에 있으면 75 퍼센타일 + min/max 클램프
+      - 그 외는 DEFAULT_AUTO_RANGE 적용
+    min_widths/max_width 인자는 호환을 위해 유지 (오버라이드 가능).
+    """
     col_lengths = [[] for _ in col_names]
 
-    # 헤더 길이
+    # 헤더 길이 (한글 2배 너비)
     header_widths = []
     for i, name in enumerate(col_names):
         hw = sum(2 if ord(c) > 127 else 1 for c in name) + 2
         header_widths.append(hw)
 
-    # 각 셀의 가장 긴 줄 길이 수집
+    # 각 셀의 가장 긴 줄 길이 수집 (자동 컬럼만)
     for row_data in all_row_data:
         for i, val in enumerate(row_data):
             if not val:
@@ -523,19 +551,32 @@ def _calc_col_widths(col_names, all_row_data, min_widths=None, max_width=60):
             ) if lines else 0
             col_lengths[i].append(max_line_w)
 
-    # 75 퍼센타일 계산
     widths = []
-    for i, lengths in enumerate(col_lengths):
-        min_w = (min_widths or {}).get(col_names[i], 8)
+    for i, name in enumerate(col_names):
+        # 1) 고정 너비 컬럼
+        if name in FIXED_COL_WIDTHS:
+            widths.append(FIXED_COL_WIDTHS[name])
+            continue
+        # 2) 자동 컬럼 — 75 퍼센타일 + min/max 클램프
+        rng_min, rng_max = AUTO_COL_RANGES.get(name, DEFAULT_AUTO_RANGE)
+        # min_widths 인자 호환: 더 큰 값 채택
+        explicit_min = (min_widths or {}).get(name, 0)
+        rng_min = max(rng_min, explicit_min)
+
+        lengths = col_lengths[i]
         if not lengths:
-            widths.append(max(header_widths[i], min_w))
+            widths.append(max(header_widths[i], rng_min))
             continue
         sorted_l = sorted(lengths)
         p75_idx = int(len(sorted_l) * 0.75)
         p75 = sorted_l[min(p75_idx, len(sorted_l) - 1)]
-        widths.append(max(p75, header_widths[i], min_w))
+        # 헤더가 더 길면 헤더 보장
+        chosen = max(p75, header_widths[i])
+        # min/max 클램프
+        chosen = max(rng_min, min(chosen, rng_max))
+        widths.append(chosen)
 
-    return [min(w, max_width) for w in widths]
+    return widths
 
 
 def _mark_smoke(tcs):
