@@ -684,7 +684,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
         if show_group_headers and group_key != prev_group_key:
             prev_group_key = group_key
             # 연한 회색 배경 + 진한 텍스트 — 가독성 + 시각적 조용함
-            HEADER_BG = "F1F5F9"   # slate-100
+            HEADER_BG = "CBD5E1"   # slate-300 — zebra (FFFFFF/F5F9FE) 와 명확히 구분되는 중간 회색
             HEADER_FG = "1F2937"   # slate-800
             if group_by == "middle":
                 # 중분류별 헤더: "Email Input  ·  SM-EML"
