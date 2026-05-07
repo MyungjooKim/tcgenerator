@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.9.26"
-APP_VERSION_DATE    = "2026-04-29"
-APP_VERSION_TAGLINE = "입력 소스 부록 표 자동 제거 + 입력 범위 엄격 준수"
+APP_VERSION         = "v0.10.0"
+APP_VERSION_DATE    = "2026-05-07"
+APP_VERSION_TAGLINE = "구조화 spec 폴더 모드 + UI 정식화 + 화면별 정밀 TC"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🐛 [중대] SCR-810.md 끝 부록 표(SCR-403/221/410 의 에러 케이스)로 인해 무관한 분류 생성되던 버그 fix",
-    "🛡 옵션 B — strip_appendix_tables() 자동 감지/제거 — 본문 끝 다른 화면 부록 표 차단",
-    "🚨 옵션 A — 프롬프트에 '입력 파일명 일치 SCR 만' 절대 규칙 + 부록/navigateTo 무시 안내",
-    "💡 부록 자동 제거 시 사용자에게 로그로 안내 (예: 'SCR-810.md 의 ... 부록 자동 제거')",
-    "🔁 v0.9.25 샘플 기능 제거 / v0.9.24 한글 IME fix 모두 포함",
+    "📁 구조화 spec 폴더 모드 — overview/policy/design/scr 분리 폴더 1개로 화면별 정밀 TC (분류 LLM 호출 0회)",
+    "🔄 버전 diff 모드 — 이전 폴더 대비 변경/추가 SCR 만 재생성 (비용 76% 절감 가능)",
+    "🎯 분류표 계층 정상화 — 대분류>중분류(화면)>소분류(세부 시나리오) + SCR md 본문에서 자동 추출",
+    "✨ Step 1 UI 정식화 — 구조화 spec 우선 / 개별 소스는 임시 작업용 아코디언으로 분리 + 최근 사용 폴더 드롭다운",
+    "🛠 다수 안정화 — TC 갯수 정상화, focus_area SCR 일괄/범위 인식, Excel 너비 1.4배·구분 행·줄바꿈 정리",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
