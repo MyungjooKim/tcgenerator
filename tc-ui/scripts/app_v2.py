@@ -138,6 +138,19 @@ def save_project(project_name: str, tc_file: str = "", excel_file: str = "", **e
                 entry[k] = v
     # extra 필드 병합
     entry.update(extra)
+
+    # 최근 사용 spec 폴더 이력 누적 (last_sources 에서 spec_folder 타입 추출)
+    if "last_sources" in extra:
+        recent = list(entry.get("recent_spec_folders") or [])
+        for src in extra["last_sources"]:
+            if src.get("type") in ("spec_folder", "spec_folder_prev") and src.get("content"):
+                path = src["content"]
+                if path in recent:
+                    recent.remove(path)
+                recent.insert(0, path)  # 최신을 맨 앞에
+        # 최대 10개
+        entry["recent_spec_folders"] = recent[:10]
+
     if existing:
         projects = [entry if p["name"] == project_name else p for p in projects]
     else:
@@ -5335,6 +5348,43 @@ def start_spec_folder():
     })
 
 
+@app.route("/recent-spec-folders", methods=["GET"])
+def recent_spec_folders():
+    """프로젝트별 최근 사용 spec 폴더 목록 반환.
+    Query: project_name=... (없으면 전체 프로젝트의 최근 폴더 합집합)
+    Returns: {ok, folders: [path, ...]} — 존재하는 경로만, 최신 순.
+    """
+    project_name = request.args.get("project_name", "").strip()
+    projects = load_projects()
+    candidates: list[str] = []
+    if project_name:
+        proj = next((p for p in projects if p["name"] == project_name), None)
+        if proj:
+            candidates = list(proj.get("recent_spec_folders") or [])
+        # 폴백 — 프로젝트의 last_sources 에서 spec_folder 추출
+        if not candidates and proj:
+            for src in (proj.get("last_sources") or []):
+                if src.get("type") in ("spec_folder", "spec_folder_prev") and src.get("content"):
+                    if src["content"] not in candidates:
+                        candidates.append(src["content"])
+    else:
+        # 프로젝트 미지정 — 모든 프로젝트의 recent_spec_folders 합집합 (최신 5개)
+        seen = set()
+        for p in projects:
+            for f in (p.get("recent_spec_folders") or []):
+                if f not in seen:
+                    seen.add(f)
+                    candidates.append(f)
+                if len(candidates) >= 10:
+                    break
+            if len(candidates) >= 10:
+                break
+
+    # 실제 존재하는 폴더만 필터
+    folders = [f for f in candidates if Path(f).expanduser().is_dir()]
+    return jsonify({"ok": True, "folders": folders[:10]})
+
+
 @app.route("/preview-spec-folder", methods=["POST"])
 def preview_spec_folder():
     """폴더 경로만 받아 미리 분류 결과 반환 (시작 전 검증용)."""
@@ -8167,69 +8217,120 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                oninput="onProjectNameInputForResume()">
       </div>
 
-      <div class="form-group">
-        <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
-          <span>입력 소스</span>
-          <span style="font-size:11px;color:var(--muted);font-weight:400">여러 소스를 자유롭게 조합하세요</span>
-        </label>
-        <div class="source-add-bar">
-          <button type="button" class="btn-add-source" onclick="addSource('pdf')">📄 PDF 추가</button>
-          <button type="button" class="btn-add-source" onclick="addSource('url')">🔗 GitHub URL 추가</button>
-          <button type="button" class="btn-add-source" onclick="addSource('web')">🌐 웹 URL 추가</button>
-          <button type="button" class="btn-add-source" onclick="addSource('md')">📝 마크다운 파일 추가</button>
-          <button type="button" class="btn-add-source" onclick="addSource('text')">✏️ 텍스트 추가</button>
-          <button type="button" class="btn-clear-sources" id="btnClearAllSources" onclick="clearAllSources()" style="display:none;">🗑 전체 삭제</button>
-        </div>
-        <div id="sourceList"></div>
-        <div id="sourceEmpty" class="source-empty">
-          소스를 추가하세요.<br>
-          <span style="font-size:12px">PDF · GitHub URL · 웹페이지 · 마크다운 파일 · 텍스트 등을 자유롭게 조합할 수 있습니다.</span>
-        </div>
+      <!-- ═════════════════════════════════════════════════════════
+           입력 소스 — 우선순위 재배치 (v0.10.x)
+           1) 구조화 spec 폴더 = 기본 펼침 (권장 / 기획팀 표준)
+           2) 개별 소스 = 기본 접힘 (임시 작업용)
+           ═════════════════════════════════════════════════════════ -->
 
-        <!-- 구조화 spec 폴더 입력 (v0.10.0+) -->
-        <div style="margin-top:14px;padding:12px;border:1px dashed #94A3B8;border-radius:8px;background:#F8FAFC;">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-            <div style="font-weight:600;font-size:13px;color:#1E293B;">
-              📁 구조화 spec 폴더 모드 (신규)
-              <span style="font-size:11px;color:#64748B;font-weight:400;margin-left:6px;">overview/policy/design/scr 분리 폴더 1개로 화면별 정밀 TC</span>
-            </div>
-            <button type="button" id="btnSpecFolderToggle" onclick="toggleSpecFolderMode()"
-                    style="padding:4px 10px;font-size:11px;border:1px solid #94A3B8;background:#FFFFFF;border-radius:4px;cursor:pointer;">사용</button>
-          </div>
-          <div id="specFolderBox" style="display:none;">
-            <label style="font-size:11px;color:#475569;display:block;margin-bottom:4px;">신규 spec 폴더 경로 *</label>
-            <input type="text" id="specFolderPath" class="form-input" style="font-size:13px;font-family:monospace;"
+      <!-- ① 구조화 spec 폴더 (권장) ────────────────────────────── -->
+      <div class="form-group">
+        <div id="specFolderSection" style="border:1.5px solid #3B82F6;border-radius:10px;background:linear-gradient(135deg,#EFF6FF 0%,#DBEAFE 100%);overflow:hidden;">
+          <button type="button" id="specFolderHeader" onclick="toggleAccordion('spec')"
+                  style="width:100%;padding:14px 16px;background:transparent;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;text-align:left;">
+            <span style="display:flex;align-items:center;gap:10px;">
+              <span style="font-size:16px;">📁</span>
+              <span style="font-weight:700;font-size:14px;color:#1E3A5F;">구조화 spec 폴더</span>
+              <span style="font-size:11px;background:#3B82F6;color:#FFF;padding:2px 8px;border-radius:10px;font-weight:600;">권장</span>
+              <span style="font-size:11.5px;color:#475569;font-weight:400;">기획팀 표준 — overview/policy/design/scr 분리</span>
+            </span>
+            <span id="specFolderChevron" style="font-size:12px;color:#3B82F6;font-weight:700;">▼</span>
+          </button>
+          <div id="specFolderBody" style="padding:0 16px 16px 16px;">
+
+            <!-- 신규 spec 폴더 경로 + 최근 사용 드롭다운 -->
+            <label style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">
+              <span style="font-size:12px;color:#1E3A5F;font-weight:600;">신규 spec 폴더 경로 <span style="color:#DC2626;">*</span></span>
+              <button type="button" id="btnRecentFolders" onclick="toggleRecentFolders()"
+                      style="font-size:11px;color:#3B82F6;background:#FFFFFF;border:1px solid #93C5FD;border-radius:4px;padding:3px 9px;cursor:pointer;">
+                최근 사용 ▾
+              </button>
+            </label>
+            <input type="text" id="specFolderPath" class="form-input"
+                   style="font-size:13px;font-family:monospace;background:#FFFFFF;"
                    placeholder="예: /Users/me/projects/specs/v0.47.2-2026-05-07"
                    oninput="onSpecFolderChanged()"/>
+            <!-- 최근 사용 폴더 드롭다운 (프로젝트별) -->
+            <div id="recentFoldersPanel" style="display:none;margin-top:4px;background:#FFFFFF;border:1px solid #93C5FD;border-radius:6px;max-height:200px;overflow-y:auto;font-size:12px;"></div>
 
-            <!-- 버전 diff 모드 (선택) -->
-            <div style="margin-top:10px;padding:8px;background:#FFFBEB;border:1px solid #FCD34D;border-radius:6px;">
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                <label style="font-size:11px;color:#78350F;font-weight:600;">🔄 버전 diff 모드 (선택)</label>
+            <!-- 버전 diff 모드 -->
+            <div style="margin-top:10px;padding:10px 12px;background:#FFFBEB;border:1px solid #FCD34D;border-radius:6px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <label style="font-size:12px;color:#78350F;font-weight:600;display:flex;align-items:center;gap:5px;">
+                  <span>🔄</span> 버전 diff 모드
+                  <span style="font-weight:400;color:#92400E;">— 변경된 SCR 만 재생성</span>
+                </label>
                 <button type="button" id="btnDiffToggle" onclick="toggleDiffMode()"
-                        style="padding:3px 8px;font-size:10px;border:1px solid #FCD34D;background:#FFFFFF;border-radius:4px;cursor:pointer;">사용</button>
+                        style="padding:3px 10px;font-size:11px;border:1px solid #FCD34D;background:#FFFFFF;border-radius:4px;cursor:pointer;color:#78350F;">사용</button>
               </div>
-              <div id="diffBox" style="display:none;">
-                <input type="text" id="prevSpecFolderPath" class="form-input" style="font-size:12px;font-family:monospace;"
-                       placeholder="이전 버전 폴더 경로 — 변경/추가된 SCR 만 재생성"
+              <div id="diffBox" style="display:none;margin-top:8px;">
+                <label style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                  <span style="font-size:11px;color:#78350F;font-weight:600;">이전 버전 폴더 경로</span>
+                  <button type="button" id="btnRecentPrevFolders" onclick="toggleRecentPrevFolders()"
+                          style="font-size:10px;color:#78350F;background:#FFFFFF;border:1px solid #FCD34D;border-radius:4px;padding:2px 7px;cursor:pointer;">
+                    최근 사용 ▾
+                  </button>
+                </label>
+                <input type="text" id="prevSpecFolderPath" class="form-input"
+                       style="font-size:12px;font-family:monospace;background:#FFFFFF;"
+                       placeholder="비교할 이전 버전 폴더 경로"
                        oninput="onSpecFolderChanged()"/>
-                <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-                  <button type="button" onclick="previewDiff()" style="padding:5px 10px;font-size:11px;background:#F59E0B;color:#FFF;border:none;border-radius:4px;cursor:pointer;">📊 변경 화면 미리보기</button>
-                  <label style="font-size:11px;color:#78350F;display:flex;align-items:center;gap:4px;">
+                <div id="recentPrevFoldersPanel" style="display:none;margin-top:4px;background:#FFFFFF;border:1px solid #FCD34D;border-radius:6px;max-height:160px;overflow-y:auto;font-size:11px;"></div>
+                <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                  <button type="button" onclick="previewDiff()" style="padding:5px 11px;font-size:11px;background:#F59E0B;color:#FFF;border:none;border-radius:5px;cursor:pointer;font-weight:500;">📊 변경 화면 미리보기</button>
+                  <label style="font-size:11px;color:#78350F;display:flex;align-items:center;gap:5px;cursor:pointer;">
                     <input type="checkbox" id="includeUnchanged" style="margin:0;"/>
-                    동일한 화면도 함께 재생성 (분류표 일관성)
+                    동일 화면도 재생성
                   </label>
                 </div>
-                <div id="diffPreview" style="display:none;margin-top:6px;padding:6px 8px;background:#FFFFFF;border:1px solid #FCD34D;border-radius:4px;font-size:11px;"></div>
+                <div id="diffPreview" style="display:none;margin-top:6px;padding:8px 10px;background:#FFFFFF;border:1px solid #FCD34D;border-radius:5px;font-size:11px;"></div>
               </div>
             </div>
 
-            <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;">
-              <button type="button" onclick="previewSpecFolder()" style="padding:6px 12px;font-size:12px;background:#3B82F6;color:#FFF;border:none;border-radius:4px;cursor:pointer;">🔍 미리보기</button>
-              <button type="button" id="btnResumeSpec" onclick="resumeSpecFolder()" style="display:none;padding:6px 12px;font-size:12px;background:#7C3AED;color:#FFF;border:none;border-radius:4px;cursor:pointer;">▶ 이어서 작업</button>
-              <span id="specFolderHint" style="font-size:11px;color:#64748B;align-self:center;">폴더 경로를 입력하고 미리보기로 분류 결과를 확인하세요.</span>
+            <!-- 액션 -->
+            <div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap;align-items:center;">
+              <button type="button" onclick="previewSpecFolder()"
+                      style="padding:7px 14px;font-size:12.5px;background:#3B82F6;color:#FFF;border:none;border-radius:6px;cursor:pointer;font-weight:600;">
+                🔍 미리보기
+              </button>
+              <button type="button" id="btnResumeSpec" onclick="resumeSpecFolder()"
+                      style="display:none;padding:7px 14px;font-size:12.5px;background:#7C3AED;color:#FFF;border:none;border-radius:6px;cursor:pointer;font-weight:600;">
+                ▶ 이어서 작업
+              </button>
+              <span id="specFolderHint" style="font-size:11px;color:#475569;align-self:center;">폴더 경로 입력 후 미리보기로 분류 결과를 확인하세요.</span>
             </div>
-            <div id="specFolderPreview" style="display:none;margin-top:8px;padding:8px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:4px;font-size:12px;"></div>
+            <div id="specFolderPreview" style="display:none;margin-top:10px;padding:10px 12px;background:#FFFFFF;border:1px solid #DBEAFE;border-radius:6px;font-size:12px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ② 개별 소스 (임시 작업용 — 기본 접힘) ──────────────────── -->
+      <div class="form-group">
+        <div id="legacySourceSection" style="border:1px solid #CBD5E1;border-radius:10px;background:#F8FAFC;overflow:hidden;">
+          <button type="button" id="legacySourceHeader" onclick="toggleAccordion('legacy')"
+                  style="width:100%;padding:12px 16px;background:transparent;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;text-align:left;">
+            <span style="display:flex;align-items:center;gap:10px;">
+              <span style="font-size:14px;">📝</span>
+              <span style="font-weight:600;font-size:13px;color:#475569;">개별 소스 입력</span>
+              <span style="font-size:10.5px;background:#CBD5E1;color:#1F2937;padding:2px 7px;border-radius:8px;font-weight:500;">임시 작업용</span>
+              <span style="font-size:11.5px;color:#94A3B8;font-weight:400;">PDF · GitHub URL · 웹페이지 · 마크다운 · 텍스트</span>
+            </span>
+            <span id="legacySourceChevron" style="font-size:12px;color:#94A3B8;font-weight:700;">▶</span>
+          </button>
+          <div id="legacySourceBody" style="display:none;padding:0 16px 14px 16px;">
+            <div class="source-add-bar" style="margin-bottom:10px;">
+              <button type="button" class="btn-add-source" onclick="addSource('pdf')">📄 PDF 추가</button>
+              <button type="button" class="btn-add-source" onclick="addSource('url')">🔗 GitHub URL 추가</button>
+              <button type="button" class="btn-add-source" onclick="addSource('web')">🌐 웹 URL 추가</button>
+              <button type="button" class="btn-add-source" onclick="addSource('md')">📝 마크다운 파일 추가</button>
+              <button type="button" class="btn-add-source" onclick="addSource('text')">✏️ 텍스트 추가</button>
+              <button type="button" class="btn-clear-sources" id="btnClearAllSources" onclick="clearAllSources()" style="display:none;">🗑 전체 삭제</button>
+            </div>
+            <div id="sourceList"></div>
+            <div id="sourceEmpty" class="source-empty">
+              소스를 추가하세요.<br>
+              <span style="font-size:12px">PDF · GitHub URL · 웹페이지 · 마크다운 파일 · 텍스트 등을 자유롭게 조합할 수 있습니다.</span>
+            </div>
           </div>
         </div>
       </div>
@@ -8872,14 +8973,14 @@ async function onProjectDropdownChange() {
       });
       renderSources();
 
-      // 구조화 spec 폴더 자동 복원 — 박스 토글 ON + 경로 채움
+      // 구조화 spec 폴더 자동 복원 — 경로 채움 (spec 섹션은 기본 펼침 상태라 토글 불필요)
       if (specFolderEntry) {
-        var box = document.getElementById('specFolderBox');
         var pathEl = document.getElementById('specFolderPath');
         if (pathEl) pathEl.value = specFolderEntry.content || '';
-        if (box && box.style.display === 'none') {
-          // toggleSpecFolderMode() 호출과 동일 효과
-          if (typeof toggleSpecFolderMode === 'function') toggleSpecFolderMode();
+        // spec 섹션이 접혀있으면 자동으로 펼침 (기본은 펼침이지만 사용자가 닫았을 수 있음)
+        var specBody = document.getElementById('specFolderBody');
+        if (specBody && specBody.style.display === 'none') {
+          toggleAccordion('spec');
         }
         // 이전 폴더가 있으면 diff 박스도 자동 복원
         if (specFolderPrevEntry) {
@@ -10184,15 +10285,14 @@ async function startPipeline() {
   const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
   const focusArea = document.getElementById('focusArea').value.trim();
 
-  // 구조화 spec 폴더 모드 분기
-  const specBox = document.getElementById('specFolderBox');
+  // 구조화 spec 폴더 모드 분기 — v0.10.x: spec 폴더 경로가 비어있지 않으면 spec 모드 우선
   const specPathEl = document.getElementById('specFolderPath');
-  const specFolderActive = specBox && specBox.style.display !== 'none' && specPathEl && specPathEl.value.trim();
+  const specFolderActive = specPathEl && specPathEl.value.trim();
   if (specFolderActive) {
     return startPipelineSpecFolder(projectName, focusArea, specPathEl.value.trim());
   }
 
-  if (sources.length === 0) { alert('소스를 하나 이상 추가하거나 구조화 spec 폴더를 사용하세요.'); return; }
+  if (sources.length === 0) { alert('구조화 spec 폴더 경로를 입력하거나, 개별 소스를 하나 이상 추가하세요.'); return; }
 
   const typeNames = { pdf: 'PDF', url: 'GitHub URL', web: '웹 URL', md: '마크다운', text: '텍스트' };
   for (const s of sources) {
@@ -10325,8 +10425,9 @@ let _resumeCheckTimer = null;
 function onProjectNameInputForResume() {
   if (_resumeCheckTimer) clearTimeout(_resumeCheckTimer);
   _resumeCheckTimer = setTimeout(() => {
-    const box = document.getElementById('specFolderBox');
-    if (box && box.style.display !== 'none') checkResumeSpec();
+    // 새 구조: spec 아코디언 body 가 펼쳐져 있을 때만 resume 체크
+    const body = document.getElementById('specFolderBody');
+    if (body && body.style.display !== 'none') checkResumeSpec();
   }, 500);
 }
 
@@ -10383,16 +10484,87 @@ async function resumeSpecFolder() {
   }
 }
 
+// ── 신규 아코디언 시스템 (v0.10.x UI 정식화) ────────────────────────
+// 이전: toggleSpecFolderMode() 가 별도 박스 표시/숨김
+// 현재: spec 섹션은 기본 펼침, legacy 소스는 기본 접힘. toggleAccordion('spec'|'legacy')
+function toggleAccordion(which) {
+  const map = {
+    spec:   { body: 'specFolderBody',   chev: 'specFolderChevron' },
+    legacy: { body: 'legacySourceBody', chev: 'legacySourceChevron' },
+  };
+  const cfg = map[which];
+  if (!cfg) return;
+  const body = document.getElementById(cfg.body);
+  const chev = document.getElementById(cfg.chev);
+  if (!body || !chev) return;
+  const opening = body.style.display === 'none';
+  body.style.display = opening ? '' : 'none';
+  chev.textContent = opening ? '▼' : '▶';
+  if (which === 'spec' && opening) checkResumeSpec();
+}
+
+// 하위 호환 — 이전 toggleSpecFolderMode() 호출하는 곳 보호
 function toggleSpecFolderMode() {
-  const box = document.getElementById('specFolderBox');
-  const btn = document.getElementById('btnSpecFolderToggle');
-  if (!box || !btn) return;
-  const enabled = box.style.display === 'none';
-  box.style.display = enabled ? '' : 'none';
-  btn.textContent = enabled ? '사용 중 ✓' : '사용';
-  btn.style.background = enabled ? '#DBEAFE' : '#FFFFFF';
-  btn.style.borderColor = enabled ? '#3B82F6' : '#94A3B8';
-  if (enabled) checkResumeSpec();
+  // 이전 코드 호환: 호출되면 spec 아코디언 토글
+  toggleAccordion('spec');
+}
+
+// ── 최근 사용 폴더 드롭다운 ─────────────────────────────────────────
+async function toggleRecentFolders() {
+  const panel = document.getElementById('recentFoldersPanel');
+  if (!panel) return;
+  if (panel.style.display !== 'none' && panel.dataset.loaded === '1') {
+    panel.style.display = 'none';
+    return;
+  }
+  await loadRecentFolders('specFolderPath', 'recentFoldersPanel');
+}
+
+async function toggleRecentPrevFolders() {
+  const panel = document.getElementById('recentPrevFoldersPanel');
+  if (!panel) return;
+  if (panel.style.display !== 'none' && panel.dataset.loaded === '1') {
+    panel.style.display = 'none';
+    return;
+  }
+  await loadRecentFolders('prevSpecFolderPath', 'recentPrevFoldersPanel');
+}
+
+async function loadRecentFolders(targetInputId, panelId) {
+  const projectName = document.getElementById('projectName').value.trim();
+  const panel = document.getElementById(panelId);
+  panel.style.display = '';
+  panel.innerHTML = '<div style="padding:10px;color:#94A3B8;">⏳ 불러오는 중...</div>';
+  try {
+    const url = '/recent-spec-folders' + (projectName ? '?project_name=' + encodeURIComponent(projectName) : '');
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok || !d.folders || d.folders.length === 0) {
+      panel.innerHTML = '<div style="padding:10px;color:#94A3B8;">최근 사용한 폴더가 없습니다.</div>';
+      panel.dataset.loaded = '1';
+      return;
+    }
+    panel.innerHTML = d.folders.map(f =>
+      '<div onclick="pickRecentFolder(\'' + targetInputId + '\',\'' + panelId + '\',\'' +
+      f.replace(/'/g, "\\'") + '\')" ' +
+      'style="padding:8px 12px;border-bottom:1px solid #F1F5F9;cursor:pointer;font-family:monospace;color:#1E293B;" ' +
+      'onmouseover="this.style.background=\'#F1F5F9\'" onmouseout="this.style.background=\'\'">' +
+      f + '</div>'
+    ).join('');
+    panel.dataset.loaded = '1';
+  } catch (e) {
+    panel.innerHTML = '<div style="padding:10px;color:#DC2626;">오류: ' + e.message + '</div>';
+  }
+}
+
+function pickRecentFolder(targetInputId, panelId, path) {
+  const input = document.getElementById(targetInputId);
+  if (input) {
+    input.value = path;
+    input.dispatchEvent(new Event('input'));
+  }
+  const panel = document.getElementById(panelId);
+  if (panel) panel.style.display = 'none';
 }
 
 function onSpecFolderChanged() {
