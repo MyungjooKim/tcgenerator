@@ -862,6 +862,122 @@ def step_parse_structured_spec(sess: dict, folder_path: str) -> dict:
     }
 
 
+def diff_spec_folders(prev_folder: Path, new_folder: Path) -> dict:
+    """이전 spec 폴더와 신규 spec 폴더를 비교해 SCR 단위로 변경분 분류.
+
+    반환: {
+      "added":     [SCR-ID, ...],   # 신규 추가된 화면
+      "modified":  [SCR-ID, ...],   # 본문이 바뀐 화면
+      "removed":   [SCR-ID, ...],   # 신규에서 사라진 화면
+      "unchanged": [SCR-ID, ...],   # 동일 (재생성 불필요)
+      "common_changed": bool,       # 정책/디자인/overview 가 바뀌었는지
+    }
+    """
+    import hashlib
+
+    def _hash_file(p: Path) -> str:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def _scr_map(folder: Path) -> dict[str, Path]:
+        cls = classify_spec_files(folder)
+        out: dict[str, Path] = {}
+        for p in cls["screens"]:
+            m = re.match(r"^(SCR[-_]?\w+)", p.stem, re.IGNORECASE)
+            if m:
+                sid = m.group(1).upper().replace("_", "-")
+                out[sid] = p
+        return out
+
+    prev_scr = _scr_map(prev_folder)
+    new_scr = _scr_map(new_folder)
+
+    added = sorted(set(new_scr) - set(prev_scr))
+    removed = sorted(set(prev_scr) - set(new_scr))
+    modified = []
+    unchanged = []
+    for sid in sorted(set(new_scr) & set(prev_scr)):
+        if _hash_file(prev_scr[sid]) != _hash_file(new_scr[sid]):
+            modified.append(sid)
+        else:
+            unchanged.append(sid)
+
+    # 공통 문서(overview/policy/design) 변경 여부
+    prev_cls = classify_spec_files(prev_folder)
+    new_cls = classify_spec_files(new_folder)
+    common_changed = False
+    for key in ("overview",):
+        a = prev_cls.get(key)
+        b = new_cls.get(key)
+        if (a is None) != (b is None) or (a and b and _hash_file(a) != _hash_file(b)):
+            common_changed = True
+            break
+    if not common_changed:
+        prev_common = sorted([p.name for p in prev_cls["policy"] + prev_cls["design"]])
+        new_common = sorted([p.name for p in new_cls["policy"] + new_cls["design"]])
+        if prev_common != new_common:
+            common_changed = True
+        else:
+            for plist_a, plist_b in [
+                (sorted(prev_cls["policy"], key=lambda p: p.name),
+                 sorted(new_cls["policy"], key=lambda p: p.name)),
+                (sorted(prev_cls["design"], key=lambda p: p.name),
+                 sorted(new_cls["design"], key=lambda p: p.name)),
+            ]:
+                for a, b in zip(plist_a, plist_b):
+                    if _hash_file(a) != _hash_file(b):
+                        common_changed = True
+                        break
+                if common_changed:
+                    break
+
+    return {
+        "added": added,
+        "modified": modified,
+        "removed": removed,
+        "unchanged": unchanged,
+        "common_changed": common_changed,
+    }
+
+
+def step_parse_structured_spec_with_diff(sess: dict, new_folder_path: str,
+                                           prev_folder_path: str,
+                                           include_unchanged: bool = False) -> dict:
+    """diff 모드 — 신규 폴더를 파싱하되 변경된/추가된 화면만 screens 에 남기고
+    unchanged 는 따로 표기. step_parse_structured_spec 의 결과 + diff 정보를 반환.
+    include_unchanged=True 이면 모든 화면 포함(분류표 일관성 유지용).
+    """
+    new_folder = Path(new_folder_path).expanduser()
+    prev_folder = Path(prev_folder_path).expanduser()
+    if not prev_folder.exists():
+        raise FileNotFoundError(f"이전 폴더 없음: {prev_folder}")
+
+    push_log(sess, f"[diff] 비교 — 이전={prev_folder.name} / 신규={new_folder.name}")
+    diff = diff_spec_folders(prev_folder, new_folder)
+    push_log(sess,
+        f"[diff] 추가 {len(diff['added'])}개 / 수정 {len(diff['modified'])}개 / "
+        f"삭제 {len(diff['removed'])}개 / 동일 {len(diff['unchanged'])}개 / "
+        f"공통 문서 변경={diff['common_changed']}")
+
+    # 신규 폴더 정상 파싱
+    spec = step_parse_structured_spec(sess, str(new_folder))
+
+    # diff 결과를 screens 필터링에 반영 (재생성 대상만 남김)
+    target_scrs = set(diff["added"]) | set(diff["modified"])
+    if diff["common_changed"]:
+        push_log(sess, "[diff] ⚠️ 공통 문서(정책/디자인/overview) 변경됨 — 모든 화면 재생성 권장")
+    if include_unchanged or diff["common_changed"]:
+        # 전체 유지 (분류표 일관성 + 공통 변경 시 안전 재생성)
+        pass
+    else:
+        before_n = len(spec["screens"])
+        spec["screens"] = [sc for sc in spec["screens"] if sc["id"] in target_scrs]
+        push_log(sess, f"[diff] 재생성 대상으로 화면 필터링: {before_n}개 → {len(spec['screens'])}개")
+
+    spec["_diff"] = diff
+    spec["_prev_folder"] = str(prev_folder)
+    return spec
+
+
 def extract_pdf_text(pdf_path: Path) -> str:
     try:
         from pypdf import PdfReader
@@ -1603,12 +1719,36 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     push_log(sess, f"[화면별 TC 작성] 대상 화면 {len(target_screens)}개")
     project_code = _detect_project_code(project_name)
 
+    # resume 지원 — 이미 처리된 화면은 건너뛴다.
+    # 화면별 결과는 sess["workspace"]/per_screen/<SCR-ID>.md 에 저장된다.
+    per_screen_dir = sess["workspace"] / "per_screen"
+    per_screen_dir.mkdir(exist_ok=True)
+    completed_ids = {p.stem for p in per_screen_dir.glob("SCR-*.md")}
+    if completed_ids:
+        push_log(sess, f"[화면별 TC 작성] resume — 이미 완료된 화면 {len(completed_ids)}개 건너뜀: {sorted(completed_ids)[:5]}{'...' if len(completed_ids) > 5 else ''}")
+
     tc_parts: list[str] = []
     seq_per_suite: dict[str, int] = {}
     total_tc = 0
 
-    for idx, (sc, meta_row, major) in enumerate(target_screens, 1):
+    # 이미 완료된 화면의 결과를 먼저 메모리에 적재 (병합 + seq 누적)
+    for sc, meta_row, major in target_screens:
+        if sc["id"] not in completed_ids:
+            continue
+        existing_path = per_screen_dir / f"{sc['id']}.md"
+        existing_text = existing_path.read_text(encoding="utf-8")
+        suite_code = domain_to_suite.get(major, "FUNC") or "FUNC"
+        scr_tc_count = count_unique_tc_ids(existing_text)
+        seq_per_suite[suite_code] = seq_per_suite.get(suite_code, 1) + scr_tc_count
+        total_tc += scr_tc_count
+        tc_parts.append(f"<!-- {sc['id']} — {sc['title']} (resumed) -->\n\n{existing_text.strip()}")
+
+    pending = [(sc, mr, mj) for (sc, mr, mj) in target_screens if sc["id"] not in completed_ids]
+    push_log(sess, f"[화면별 TC 작성] 대기 화면 {len(pending)}개 (총 {len(target_screens)}개 중)")
+
+    for idx_pending, (sc, meta_row, major) in enumerate(pending, 1):
         check_stop(sess)
+        idx = len(completed_ids) + idx_pending  # 전체 진행 인덱스
         suite_code = domain_to_suite.get(major, "FUNC") or "FUNC"
         starting = seq_per_suite.get(suite_code, 1)
 
@@ -1631,6 +1771,9 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         })
 
         tc_draft = call_claude_cached(sys_blocks, user, max_tokens=8192)
+
+        # 화면별 즉시 저장 — resume 시 여기서 다시 시작
+        (per_screen_dir / f"{sc['id']}.md").write_text(tc_draft, encoding="utf-8")
 
         # TC 개수 카운트 → 다음 화면의 starting seq 계산
         scr_tc_count = count_unique_tc_ids(tc_draft)
@@ -4689,17 +4832,39 @@ def upload_md():
     })
 
 
-def run_pipeline_structured(sess: dict, folder_path: str, project_name: str):
-    """구조화 spec 폴더 파이프라인 — LLM 분류 단계 스킵, 화면별 1:1 호출."""
+def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
+                              prev_folder_path: str = "",
+                              include_unchanged: bool = False):
+    """구조화 spec 폴더 파이프라인 — LLM 분류 단계 스킵, 화면별 1:1 호출.
+
+    Args:
+        prev_folder_path: 비어있지 않으면 diff 모드 — 이전 폴더 대비 추가/수정 SCR 만 재생성.
+        include_unchanged: True면 diff 가 있어도 모든 화면 처리 (분류표 일관성용).
+    """
     focus_area = sess.get("focus_area", "")
+    diff_mode = bool(prev_folder_path)
     try:
         # ── 1) 폴더 파싱 (LLM 호출 없음) ──
         sess["status"] = "parsing"
-        push_stage(sess, 1, "구조화 spec 폴더 파싱", 8)
-        spec_data = step_parse_structured_spec(sess, folder_path)
+        if diff_mode:
+            push_stage(sess, 1, "구조화 spec 폴더 + diff 비교", 8)
+            spec_data = step_parse_structured_spec_with_diff(
+                sess, folder_path, prev_folder_path, include_unchanged=include_unchanged
+            )
+        else:
+            push_stage(sess, 1, "구조화 spec 폴더 파싱", 8)
+            spec_data = step_parse_structured_spec(sess, folder_path)
         check_stop(sess)
 
         if not spec_data["screens"]:
+            if diff_mode and not spec_data.get("_diff", {}).get("common_changed"):
+                # diff 모드에서 변경된 화면이 0개면 정상 종료
+                push_log(sess, "[diff] 변경된 화면이 없습니다. 재생성할 TC 없음 — 종료.")
+                sess["status"] = "done"
+                push_stage(sess, 7, "완료 (변경 없음)", 100)
+                push(sess, "done", {"result": None, "tc_count": 0, "diff": spec_data.get("_diff")})
+                clear_pipeline_state(project_name)
+                return
             raise RuntimeError(f"화면 md 가 없습니다: {folder_path}/scr/")
         if not spec_data["screen_rows"]:
             push_log(sess, "[경고] overview 의 화면 목록 표를 찾지 못함 — 화면 파일명/H1만으로 분류표 생성")
@@ -4723,13 +4888,17 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str):
         # ── 2) 분류표 자동 생성 (LLM 호출 없음) ──
         sess["status"] = "classifying"
         push_stage(sess, 2, "분류표 자동 생성 (LLM 호출 없음)", 25)
-        classification = build_classification_from_screen_list(spec_data["screen_rows"], project_name)
+        # 분류표는 항상 전체 화면 기준으로 생성 (일관성 유지) — diff 라도 분류는 전체
+        all_rows = spec_data["screen_rows"]
+        classification = build_classification_from_screen_list(all_rows, project_name)
         classify_path = sess["workspace"] / "04_classification_draft.md"
         classify_path.write_text(classification, encoding="utf-8")
         push_log(sess, f"[분류] 화면 목록 표에서 분류표 자동 생성 — {len(classification):,}자")
 
         # 체크포인트 저장
         sources_info = [{"type": "spec_folder", "content": folder_path}]
+        if diff_mode:
+            sources_info.append({"type": "spec_folder_prev", "content": prev_folder_path})
         save_pipeline_state(project_name, "gate_waiting", {
             "raw_text": raw_text[:20000],
             "classification": classification,
@@ -4737,6 +4906,9 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str):
             "sources_info": sources_info,
             "source_scr_map": sess["_source_scr_map"],
             "structured_spec_folder": folder_path,
+            "prev_folder": prev_folder_path,
+            "include_unchanged": include_unchanged,
+            "workspace": str(sess["workspace"]),
         })
         save_project(project_name, last_sources=sources_info, last_focus_area=focus_area)
 
@@ -4752,6 +4924,21 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str):
         # ── 4) 화면별 1:1 TC 작성 ──
         sess["status"] = "tc_writing"
         push_stage(sess, 4, "화면별 TC 작성 (cache 활용)", 55)
+        # tc_writing 단계 진입 전 체크포인트 갱신 — resume 시 여기로 복귀
+        save_pipeline_state(project_name, "tc_writing", {
+            "raw_text": raw_text[:20000],
+            "classification": classification,
+            "approved_classification": approved,
+            "focus_area": focus_area,
+            "sources_info": sources_info,
+            "source_scr_map": sess["_source_scr_map"],
+            "structured_spec_folder": folder_path,
+            "prev_folder": prev_folder_path,
+            "include_unchanged": include_unchanged,
+            "workspace": str(sess["workspace"]),
+            "selected_domains": sess.get("selected_domains"),
+            "suite_codes": sess.get("suite_codes"),
+        })
         selected = sess.get("selected_domains")
         merged_tc, total_tc = step_write_tc_per_screen(
             sess, approved, spec_data, project_name,
@@ -4787,19 +4974,63 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str):
 @app.route("/start-spec-folder", methods=["POST"])
 def start_spec_folder():
     """구조화 spec 폴더 1개를 받아 파이프라인 실행.
-    POST body: {project_name, folder_path, focus_area?}
-    기존 /start 와 분리 — 새 모드는 LLM 호출이 화면별로만 발생.
+    POST body: {project_name, folder_path, focus_area?, prev_folder_path?, include_unchanged?, resume?}
+    - prev_folder_path 가 있으면 diff 모드 (변경/추가 SCR 만 재생성)
+    - resume=true 면 이전 체크포인트(workspace/per_screen/*.md)로부터 이어서 작업
     """
     data = request.get_json(force=True) or {}
     project_name = data.get("project_name", "프로젝트").strip() or "프로젝트"
     focus_area   = (data.get("focus_area") or "").strip()
     folder_path  = (data.get("folder_path") or "").strip()
+    prev_folder  = (data.get("prev_folder_path") or "").strip()
+    include_unchanged = bool(data.get("include_unchanged"))
+    resume       = bool(data.get("resume"))
+
+    # resume 모드 — 저장된 체크포인트 복원
+    if resume:
+        state = load_pipeline_state(project_name)
+        if not state:
+            return jsonify({"ok": False, "error": "저장된 체크포인트가 없습니다."}), 400
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY가 설정되지 않았습니다."}), 500
+        ckpt = state["data"]
+        ckpt_folder = ckpt.get("structured_spec_folder")
+        if not ckpt_folder:
+            return jsonify({"ok": False, "error": "체크포인트에 spec 폴더 정보가 없습니다 (구조화 spec 모드 체크포인트가 아님)."}), 400
+
+        sess = new_session()
+        sess["project_name"] = project_name
+        sess["focus_area"] = ckpt.get("focus_area", "")
+        sess["generation_mode"] = "structured_spec"
+        # workspace 복원 — per_screen/*.md 가 여기 있어야 resume 효력
+        prev_workspace = ckpt.get("workspace")
+        if prev_workspace and Path(prev_workspace).exists():
+            sess["workspace"] = Path(prev_workspace)
+            push_log(sess, f"[resume] workspace 복원: {prev_workspace}")
+        sess["selected_domains"] = ckpt.get("selected_domains")
+        sess["suite_codes"]      = ckpt.get("suite_codes") or []
+        sess["_resumed_state"]   = state
+
+        t = threading.Thread(
+            target=run_pipeline_structured,
+            args=(sess, ckpt_folder, project_name,
+                  ckpt.get("prev_folder", ""),
+                  bool(ckpt.get("include_unchanged"))),
+            daemon=True,
+        )
+        sess["thread"] = t
+        t.start()
+        return jsonify({"ok": True, "sid": sess["id"], "resumed_stage": state["stage"]})
 
     if not folder_path:
         return jsonify({"ok": False, "error": "folder_path 가 비어 있습니다."}), 400
     folder = Path(folder_path).expanduser()
     if not folder.exists() or not folder.is_dir():
         return jsonify({"ok": False, "error": f"폴더가 없거나 디렉토리가 아닙니다: {folder}"}), 400
+    if prev_folder:
+        prev_p = Path(prev_folder).expanduser()
+        if not prev_p.exists() or not prev_p.is_dir():
+            return jsonify({"ok": False, "error": f"이전 폴더가 없거나 디렉토리가 아닙니다: {prev_p}"}), 400
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY가 설정되지 않았습니다."}), 500
 
@@ -4823,11 +5054,15 @@ def start_spec_folder():
     sess["generation_mode"] = "structured_spec"
 
     sources_to_save = [{"type": "spec_folder", "content": str(folder)}]
+    if prev_folder:
+        sources_to_save.append({"type": "spec_folder_prev", "content": str(Path(prev_folder).expanduser())})
     save_project(project_name, last_sources=sources_to_save, last_focus_area=focus_area)
 
     t = threading.Thread(
         target=run_pipeline_structured,
-        args=(sess, str(folder), project_name),
+        args=(sess, str(folder), project_name,
+              str(Path(prev_folder).expanduser()) if prev_folder else "",
+              include_unchanged),
         daemon=True,
     )
     sess["thread"] = t
@@ -4867,6 +5102,78 @@ def preview_spec_folder():
         "screens": [p.name for p in cls["screens"]],
         "screen_rows_count": len(rows),
         "majors": sorted(set(r["major"] for r in rows if r["major"])),
+    })
+
+
+@app.route("/diff-spec-folders", methods=["POST"])
+def diff_spec_folders_route():
+    """두 폴더 비교 미리보기 — 변경 SCR 목록 반환."""
+    data = request.get_json(force=True) or {}
+    new_path = (data.get("folder_path") or "").strip()
+    prev_path = (data.get("prev_folder_path") or "").strip()
+    if not new_path or not prev_path:
+        return jsonify({"ok": False, "error": "folder_path 와 prev_folder_path 모두 필요합니다."}), 400
+    new_p = Path(new_path).expanduser()
+    prev_p = Path(prev_path).expanduser()
+    if not new_p.exists() or not new_p.is_dir():
+        return jsonify({"ok": False, "error": f"신규 폴더 없음: {new_p}"}), 400
+    if not prev_p.exists() or not prev_p.is_dir():
+        return jsonify({"ok": False, "error": f"이전 폴더 없음: {prev_p}"}), 400
+    try:
+        diff = diff_spec_folders(prev_p, new_p)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"diff 실패: {e}"}), 500
+    return jsonify({
+        "ok": True,
+        "new_folder": str(new_p),
+        "prev_folder": str(prev_p),
+        "added": diff["added"],
+        "modified": diff["modified"],
+        "removed": diff["removed"],
+        "unchanged_count": len(diff["unchanged"]),
+        "common_changed": diff["common_changed"],
+        "regenerate_count": len(diff["added"]) + len(diff["modified"]),
+    })
+
+
+@app.route("/check-resume-spec", methods=["GET"])
+def check_resume_spec():
+    """프로젝트의 구조화 spec 모드 체크포인트가 있는지 확인.
+    Query: project_name=...
+    Returns: {ok, resumable, stage, completed_screens, total_screens, ...}
+    """
+    project_name = request.args.get("project_name", "").strip()
+    if not project_name:
+        return jsonify({"ok": False, "error": "project_name 필요"}), 400
+    state = load_pipeline_state(project_name)
+    if not state:
+        return jsonify({"ok": True, "resumable": False})
+    ckpt = state["data"]
+    folder = ckpt.get("structured_spec_folder")
+    if not folder:
+        return jsonify({"ok": True, "resumable": False, "reason": "구조화 spec 모드 체크포인트 아님"})
+    workspace = ckpt.get("workspace")
+    completed = []
+    if workspace and Path(workspace).exists():
+        per_screen_dir = Path(workspace) / "per_screen"
+        if per_screen_dir.exists():
+            completed = sorted([p.stem for p in per_screen_dir.glob("SCR-*.md")])
+    # 신규 폴더에서 화면 개수 다시 계산 (참고용)
+    folder_p = Path(folder)
+    total = 0
+    if folder_p.exists():
+        cls = classify_spec_files(folder_p)
+        total = len(cls["screens"])
+    return jsonify({
+        "ok": True,
+        "resumable": True,
+        "stage": state["stage"],
+        "folder": folder,
+        "prev_folder": ckpt.get("prev_folder", ""),
+        "completed_screens": completed,
+        "completed_count": len(completed),
+        "total_screens": total,
+        "remaining": max(total - len(completed), 0) if total else None,
     })
 
 
@@ -7600,7 +7907,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="form-group">
         <label class="form-label">프로젝트명</label>
         <input type="text" id="projectName" class="form-input"
-               placeholder="예: Supercycl 모바일" value="">
+               placeholder="예: Supercycl 모바일" value=""
+               oninput="onProjectNameInputForResume()">
       </div>
 
       <div class="form-group">
@@ -7633,11 +7941,36 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     style="padding:4px 10px;font-size:11px;border:1px solid #94A3B8;background:#FFFFFF;border-radius:4px;cursor:pointer;">사용</button>
           </div>
           <div id="specFolderBox" style="display:none;">
+            <label style="font-size:11px;color:#475569;display:block;margin-bottom:4px;">신규 spec 폴더 경로 *</label>
             <input type="text" id="specFolderPath" class="form-input" style="font-size:13px;font-family:monospace;"
                    placeholder="예: /Users/me/projects/specs/v0.47.2-2026-05-07"
                    oninput="onSpecFolderChanged()"/>
-            <div style="display:flex;gap:6px;margin-top:6px;">
+
+            <!-- 버전 diff 모드 (선택) -->
+            <div style="margin-top:10px;padding:8px;background:#FFFBEB;border:1px solid #FCD34D;border-radius:6px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                <label style="font-size:11px;color:#78350F;font-weight:600;">🔄 버전 diff 모드 (선택)</label>
+                <button type="button" id="btnDiffToggle" onclick="toggleDiffMode()"
+                        style="padding:3px 8px;font-size:10px;border:1px solid #FCD34D;background:#FFFFFF;border-radius:4px;cursor:pointer;">사용</button>
+              </div>
+              <div id="diffBox" style="display:none;">
+                <input type="text" id="prevSpecFolderPath" class="form-input" style="font-size:12px;font-family:monospace;"
+                       placeholder="이전 버전 폴더 경로 — 변경/추가된 SCR 만 재생성"
+                       oninput="onSpecFolderChanged()"/>
+                <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+                  <button type="button" onclick="previewDiff()" style="padding:5px 10px;font-size:11px;background:#F59E0B;color:#FFF;border:none;border-radius:4px;cursor:pointer;">📊 변경 화면 미리보기</button>
+                  <label style="font-size:11px;color:#78350F;display:flex;align-items:center;gap:4px;">
+                    <input type="checkbox" id="includeUnchanged" style="margin:0;"/>
+                    동일한 화면도 함께 재생성 (분류표 일관성)
+                  </label>
+                </div>
+                <div id="diffPreview" style="display:none;margin-top:6px;padding:6px 8px;background:#FFFFFF;border:1px solid #FCD34D;border-radius:4px;font-size:11px;"></div>
+              </div>
+            </div>
+
+            <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;">
               <button type="button" onclick="previewSpecFolder()" style="padding:6px 12px;font-size:12px;background:#3B82F6;color:#FFF;border:none;border-radius:4px;cursor:pointer;">🔍 미리보기</button>
+              <button type="button" id="btnResumeSpec" onclick="resumeSpecFolder()" style="display:none;padding:6px 12px;font-size:12px;background:#7C3AED;color:#FFF;border:none;border-radius:4px;cursor:pointer;">▶ 이어서 작업</button>
               <span id="specFolderHint" style="font-size:11px;color:#64748B;align-self:center;">폴더 경로를 입력하고 미리보기로 분류 결과를 확인하세요.</span>
             </div>
             <div id="specFolderPreview" style="display:none;margin-top:8px;padding:8px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:4px;font-size:12px;"></div>
@@ -9607,11 +9940,23 @@ async function startPipelineSpecFolder(projectName, focusArea, folderPath) {
   document.getElementById('card2').scrollIntoView({ behavior: 'smooth', block: 'start' });
   setStopButtonsDisabled(false);
 
+  // diff 모드 옵션 수집
+  const diffBox = document.getElementById('diffBox');
+  const prevPath = (document.getElementById('prevSpecFolderPath') && document.getElementById('prevSpecFolderPath').value || '').trim();
+  const diffActive = diffBox && diffBox.style.display !== 'none' && prevPath;
+  const includeUnchanged = document.getElementById('includeUnchanged') ? document.getElementById('includeUnchanged').checked : false;
+
   try {
     const resp = await fetch('/start-spec-folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_name: projectName, focus_area: focusArea || null, folder_path: folderPath })
+      body: JSON.stringify({
+        project_name: projectName,
+        focus_area: focusArea || null,
+        folder_path: folderPath,
+        prev_folder_path: diffActive ? prevPath : '',
+        include_unchanged: includeUnchanged,
+      })
     });
     const data = await resp.json();
     if (!data.ok) {
@@ -9623,9 +9968,113 @@ async function startPipelineSpecFolder(projectName, focusArea, folderPath) {
     }
     currentSid = data.sid;
     if (data.summary) {
-      showToast(`📁 폴더 분류: overview ${data.summary.overview ? '✓' : '✗'} · policy ${data.summary.policy_count} · design ${data.summary.design_count} · 화면 ${data.summary.screens_count}개`, 'success');
+      showToast(`📁 폴더 분류: overview ${data.summary.overview ? '✓' : '✗'} · policy ${data.summary.policy_count} · design ${data.summary.design_count} · 화면 ${data.summary.screens_count}개${diffActive ? ' (diff 모드)' : ''}`, 'success');
     }
     connectStream(data.sid);
+  } catch(e) {
+    alert('서버 오류: ' + e.message);
+    document.getElementById('startBtn').disabled = false;
+  }
+}
+
+function toggleDiffMode() {
+  const box = document.getElementById('diffBox');
+  const btn = document.getElementById('btnDiffToggle');
+  if (!box || !btn) return;
+  const enabled = box.style.display === 'none';
+  box.style.display = enabled ? '' : 'none';
+  btn.textContent = enabled ? '사용 중 ✓' : '사용';
+  btn.style.background = enabled ? '#FCD34D' : '#FFFFFF';
+}
+
+async function previewDiff() {
+  const newPath = document.getElementById('specFolderPath').value.trim();
+  const prevPath = document.getElementById('prevSpecFolderPath').value.trim();
+  if (!newPath || !prevPath) { alert('두 폴더 경로를 모두 입력하세요.'); return; }
+  const prev = document.getElementById('diffPreview');
+  prev.style.display = '';
+  prev.innerHTML = '⏳ diff 계산 중...';
+  try {
+    const r = await fetch('/diff-spec-folders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder_path: newPath, prev_folder_path: prevPath })
+    });
+    const d = await r.json();
+    if (!d.ok) { prev.innerHTML = '<span style="color:#DC2626;">❌ ' + d.error + '</span>'; return; }
+    let html = '<div style="line-height:1.6;">';
+    html += `<div><strong>🆕 추가:</strong> ${d.added.length}개${d.added.length ? ' — <code>' + d.added.slice(0, 8).join(', ') + (d.added.length > 8 ? ', ...' : '') + '</code>' : ''}</div>`;
+    html += `<div><strong>📝 수정:</strong> ${d.modified.length}개${d.modified.length ? ' — <code>' + d.modified.slice(0, 8).join(', ') + (d.modified.length > 8 ? ', ...' : '') + '</code>' : ''}</div>`;
+    html += `<div><strong>🗑 삭제:</strong> ${d.removed.length}개${d.removed.length ? ' — <code>' + d.removed.slice(0, 8).join(', ') + (d.removed.length > 8 ? ', ...' : '') + '</code>' : ''}</div>`;
+    html += `<div><strong>✅ 동일:</strong> ${d.unchanged_count}개</div>`;
+    if (d.common_changed) {
+      html += '<div style="margin-top:4px;color:#B45309;"><strong>⚠️ 공통 문서(정책/디자인/overview) 변경됨</strong> — 모든 화면 재생성을 권장합니다 (전체 일관성 위해).</div>';
+    }
+    html += `<div style="margin-top:6px;color:#059669;"><strong>재생성 대상:</strong> ${d.regenerate_count}개${d.common_changed ? ' (공통 변경 시 전체 처리됨)' : ''}</div>`;
+    html += '</div>';
+    prev.innerHTML = html;
+  } catch(e) {
+    prev.innerHTML = '<span style="color:#DC2626;">❌ 서버 오류: ' + e.message + '</span>';
+  }
+}
+
+// 입력 디바운스 — 타이핑 중 매번 호출하지 않게
+let _resumeCheckTimer = null;
+function onProjectNameInputForResume() {
+  if (_resumeCheckTimer) clearTimeout(_resumeCheckTimer);
+  _resumeCheckTimer = setTimeout(() => {
+    const box = document.getElementById('specFolderBox');
+    if (box && box.style.display !== 'none') checkResumeSpec();
+  }, 500);
+}
+
+async function checkResumeSpec() {
+  const projectName = document.getElementById('projectName').value.trim();
+  if (!projectName) return;
+  try {
+    const r = await fetch('/check-resume-spec?project_name=' + encodeURIComponent(projectName));
+    const d = await r.json();
+    const btn = document.getElementById('btnResumeSpec');
+    if (!btn) return;
+    if (d.ok && d.resumable) {
+      btn.style.display = '';
+      btn.title = `완료된 화면 ${d.completed_count}개 / 전체 ${d.total_screens || '?'}개 (stage=${d.stage})`;
+      btn.textContent = `▶ 이어서 작업 (${d.completed_count}/${d.total_screens || '?'} 완료)`;
+    } else {
+      btn.style.display = 'none';
+    }
+  } catch(e) {
+    // 무시
+  }
+}
+
+async function resumeSpecFolder() {
+  const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
+  if (!confirm(`"${projectName}" 의 이전 작업을 이어서 실행하시겠습니까?\\n(이미 완료된 화면은 건너뛰고 미완료 화면만 처리합니다)`)) return;
+
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('card1').classList.add('hidden');
+  document.getElementById('card2').classList.remove('hidden');
+  setStepBar(2);
+  setStopButtonsDisabled(false);
+
+  try {
+    const r = await fetch('/start-spec-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name: projectName, resume: true })
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      alert('이어서 작업 실패: ' + d.error);
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('card1').classList.remove('hidden');
+      document.getElementById('card2').classList.add('hidden');
+      return;
+    }
+    currentSid = d.sid;
+    showToast(`▶ 이어서 작업 — stage=${d.resumed_stage}`, 'success');
+    connectStream(d.sid);
   } catch(e) {
     alert('서버 오류: ' + e.message);
     document.getElementById('startBtn').disabled = false;
@@ -9641,6 +10090,7 @@ function toggleSpecFolderMode() {
   btn.textContent = enabled ? '사용 중 ✓' : '사용';
   btn.style.background = enabled ? '#DBEAFE' : '#FFFFFF';
   btn.style.borderColor = enabled ? '#3B82F6' : '#94A3B8';
+  if (enabled) checkResumeSpec();
 }
 
 function onSpecFolderChanged() {
