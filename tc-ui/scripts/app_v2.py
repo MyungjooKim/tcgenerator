@@ -615,30 +615,165 @@ def parse_screen_list_table(overview_md_text: str) -> list[dict]:
     return rows
 
 
-def build_classification_from_screen_list(screen_rows: list[dict], project_name: str) -> str:
+def extract_minors_from_screen_md(md_text: str, max_minors: int = 12) -> list[str]:
+    """SCR-XXX.md 본문에서 소분류(세부 시나리오) 시드를 규칙 기반으로 추출.
+    LLM 호출 없음. 우선순위:
+      1. 상태(Status) 표 케이스 — 가장 구조화된 시나리오
+      2. 에러 케이스 표
+      3. [dev] 인터랙션 항목
+      4. 비고의 [정책]/[제약]/[접근성]/[세션] 마커
+    너무 많아지면 max_minors 까지 자른다.
+    각 항목은 짧은 한국어 라벨(35자 이내)로 정규화.
+    """
+    minors: list[str] = []
+    seen_keys: set[str] = set()  # 중복 제거용 (소문자 정규화 비교)
+
+    def add(label: str):
+        label = label.strip().rstrip(".·")
+        if not label:
+            return
+        if len(label) > 50:
+            label = label[:50].rstrip() + "…"
+        key = re.sub(r"\s+", "", label.lower())
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        minors.append(label)
+
+    # 1) 상태 표 — | 케이스 | 조건 | 설명/동작 |
+    in_status = False
+    for line in md_text.splitlines():
+        if not in_status:
+            if re.search(r"상태\s*\(\s*Status\s*\)|^##+\s*상태", line):
+                in_status = "header_pending"
+            continue
+        if in_status == "header_pending":
+            if line.strip().startswith("|") and "케이스" in line:
+                in_status = "rows"
+            continue
+        if in_status == "rows":
+            if line.strip().startswith("|---"):
+                continue
+            if not line.strip().startswith("|"):
+                in_status = False
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) >= 1 and cells[0]:
+                # 케이스 라벨 (Normal, Error.network) 을 소분류 시드로
+                add(f"{cells[0]} 상태 표시 및 동작")
+
+    # 2) 에러 케이스 표 — | 에러 케이스 | 표시 패턴 | 메시지 | 동작 |
+    in_err = False
+    err_headers: list[str] = []
+    for line in md_text.splitlines():
+        if not in_err:
+            if re.search(r"에러\s*케이스|^##+\s*에러", line):
+                in_err = "header_pending"
+            continue
+        if in_err == "header_pending":
+            if line.strip().startswith("|") and ("에러" in line or "케이스" in line):
+                err_headers = [c.strip().lower() for c in line.strip("|").split("|")]
+                in_err = "rows"
+            continue
+        if in_err == "rows":
+            if line.strip().startswith("|---"):
+                continue
+            if not line.strip().startswith("|"):
+                in_err = False
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) >= 1 and cells[0]:
+                add(f"에러 처리 — {cells[0]}")
+
+    # 3) [dev] 인터랙션 항목 — bullet list (- xxx → yyy)
+    in_inter = False
+    for line in md_text.splitlines():
+        if not in_inter:
+            if re.search(r"\[dev\]\s*인터랙션|^##+\s*인터랙션|\*\*인터랙션\*\*", line, re.IGNORECASE):
+                in_inter = True
+            continue
+        if not line.strip():
+            continue
+        # bullet 끝났음을 다음 굵은 헤더(**) 또는 다음 ## 으로 판단
+        if line.startswith("**") or line.startswith("##") or line.startswith("---"):
+            in_inter = False
+            continue
+        # bullet 추출
+        m = re.match(r"^[\-\*]\s+(.+)", line)
+        if m:
+            body = m.group(1)
+            # "<요소> <이벤트> → <결과>" 형식이 흔함. 화살표 앞부분만 사용
+            label = body.split("→")[0]
+            # 백틱·HTML 코드 제거
+            label = re.sub(r"`[^`]+`", "", label)
+            label = re.sub(r"<[^>]+>", "", label)
+            label = re.sub(r"\s+", " ", label).strip(" .·:")
+            if label and len(label) >= 3:
+                add(label)
+
+    # 4) 비고의 [정책]/[제약]/[접근성]/[세션]/[타이밍] 마커
+    for m in re.finditer(r"\[(정책|제약|접근성|세션|타이밍|보안|성능)\]\s*([^\n]{5,80})", md_text):
+        marker, body = m.group(1), m.group(2)
+        # 첫 문장만
+        body = re.split(r"[.。]", body)[0].strip(" ·-")
+        if body:
+            add(f"[{marker}] {body}")
+
+    # 한도 잘라내기 — 가장 중요한 것 먼저 (위에서 이미 우선순위 순)
+    if len(minors) > max_minors:
+        minors = minors[:max_minors]
+    return minors
+
+
+def build_classification_from_screen_list(screen_rows: list[dict], project_name: str,
+                                            screens_meta: list[dict] | None = None) -> str:
     """parse_screen_list_table() 의 결과를 분류표 마크다운(extract_domains() 가 읽는 형식)으로 변환.
     LLM 호출 없이 바로 Human Gate 로 갈 수 있는 분류표를 생성한다.
+
+    구조: 대분류(영역) > 중분류(화면) > 소분류(세부 시나리오)
+      - 중분류 = 화면 (SCR-XXX) — 사용자가 자주 단위로 인식하는 레벨
+      - 소분류 = SCR md 본문에서 규칙 기반 추출한 시나리오 (extract_minors_from_screen_md)
+
+    Args:
+        screen_rows: parse_screen_list_table() 결과 (id/name/major/middle 등)
+        screens_meta: parse_screen_md() 결과 list — 있으면 본문에서 소분류 추출.
+                      없으면 폴백(소분류 = '기본 동작 검증'만).
     """
-    # 대분류 → 중분류 → [화면 ID + name]
+    # 화면 ID → meta 매핑
+    meta_by_id = {sc["id"]: sc for sc in (screens_meta or [])}
+
+    # 대분류 → [화면 행 list]  (중분류는 화면 자체로 매핑)
     from collections import defaultdict
-    tree: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    tree: dict[str, list[dict]] = defaultdict(list)
     for r in screen_rows:
         major = r["major"] or "공통"
-        middle = r["middle"] or r["name"] or "기본"
-        tree[major][middle].append(r)
+        tree[major].append(r)
 
     lines = [f"# TC 분류표 — {project_name}", ""]
-    for major, mids in tree.items():
+    for major, screens in tree.items():
         lines.append(f"## 대분류: {major}")
         lines.append("")
-        for middle, screens in mids.items():
-            lines.append(f"### 중분류: {middle}")
+        for s in screens:
+            # 중분류 = 화면 ID + 화면명
+            screen_label = f"{s['id']} {s['name']}".strip()
+            lines.append(f"### 중분류: {screen_label}")
             lines.append("")
             lines.append("#### 소분류")
-            for s in screens:
-                # SCR-001 — Login: ... 형식. 소분류 1개당 화면 1개로 시드.
-                short_desc = s["desc"][:80] if s["desc"] else ""
-                lines.append(f"- {s['id']} {s['name']}: {short_desc}")
+
+            # 소분류 = SCR md 본문에서 추출 (규칙 기반)
+            sc_meta = meta_by_id.get(s["id"])
+            minors = []
+            if sc_meta and sc_meta.get("raw"):
+                minors = extract_minors_from_screen_md(sc_meta["raw"])
+
+            if minors:
+                for label in minors:
+                    lines.append(f"- {label}")
+            else:
+                # 폴백 — 본문이 없거나 파싱 실패. 최소 1개라도 시드.
+                desc_short = (s.get("desc") or "")[:60]
+                lines.append(f"- 기본 UI 표시 및 동작 검증{(': ' + desc_short) if desc_short else ''}")
+
             lines.append("")
     return "\n".join(lines)
 
@@ -4993,9 +5128,12 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
         # ── 2) 분류표 자동 생성 (LLM 호출 없음) ──
         sess["status"] = "classifying"
         push_stage(sess, 2, "분류표 자동 생성 (LLM 호출 없음)", 25)
-        # 필터링된 화면 기준으로 분류표 생성 (focus_area 가 있으면 그 화면들만)
+        # 필터링된 화면 기준으로 분류표 생성 (focus_area 가 있으면 그 화면들만).
+        # screens 메타까지 넘겨야 SCR md 본문에서 소분류(세부 시나리오)를 자동 추출 가능.
         all_rows = spec_data["screen_rows"]
-        classification = build_classification_from_screen_list(all_rows, project_name)
+        classification = build_classification_from_screen_list(
+            all_rows, project_name, screens_meta=spec_data.get("screens"),
+        )
         classify_path = sess["workspace"] / "04_classification_draft.md"
         classify_path.write_text(classification, encoding="utf-8")
         push_log(sess, f"[분류] 화면 목록 표에서 분류표 자동 생성 — {len(classification):,}자")
