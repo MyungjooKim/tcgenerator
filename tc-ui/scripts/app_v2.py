@@ -824,18 +824,85 @@ def extract_policy_excerpts(policy_full_text: str, ref_keywords: list[str]) -> l
     return excerpts
 
 
-def parse_scr_filter_from_focus(focus_area: str) -> set[str] | None:
-    """focus_area 텍스트에서 SCR ID 패턴을 추출해 필터로 사용.
-    - "SCR-104", "scr-104", "scr_104", "SCR104" 모두 정규화 → "SCR-104"
-    - "SCR-102, SCR-104" 같이 여러 개 OK
-    - 하나도 못 찾으면 None (필터 미적용 = 전체 처리)
+def parse_scr_filter_from_focus(focus_area: str, available_scrs: set[str] | None = None) -> set[str] | None:
+    """focus_area 텍스트에서 SCR ID 패턴을 관대하게 추출해 필터로 사용.
+
+    지원 입력 형식:
+      - 명시: "SCR-104", "scr-104", "scr_104", "SCR104", "SCR 104"
+      - 일괄 (앵커 모드): "SCR-102, 104, 106, 116" → 첫 SCR 발견 후 따라오는 숫자도 SCR ID 로
+      - 범위: "SCR-102~116", "SCR-102 to 116", "SCR-102 - 116"
+        → available_scrs 가 주어지면 그 범위 내 실제 존재 SCR 만 매칭
+      - 영문 접미: "SCR-007A" 그대로 인식
+      - 자연어 섞임: "주문 확인 화면 (SCR-104) 만 만들어줘" OK
+
+    Args:
+        focus_area:      사용자 입력 텍스트
+        available_scrs:  폴더에서 실제 발견된 SCR ID 집합 (예: {"SCR-001","SCR-102",...})
+                         주어지면 범위 표기·숫자 흡수의 유효성 검증에 사용.
+                         None 이면 명시적으로 보인 ID 만 신뢰.
+
+    Returns:
+        - set[str]: 매칭된 SCR ID 들 (예: {"SCR-102","SCR-104"})
+        - None:     SCR 패턴이 하나도 없으면 (필터 미적용 = 전체 처리)
     """
     if not focus_area or not focus_area.strip():
         return None
-    matches = re.findall(r"SCR[-_]?(\w+)", focus_area, re.IGNORECASE)
-    if not matches:
+
+    text = focus_area
+    # 1) 명시적 SCR-XXX 매칭 (영문 접미 가능)
+    explicit = re.findall(r"SCR[\s\-_]*([0-9]+[A-Z]?)", text, re.IGNORECASE)
+    explicit_norm = {f"SCR-{m.upper()}" for m in explicit}
+
+    # 앵커가 하나도 없으면 SCR 모드 아님 → None
+    if not explicit_norm:
         return None
-    return {f"SCR-{m.upper()}" for m in matches}
+
+    # available_scrs 가 주어지면 명시 ID 도 폴더 검증 (잘못 입력한 ID 흡수 방지)
+    if available_scrs:
+        result = explicit_norm & available_scrs
+    else:
+        result = set(explicit_norm)
+
+    # 2) 범위 표기 지원: "SCR-102~116", "102-116", "102 to 116"
+    #    숫자~숫자 / 숫자-숫자 / 숫자 to 숫자 패턴
+    range_matches = re.findall(
+        r"(?:SCR[\s\-_]*)?([0-9]{2,4})\s*(?:~|to|\-\-|—|–)\s*([0-9]{2,4})",
+        text, re.IGNORECASE
+    )
+    if range_matches and available_scrs:
+        for start_s, end_s in range_matches:
+            start, end = int(start_s), int(end_s)
+            if start > end:
+                start, end = end, start
+            # available_scrs 안에서 숫자 부분이 [start, end] 범위에 들어가는 것 추가
+            for sid in available_scrs:
+                m = re.match(r"^SCR-([0-9]+)([A-Z]?)$", sid)
+                if not m:
+                    continue
+                num = int(m.group(1))
+                if start <= num <= end:
+                    result.add(sid)
+
+    # 3) 앵커 모드 — 텍스트에 SCR 가 보였으니 뒤따르는 "그냥 숫자"도 SCR ID 후보로
+    #    예: "SCR-102, 104, 106, 116" → 102, 104, 106, 116 모두
+    #    단, available_scrs 가 주어진 경우에만 (미지의 숫자 흡수 방지).
+    if available_scrs:
+        # 텍스트 안의 모든 2~4자리 숫자 토큰 (앞뒤가 단어 경계)
+        # 단, 범위 표기에서 이미 처리한 숫자는 흡수해도 무방 (set 이라 중복 제거됨)
+        all_nums = re.findall(r"\b([0-9]{2,4})([A-Z]?)\b", text)
+        for num_s, suffix in all_nums:
+            num = int(num_s)
+            # SCR ID 와 매칭되는 형식으로 후보 생성
+            # available_scrs 에는 보통 "SCR-001", "SCR-102", "SCR-007A" 형식
+            candidate_plain = f"SCR-{num_s}{suffix.upper()}"
+            # zero-padding 변형: 102 → 102, 1 → 001 / 12 → 012 도 시도
+            candidate_padded = f"SCR-{num_s.zfill(3)}{suffix.upper()}"
+            for cand in (candidate_plain, candidate_padded):
+                if cand in available_scrs:
+                    result.add(cand)
+                    break
+
+    return result
 
 
 def step_parse_structured_spec(sess: dict, folder_path: str) -> dict:
@@ -4896,7 +4963,10 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
                 })
 
         # ── focus_area 에서 SCR ID 필터 추출 → 화면 한정 처리 ──
-        scr_filter = parse_scr_filter_from_focus(focus_area)
+        # available_scrs 를 함께 넘겨야 "SCR-102, 104, 106" 같은 일괄 표기,
+        # "SCR-102~116" 같은 범위 표기를 정확히 인식할 수 있다.
+        available_scrs = {sc["id"] for sc in spec_data["screens"]}
+        scr_filter = parse_scr_filter_from_focus(focus_area, available_scrs=available_scrs)
         if scr_filter:
             before_screens = len(spec_data["screens"])
             before_rows = len(spec_data["screen_rows"])
@@ -8033,7 +8103,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <textarea id="focusArea" class="form-input" rows="5"
           style="resize:vertical; min-height:110px; font-size:13px; line-height:1.5;"
           oninput="onInputsChanged()"
-          placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리&#10;💡 구조화 spec 모드: SCR-104 또는 SCR-102, SCR-104 처럼 ID를 적으면 해당 화면만 처리"></textarea>
+          placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리&#10;💡 구조화 spec 모드 (관대한 인식):&#10;   • SCR-104 또는 SCR-102, SCR-104, SCR-106 (개별)&#10;   • SCR-102, 104, 106, 116 (일괄 — SCR 한 번만 적어도 OK)&#10;   • SCR-102~116 (범위)"></textarea>
         <div style="font-size:11px; color:var(--muted); margin-top:3px;">
           입력하면 해당 기능에 집중하여 TC를 생성합니다. 여러 기능은 쉼표 또는 줄바꿈으로 구분하세요.
         </div>
