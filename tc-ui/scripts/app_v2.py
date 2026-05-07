@@ -775,6 +775,8 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
 그룹: {screen_meta['group']}
 
 ⚠️ TC ID 형식: `{example_id}`, `{project_code}-{suite_code}-{next_str}`, ... (시작 번호 `{seq_str}`부터 연속 증가)
+⚠️ 시스템 프롬프트의 'TC 생성 카테고리 4가지(UI/주요/예외/에러)'와 비율(20/35/25/20)을 반드시 따르세요.
+   카테고리 3(예외)·4(에러)는 반드시 포함합니다 (Positive 만으로 구성 금지).
 
 ## 화면 명세 (전문 — 이 문서의 내용에서만 TC 작성)
 
@@ -782,10 +784,12 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
 
 {states_block}
 {refs_block}
-위 화면의 모든 상태 케이스와 인터랙션에 대해 TC를 빠짐없이 작성하세요.
-- Normal 상태 → Positive TC (UI/UX 체크 + 주요 기능)
-- Error.* 상태 → Negative TC (에러 처리 패턴은 위 정책 발췌 따라 명시)
-- 비고에 [정책]/[제약]/[접근성] 마커가 있으면 해당 검증 TC도 포함
+위 화면의 모든 상태 케이스·인터랙션·비고 마커를 빠짐없이 TC 로 변환하세요.
+- Normal 상태 → 카테고리 1 (UI/UX) + 카테고리 2 (주요 기능) Positive TC
+- Error.* 상태 → 카테고리 3 (예외) Negative + 카테고리 4 (에러) Edge TC
+- 비고의 [정책]/[제약]/[접근성]/[세션]/[타이밍]/[dev] 마커는 각각 별도 TC 후보
+- 인터랙션의 모든 진입 경로/탭 동작/네비게이션 → 각각 별도 TC
+- 누락 없이 가능한 모든 시나리오를 작성. 응답이 길어지더라도 끝까지 작성하세요.
 """
 
 
@@ -1659,41 +1663,40 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     project_policies = load_project_policies(project_name)
 
     # 1) 시스템 프롬프트 블록 구성 — cache_control 적용
-    # ⚠️ Anthropic 제약: cache_control 블록은 최대 4개. 큰 블록 위주로 캐시 마커 부여하고
-    #    fewshot 같이 작은 블록은 인라인 캐시 (마커 없이 — 앞 블록의 캐시 prefix 에 포함됨)
+    # ⚠️ Anthropic 제약: cache_control 블록은 최대 4개. 큰 블록 위주로 캐시 마커 부여.
+    # ⚠️ 기존 정상 파이프라인과 동일한 가이드(TC 4가지 카테고리, ID/형식 규칙 등)를 사용하기 위해
+    #    build_tc_system_prompt() 를 그대로 호출 → 기능 동등성 보장 (TC 갯수 동일 수준 유지).
     sys_blocks = []
-    base_sys = f"""당신은 전문 소프트웨어 QA 엔지니어입니다. 화면 단위로 정밀한 테스트 케이스를 작성합니다.
-
-## TC 작성 규칙
-{tc_rules if tc_rules else '표준 TC 형식을 따릅니다.'}
-"""
-    # base_sys + fewshot + project_policies 를 1블록으로 합치고 끝에 캐시 마커
-    base_combined = base_sys
-    if fewshot:
-        base_combined += f"\n## 참고 예시 (이 형식과 수준을 따라 작성)\n{fewshot[:5000]}\n"
-    if project_policies:
-        base_combined += f"\n## 프로젝트별 정책 (반드시 준수)\n{project_policies[:6000]}\n"
+    base_system_prompt = build_tc_system_prompt(
+        tc_rules=tc_rules,
+        classification=approved_classification,
+        project_policies=project_policies,
+        fewshot=fewshot,
+    )
     sys_blocks.append({
         "type": "text",
-        "text": base_combined,
-        "cache_control": {"type": "ephemeral"},  # 캐시 #1
+        "text": base_system_prompt,
+        "cache_control": {"type": "ephemeral"},  # 캐시 #1 — 카테고리 가이드 + 분류표 + tc_rules + 프로젝트 정책 + fewshot
     })
     if spec_data.get("policy_text"):
         sys_blocks.append({
             "type": "text",
-            "text": f"\n## 공통 정책 문서 (전문 — 화면이 참조하는 정책)\n{spec_data['policy_text'][:20000]}\n",
+            "text": f"\n## 공통 정책 문서 (구조화 spec 의 policy md 전문)\n{spec_data['policy_text'][:20000]}\n",
             "cache_control": {"type": "ephemeral"},  # 캐시 #2
         })
     if spec_data.get("design_text"):
         sys_blocks.append({
             "type": "text",
-            "text": f"\n## 디자인 시스템 문서 (전문 — 토큰/컴포넌트 참조)\n{spec_data['design_text'][:20000]}\n",
+            "text": f"\n## 디자인 시스템 문서 (구조화 spec 의 design md 전문 — 토큰/컴포넌트 참조)\n{spec_data['design_text'][:20000]}\n",
             "cache_control": {"type": "ephemeral"},  # 캐시 #3
         })
     sys_blocks.append({
         "type": "text",
-        "text": f"\n## 분류표 (사용자 승인 — 최종 진실 소스)\n{approved_classification[:10000]}\n",
-        "cache_control": {"type": "ephemeral"},  # 캐시 #4 — 마지막 마커, 앞 모든 블록 캐시 포함
+        "text": "\n## 화면별 호출 모드 안내\n"
+                "이 호출은 분류표의 **하나의 화면**에 대해서만 TC 를 작성합니다. "
+                "user 메시지에 주어진 SCR 화면 명세에 한정해, 위 'TC 생성 카테고리 4가지'와 비율(20/35/25/20)을 반드시 따르세요. "
+                "카테고리 3(예외)·4(에러)도 반드시 포함합니다.\n",
+        "cache_control": {"type": "ephemeral"},  # 캐시 #4 — 마지막 마커
     })
 
     # 2) 처리 대상 화면 필터링 (selected_domain_codes)
@@ -1784,7 +1787,9 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
             "pct": 55 + int(25 * (idx / max(len(target_screens), 1))),
         })
 
-        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=8192)
+        # max_tokens=16000 — 기존 파이프라인과 동일. 8192 였을 때 카테고리 4 후반부가
+        # 응답 잘림으로 누락돼 화면당 TC 갯수가 절반 수준이던 문제 해결.
+        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=16000)
 
         # 화면별 즉시 저장 — resume 시 여기서 다시 시작
         (per_screen_dir / f"{sc['id']}.md").write_text(tc_draft, encoding="utf-8")
