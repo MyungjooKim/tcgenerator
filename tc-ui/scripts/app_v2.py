@@ -628,7 +628,7 @@ def parse_screen_list_table(overview_md_text: str) -> list[dict]:
     return rows
 
 
-def extract_minors_from_screen_md(md_text: str, max_minors: int = 16) -> list[str]:
+def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[str]:
     """SCR-XXX.md 본문에서 소분류(세부 시나리오) 시드를 규칙 기반으로 추출.
     LLM 호출 없음. 우선순위:
       1. 상태(Status) 표 케이스 — 가장 구조화된 시나리오
@@ -675,6 +675,11 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 16) -> list[st
             if len(cells) >= 1 and cells[0]:
                 # 케이스 라벨 (Normal, Error.network) 을 소분류 시드로
                 add(f"{cells[0]} 상태 표시 및 동작")
+
+    # 1.5) 계산 정확성 — 상태 직후, 다른 카테고리보다 먼저 (max_minors 캡 도달 시 보장)
+    #      도메인 본질이라 우선순위 가장 높음.
+    #      정의는 본 함수 하단에 모아둠 → 여기서는 헬퍼 호출.
+    _add_calc_accuracy_minors(md_text, add, domain_max=8, general_max=6)
 
     # 2) 에러 케이스 표 — | 에러 케이스 | 표시 패턴 | 메시지 | 동작 |
     in_err = False
@@ -733,38 +738,115 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 16) -> list[st
         if body:
             add(f"[{marker}] {body}")
 
-    # 5) 계산 공식 / 수치 변환 — 정확성 검증 누락 방지
-    #    AI 가 "표시된다"로 짧게 처리하기 쉬운 항목들을 별도 소분류로 부각.
-    #    감지 대상:
-    #      - 도메인 약어: ROE, PnL, P&L, Liquidation, Margin, Leverage 와 함께 '계산'·'공식'·'='
-    #      - "= X × Y", "X% × Y" 같은 명시 공식
-    #      - "Est.", "예상", "환산" 같은 추정값
-    calc_patterns = [
-        # (감지 정규식, 라벨 prefix)
-        (r"(ROE)\s*[%％]?\s*[=＝]\s*[^\n]{5,60}",          "계산 정확성 — ROE 산출"),
-        (r"PnL\s*[%％]?\s*[=＝]\s*[^\n]{5,60}",            "계산 정확성 — PnL 산출"),
-        (r"(P&L|P\\&L)\s*[%％]?\s*[=＝]\s*[^\n]{5,60}",    "계산 정확성 — P&L 산출"),
-        (r"Liquidation\s*price\s*[=＝]\s*[^\n]{5,60}",     "계산 정확성 — Liquidation price 산출"),
-        (r"Position\s*size\s*[=＝]\s*[^\n]{5,60}",         "계산 정확성 — Position size 산출"),
-        (r"Margin\s*[=＝]\s*[^\n]{5,60}",                  "계산 정확성 — Margin 산출"),
-        (r"Est\.\s*receive\s*[=＝]\s*[^\n]{5,60}",         "계산 정확성 — Est. receive 산출"),
-        (r"Est\.\s*fee\s*[=＝]\s*[^\n]{5,60}",             "계산 정확성 — Est. fee 산출"),
-    ]
-    for pat, prefix in calc_patterns:
-        if re.search(pat, md_text, re.IGNORECASE):
-            add(prefix)
-
-    # 추가 — 본문에 'X% 계산', 'X 정확성' 같은 자연어 표현이 있으면 일반화 항목
-    if re.search(r"(계산|산출)\s*(정확성|정확도|검증)", md_text):
-        add("계산 결과 수치 정확성 검증")
-    # '실시간 갱신 / 실시간 계산' 패턴 — 단순 표시가 아닌 갱신 동작 검증
-    if re.search(r"실시간\s*(갱신|업데이트|계산|반영)", md_text):
-        add("실시간 데이터 갱신 동작 검증")
-
     # 한도 잘라내기 — 가장 중요한 것 먼저 (위에서 이미 우선순위 순)
     if len(minors) > max_minors:
         minors = minors[:max_minors]
     return minors
+
+
+# ── 계산·표시 정확성 패턴 (extract_minors_from_screen_md + checklist 공유) ──
+# 두 함수가 같은 패턴 셋을 사용하도록 모듈 상수로 분리.
+CALC_DOMAIN_PATTERNS_C = [
+    # (감지 정규식, 라벨 — 소분류용 / 체크리스트용 둘 다 호환되는 단순 라벨)
+    (r"\bROE\b",                                       "ROE 계산 정확성"),
+    (r"\bPnL\b",                                       "PnL 계산 정확성"),
+    (r"P&L|P\\&L",                                     "P&L 계산 정확성"),
+    (r"Liquidation\s*price",                           "Liquidation price 계산 정확성"),
+    (r"(Liquidation|청산)\s*(distance|거리)",          "Liquidation distance 계산 정확성"),
+    (r"Position\s*size",                               "Position size 계산 정확성"),
+    (r"Notional\s*(value)?",                           "Notional value 계산 정확성"),
+    (r"Initial\s*margin|초기\s*증거금",                "Initial margin 계산 정확성"),
+    (r"Maintenance\s*margin|유지\s*증거금",            "Maintenance margin 계산 정확성"),
+    (r"Margin\s*ratio",                                "Margin ratio 계산 정확성"),
+    (r"\b(MMR|IMR)\b",                                 "MMR/IMR 비율 계산 정확성"),
+    (r"Effective\s*leverage|실효\s*레버리지",          "Effective leverage 계산 정확성"),
+    (r"Est\.\s*receive",                               "Est. receive 계산 정확성 (비율별 재계산)"),
+    (r"Est\.\s*fee",                                   "Est. fee 계산 정확성"),
+    (r"Maker\s*fee|maker_fee",                         "Maker fee 계산 정확성"),
+    (r"Taker\s*fee|taker_fee",                         "Taker fee 계산 정확성"),
+    (r"Funding\s*fee",                                 "Funding fee 계산 정확성"),
+    (r"Funding\s*rate|펀딩\s*레이트",                  "Funding rate 계산 정확성"),
+    (r"Mark\s*price",                                  "Mark price 갱신 정확성"),
+    (r"Index\s*price",                                 "Index price 갱신 정확성"),
+    (r"Last\s*price",                                  "Last price 갱신 정확성"),
+    (r"\bSpread\b",                                    "Spread 계산 정확성"),
+    (r"Available\s*balance|가용\s*잔고",               "Available balance 정확성"),
+    (r"Total\s*equity|총\s*자산",                      "Total equity 정확성"),
+    (r"Locked\s*margin",                               "Locked margin 정확성"),
+    (r"Free\s*margin",                                 "Free margin 정확성"),
+    (r"Total\s*Unrealized\s*P&?L",                     "Total Unrealized P&L 정확성"),
+    (r"Daily\s*(PnL|ROI)|일일\s*(수익|손익)",          "Daily PnL/ROI 정확성"),
+    (r"\bSlippage\b",                                  "Slippage 계산 정확성"),
+    (r"Filled\s*(amount|qty)",                         "Filled amount 정확성"),
+    (r"(Average|Avg)\s*price",                         "Avg price 계산 정확성"),
+    (r"Δ\s*[%％]",                                     "Δ% 산출 정확성"),
+]
+
+CALC_GENERAL_CATEGORIES_C_PLUS = [
+    ("정렬 동작 정확성 (asc/desc 토글, 기본 정렬)", [
+        r"asc\s*↔\s*desc|asc\s*/\s*desc|toggle.*Sort\b|정렬\s*토글",
+        r"기본\s*정렬|default\s*sort\b",
+        r"sort\s*indicator|정렬\s*[표기지표]",
+    ]),
+    ("표시 형식 변환 정확성 (K/M/B 단위, 통화 포맷)", [
+        r"\$[0-9]+\.?[0-9]*\s*[KMB]\b",
+        r"_format\w+|format\w*Volume|format\w*Price|format\w*Number",
+        r"K\s*/\s*M\s*/\s*B|단위\s*변환",
+    ]),
+    ("색상 분기 정확성 (양수·음수·danger 임계)", [
+        r"양수[^\n]{0,15}(초록|green|accent-(primary|buy))",
+        r"음수[^\n]{0,15}(빨강|red|accent-sell|sell)",
+        r"위험|danger|경고[^\n]{0,15}(빨강|red|색상)",
+        r"≤\s*\d+\s*[%％]|≥\s*\d+\s*[%％]",
+    ]),
+    ("검색·필터 매칭 정확성", [
+        r"filterList|검색.*(매칭|일치|결과)|search.*(match|filter)",
+        r"부분\s*일치|prefix\s*match|substring",
+    ]),
+    ("실시간 갱신 주기 정확성 (tick rate, throttle)", [
+        r"초당\s*\d+(\s*[~∼\-]\s*\d+)?\s*회",
+        r"\d+\s*ms\s*(throttle|debounce|간격)",
+        r"tick\b.*수신|WebSocket.*tick",
+    ]),
+    ("시간 기반 트리거 정확성 (타임아웃·카운트다운·백오프)", [
+        r"\d+\s*초\s*(후|동안|이내|타임아웃|쿨다운|countdown)",
+        r"\d+\s*분\s*(후|동안|이내|타임아웃)",
+        r"카운트다운|countdown|backoff",
+    ]),
+]
+
+
+def _add_calc_accuracy_minors(md_text: str, add_fn, domain_max: int = 8, general_max: int = 6) -> None:
+    """계산·표시 정확성 항목을 add_fn 으로 등록.
+    extract_minors_from_screen_md 안에서 상태 표 직후 호출하면 우선순위 가장 높음.
+    domain_max: 코인 선물 도메인 패턴 최대 갯수 (한 화면당)
+    general_max: 일반 카테고리 최대 갯수 (한 화면당)
+    """
+    # C 도메인 (코인 선물)
+    domain_count = 0
+    for pat, label in CALC_DOMAIN_PATTERNS_C:
+        if re.search(pat, md_text, re.IGNORECASE):
+            add_fn(f"계산 정확성 — {label.replace(' 계산 정확성', '').replace(' 정확성', '')}")
+            domain_count += 1
+            if domain_count >= domain_max:
+                break
+
+    # C+ 일반 카테고리
+    general_count = 0
+    for label, patterns in CALC_GENERAL_CATEGORIES_C_PLUS:
+        for pat in patterns:
+            if re.search(pat, md_text, re.IGNORECASE):
+                add_fn(label)
+                general_count += 1
+                break  # 카테고리당 1번만 (다른 패턴 매칭은 카테고리 1개로 통합)
+        if general_count >= general_max:
+            break
+
+    # 자연어 폴백
+    if re.search(r"(계산|산출)\s*(정확성|정확도|검증)", md_text):
+        add_fn("본문 명시 계산 정확성 검증")
+    if re.search(r"실시간\s*(갱신|업데이트|계산|반영)", md_text):
+        add_fn("실시간 데이터 갱신 동작 검증")
 
 
 def build_classification_from_screen_list(screen_rows: list[dict], project_name: str,
@@ -1026,29 +1108,31 @@ def _build_checklist_from_screen_meta(screen_meta: dict) -> str:
             if counter_r >= 6:
                 break
 
-    # 계산 정확성 — C1, C2, ... (정책 A 보강: AI 가 "표시된다" 로 흡수하기 쉬운 항목 명시화)
+    # 계산·표시 정확성 — C1, C2, ... (extract_minors 와 동일한 모듈 상수 재사용)
+    # 응답 말미 자체 검증 강제 → AI 가 "표시된다" 한 줄로 흡수하지 못하게 함.
     counter_c = 0
     raw_text = screen_meta.get("raw", "")
-    calc_checks = [
-        (r"ROE\s*[%％]?\s*[=＝]", "ROE 계산 정확성 (공식 적용 검증)"),
-        (r"PnL\s*[%％]?\s*[=＝]|P&L\s*[%％]?\s*[=＝]", "PnL 계산 정확성"),
-        (r"Liquidation\s*price\s*[=＝]", "Liquidation price 계산 정확성"),
-        (r"Position\s*size\s*[=＝]", "Position size 계산 정확성"),
-        (r"Margin\s*[=＝]", "Margin 계산 정확성"),
-        (r"Est\.\s*receive\s*[=＝]", "Est. receive 계산 정확성 (비율별 재계산)"),
-        (r"Est\.\s*fee\s*[=＝]", "Est. fee 계산 정확성"),
-    ]
-    for pat, label in calc_checks:
+
+    # C 도메인 (코인 선물) — 한 화면당 최대 12개
+    for pat, label in CALC_DOMAIN_PATTERNS_C:
+        if counter_c >= 12:
+            break
         if re.search(pat, raw_text, re.IGNORECASE):
             counter_c += 1
             items.append(f"C{counter_c}. {label}")
-            if counter_c >= 6:
+
+    # C+ 일반 6 카테고리 (각 카테고리당 1번)
+    for label, patterns in CALC_GENERAL_CATEGORIES_C_PLUS:
+        for pat in patterns:
+            if re.search(pat, raw_text, re.IGNORECASE):
+                counter_c += 1
+                items.append(f"C{counter_c}. {label}")
                 break
-    # 일반 '계산 / 산출 정확성' 키워드
+
+    # 자연어 폴백
     if re.search(r"(계산|산출)\s*(정확성|정확도|검증)", raw_text):
         counter_c += 1
         items.append(f"C{counter_c}. 본문 명시 계산 항목 정확성 검증")
-    # 실시간 갱신
     if re.search(r"실시간\s*(갱신|업데이트|계산|반영)", raw_text):
         counter_c += 1
         items.append(f"C{counter_c}. 실시간 데이터 갱신 동작 검증")
