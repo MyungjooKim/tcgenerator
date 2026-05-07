@@ -628,15 +628,16 @@ def parse_screen_list_table(overview_md_text: str) -> list[dict]:
     return rows
 
 
-def extract_minors_from_screen_md(md_text: str, max_minors: int = 12) -> list[str]:
+def extract_minors_from_screen_md(md_text: str, max_minors: int = 16) -> list[str]:
     """SCR-XXX.md 본문에서 소분류(세부 시나리오) 시드를 규칙 기반으로 추출.
     LLM 호출 없음. 우선순위:
       1. 상태(Status) 표 케이스 — 가장 구조화된 시나리오
       2. 에러 케이스 표
       3. [dev] 인터랙션 항목
       4. 비고의 [정책]/[제약]/[접근성]/[세션] 마커
+      5. 계산 공식 / 수치 변환 — ROE, Est., 공식, "= X × Y" 패턴 (정확성 검증 누락 방지)
     너무 많아지면 max_minors 까지 자른다.
-    각 항목은 짧은 한국어 라벨(35자 이내)로 정규화.
+    각 항목은 짧은 한국어 라벨(50자 이내)로 정규화.
     """
     minors: list[str] = []
     seen_keys: set[str] = set()  # 중복 제거용 (소문자 정규화 비교)
@@ -731,6 +732,34 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 12) -> list[st
         body = re.split(r"[.。]", body)[0].strip(" ·-")
         if body:
             add(f"[{marker}] {body}")
+
+    # 5) 계산 공식 / 수치 변환 — 정확성 검증 누락 방지
+    #    AI 가 "표시된다"로 짧게 처리하기 쉬운 항목들을 별도 소분류로 부각.
+    #    감지 대상:
+    #      - 도메인 약어: ROE, PnL, P&L, Liquidation, Margin, Leverage 와 함께 '계산'·'공식'·'='
+    #      - "= X × Y", "X% × Y" 같은 명시 공식
+    #      - "Est.", "예상", "환산" 같은 추정값
+    calc_patterns = [
+        # (감지 정규식, 라벨 prefix)
+        (r"(ROE)\s*[%％]?\s*[=＝]\s*[^\n]{5,60}",          "계산 정확성 — ROE 산출"),
+        (r"PnL\s*[%％]?\s*[=＝]\s*[^\n]{5,60}",            "계산 정확성 — PnL 산출"),
+        (r"(P&L|P\\&L)\s*[%％]?\s*[=＝]\s*[^\n]{5,60}",    "계산 정확성 — P&L 산출"),
+        (r"Liquidation\s*price\s*[=＝]\s*[^\n]{5,60}",     "계산 정확성 — Liquidation price 산출"),
+        (r"Position\s*size\s*[=＝]\s*[^\n]{5,60}",         "계산 정확성 — Position size 산출"),
+        (r"Margin\s*[=＝]\s*[^\n]{5,60}",                  "계산 정확성 — Margin 산출"),
+        (r"Est\.\s*receive\s*[=＝]\s*[^\n]{5,60}",         "계산 정확성 — Est. receive 산출"),
+        (r"Est\.\s*fee\s*[=＝]\s*[^\n]{5,60}",             "계산 정확성 — Est. fee 산출"),
+    ]
+    for pat, prefix in calc_patterns:
+        if re.search(pat, md_text, re.IGNORECASE):
+            add(prefix)
+
+    # 추가 — 본문에 'X% 계산', 'X 정확성' 같은 자연어 표현이 있으면 일반화 항목
+    if re.search(r"(계산|산출)\s*(정확성|정확도|검증)", md_text):
+        add("계산 결과 수치 정확성 검증")
+    # '실시간 갱신 / 실시간 계산' 패턴 — 단순 표시가 아닌 갱신 동작 검증
+    if re.search(r"실시간\s*(갱신|업데이트|계산|반영)", md_text):
+        add("실시간 데이터 갱신 동작 검증")
 
     # 한도 잘라내기 — 가장 중요한 것 먼저 (위에서 이미 우선순위 순)
     if len(minors) > max_minors:
@@ -997,6 +1026,33 @@ def _build_checklist_from_screen_meta(screen_meta: dict) -> str:
             if counter_r >= 6:
                 break
 
+    # 계산 정확성 — C1, C2, ... (정책 A 보강: AI 가 "표시된다" 로 흡수하기 쉬운 항목 명시화)
+    counter_c = 0
+    raw_text = screen_meta.get("raw", "")
+    calc_checks = [
+        (r"ROE\s*[%％]?\s*[=＝]", "ROE 계산 정확성 (공식 적용 검증)"),
+        (r"PnL\s*[%％]?\s*[=＝]|P&L\s*[%％]?\s*[=＝]", "PnL 계산 정확성"),
+        (r"Liquidation\s*price\s*[=＝]", "Liquidation price 계산 정확성"),
+        (r"Position\s*size\s*[=＝]", "Position size 계산 정확성"),
+        (r"Margin\s*[=＝]", "Margin 계산 정확성"),
+        (r"Est\.\s*receive\s*[=＝]", "Est. receive 계산 정확성 (비율별 재계산)"),
+        (r"Est\.\s*fee\s*[=＝]", "Est. fee 계산 정확성"),
+    ]
+    for pat, label in calc_checks:
+        if re.search(pat, raw_text, re.IGNORECASE):
+            counter_c += 1
+            items.append(f"C{counter_c}. {label}")
+            if counter_c >= 6:
+                break
+    # 일반 '계산 / 산출 정확성' 키워드
+    if re.search(r"(계산|산출)\s*(정확성|정확도|검증)", raw_text):
+        counter_c += 1
+        items.append(f"C{counter_c}. 본문 명시 계산 항목 정확성 검증")
+    # 실시간 갱신
+    if re.search(r"실시간\s*(갱신|업데이트|계산|반영)", raw_text):
+        counter_c += 1
+        items.append(f"C{counter_c}. 실시간 데이터 갱신 동작 검증")
+
     if not items:
         return ""
     return "\n".join(items)
@@ -1095,6 +1151,37 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
 - 비고의 [정책]/[제약]/[접근성]/[세션]/[타이밍]/[dev] 마커는 각각 별도 TC 후보
 - 인터랙션의 모든 진입 경로/탭 동작/네비게이션 → 각각 별도 TC
 - 누락 없이 가능한 모든 시나리오를 작성. 응답이 길어지더라도 끝까지 작성하세요.
+
+## ⚠️ 계산 정확성 별도 TC 의무 (자주 누락되는 항목)
+
+화면 명세에 **수치 계산·공식·환산** 이 등장하면 **고유 정확성 TC를 별도로** 작성하세요.
+"표시된다" 같은 한 줄 검증으로 흡수하지 말고 독립 TC 로 분리:
+
+대표 패턴:
+- `ROE = ...`, `PnL = ...`, `Liquidation price = ...`, `Position size = Margin × Leverage` 같은 공식
+- `Est. receive = (포지션 × 비율%) − 수수료` 같은 추정값 재계산
+- `실시간 갱신`, `Δ% 산출`, `백분율 변환` 등 동적 계산
+
+각 공식별 TC 형식 예시:
+```
+### {{ID}} — ROE 계산 정확성 확인
+
+| 분류 | Positive |
+| 우선순위 | Medium |
+
+**사전 조건**
+1. 포지션이 1개 이상 존재하는 상태
+2. 입력 증거금 100 USDT, Leverage 10x 인 상태
+
+**테스트 단계**
+포지션의 ROE 표시값과 (현재 PnL / 투입 증거금 × 100) 공식 결과를 비교한다.
+
+**예상 결과**
+- 표시된 ROE % 값이 공식 계산 결과와 ±0.01% 오차 이내로 일치한다.
+- 가격 변동 시 ROE % 가 실시간으로 재계산된다.
+```
+
+이런 정확성 TC 는 우선순위 Medium 이라도 반드시 포함하세요.
 
 ## ⚠️ 중복 통합 원칙 (반드시 준수)
 
