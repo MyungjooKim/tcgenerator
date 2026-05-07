@@ -1092,6 +1092,35 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
 - 비고의 [정책]/[제약]/[접근성]/[세션]/[타이밍]/[dev] 마커는 각각 별도 TC 후보
 - 인터랙션의 모든 진입 경로/탭 동작/네비게이션 → 각각 별도 TC
 - 누락 없이 가능한 모든 시나리오를 작성. 응답이 길어지더라도 끝까지 작성하세요.
+
+## ⚠️ 중복 통합 원칙 (반드시 준수)
+
+**같은 화면 안에서 동일한 검증 결과를 갖는 트리거가 여러 개라면 1개의 TC 로 통합** 하세요.
+대표 예시:
+- "Cancel 버튼 탭" 과 "배경 오버레이 탭" 둘 다 → "시트 닫힘 + SCR-102 복귀"
+  → ❌ 별도 TC 2개로 만들지 말고, ✅ TC 1개로 통합 + 테스트 단계에 두 동작 모두 명시
+
+통합 형식 예시:
+```
+### {{ID}} — Order Confirm 시트 닫기 (Cancel 버튼 또는 배경 오버레이 탭)
+
+**테스트 단계**
+다음 중 하나를 수행한다:
+1. Cancel 버튼을 탭한다
+2. 시트 외부 배경 오버레이를 탭한다
+
+**예상 결과**
+- 시트가 닫히고 SCR-102 Lite Trade 화면으로 복귀한다
+- 두 진입 모두 동일한 결과 (AppState 변경 없음)
+```
+
+판단 기준:
+- 검증 결과(예상 결과)가 100% 동일 → 통합 권장
+- 검증 결과가 일부 다르거나 부수 효과(로그·이벤트 등)가 다름 → 별도 TC 유지
+- 사전 조건이 다른 경우 → 별도 TC 유지 (사전 조건이 다르면 같은 결과여도 별도 검증 필요)
+
+이 통합 원칙은 양을 줄이는 것이 목적이 아니라 **테스터 가독성과 유지보수성** 을 위한 것입니다.
+의미 있는 검증이 사라지면 안 되고, 단지 "동일 검증의 트리거 중복" 만 합치는 것입니다.
 """
 
 
@@ -2236,6 +2265,31 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     draft_path = sess["workspace"] / "tc_draft_per_screen.md"
     draft_path.write_text(merged, encoding="utf-8")
     push_log(sess, f"[화면별 TC 작성] 전체 완료 — 화면 {len(target_screens)}개, TC {total_tc}개")
+
+    # 정책 A 후처리 검증: 같은 화면 안에서 예상 결과가 동일한 TC 의심 그룹 검출.
+    # 자동 병합은 하지 않고 리포트로만 알림 (false positive 위험).
+    try:
+        dup_report = detect_same_result_duplicates(merged)
+        if dup_report["total_suspect"] > 0:
+            report_path = sess["workspace"] / "duplicate_suspects.md"
+            lines = ["# 중복 의심 TC 그룹 (검토 필요)\n"]
+            lines.append(f"동일 화면 내 같은 검증 결과를 갖는 TC 그룹 {len(dup_report['groups'])}개 / 통합 가능 TC {dup_report['total_suspect']}개\n")
+            for i, g in enumerate(dup_report["groups"], 1):
+                lines.append(f"\n## 그룹 {i} — {g['middle']}\n")
+                lines.append(f"**공통 예상 결과**: {g['common_result']}\n")
+                lines.append("**해당 TC**:")
+                for tc in g["tcs"]:
+                    lines.append(f"- `{tc['id']}` — {tc['title']}")
+                lines.append("\n→ 검토 후 1개로 통합하고 테스트 단계에 다른 트리거를 추가하는 것을 권장")
+            report_path.write_text("\n".join(lines), encoding="utf-8")
+            push_log(sess,
+                f"⚠️ [중복 의심] 같은 화면 내 동일 결과 TC {dup_report['total_suspect']}개 검출 — "
+                f"{report_path.name} 참고")
+        # 세션에 저장 — UI 알림용
+        sess["_dup_same_result_report"] = dup_report
+    except Exception as e:
+        push_log(sess, f"[중복 검증] 스킵: {e}")
+
     return merged, total_tc
 
 
@@ -2846,6 +2900,89 @@ def resolve_screen_navigation(middle_name: str, screen_map: dict) -> str:
     if isinstance(entry, dict):
         return entry.get("navigation", "")
     return ""
+
+
+def detect_same_result_duplicates(tc_md: str) -> dict:
+    """같은 화면 안에서 '예상 결과' 가 거의 동일한 TC 그룹을 검출.
+
+    정책 A 의 후처리 안전망: AI 가 통합을 안 했을 경우 검토자가 확인할 수 있도록
+    의심 그룹을 리포트로 만든다. 자동 병합은 하지 않음 (false positive 위험).
+
+    매칭 기준:
+      - 같은 대분류 + 같은 중분류 (= 같은 화면)
+      - 사전 조건의 핵심 줄 1~3 개가 같음 (마지막 줄 "...상태" 정규화 비교)
+      - 예상 결과의 핵심 결과 1~2개가 같음 (불릿 정규화 후 80% 이상 일치)
+
+    Returns:
+        {
+          "groups": [
+            {
+              "middle": "Order Confirm",
+              "common_result": "시트가 닫히고 SCR-102 로 복귀한다",
+              "tcs": [
+                {"id": "SM-TRAD-012", "title": "Cancel 버튼 탭으로 시트 닫기"},
+                {"id": "SM-TRAD-013", "title": "배경 오버레이 탭으로 시트 닫기"},
+              ],
+            },
+            ...
+          ],
+          "total_suspect": 4,    # 통합 대상이 될 수 있는 TC 수
+        }
+    """
+    from collections import defaultdict
+
+    # TC 블록 파싱 — 각 TC 의 (대분류, 중분류, 예상 결과 정규화) 추출
+    tc_blocks = re.split(r"\n(?=###\s)", tc_md)
+    tcs_by_screen: dict[tuple[str, str], list[dict]] = defaultdict(list)
+
+    for block in tc_blocks:
+        if not block.strip().startswith("### "):
+            continue
+        # TC ID 추출
+        m_id = re.search(r"###\s+\*?\*?([A-Z]+-[A-Z]+-\d+)", block)
+        if not m_id:
+            continue
+        tc_id = m_id.group(1)
+        # 제목
+        m_title = re.search(r"###\s+\*?\*?[A-Z]+-[A-Z]+-\d+\*?\*?\s*[—\-]\s*(.+)", block)
+        title = m_title.group(1).strip() if m_title else ""
+        # 대/중분류
+        m_major = re.search(r"\|\s*대분류\s*\|\s*([^|]+?)\s*\|", block)
+        m_middle = re.search(r"\|\s*중분류\s*\|\s*([^|]+?)\s*\|", block)
+        major = m_major.group(1).strip() if m_major else ""
+        middle = m_middle.group(1).strip() if m_middle else ""
+        # 예상 결과 — 첫 2줄만 (핵심 검증 지표)
+        m_then = re.search(r"\*\*예상\s*결과\*\*\s*\n((?:[^\n]+\n){1,5})", block)
+        then_lines = []
+        if m_then:
+            for line in m_then.group(1).split("\n"):
+                norm = re.sub(r"^[\-\*\d.\s]+", "", line).strip()
+                norm = re.sub(r"\s+", " ", norm)
+                # 의미 없는 짧은 줄 제외
+                if len(norm) >= 8:
+                    then_lines.append(norm)
+        # 핵심 결과 키 (앞 2줄)
+        result_key = " | ".join(sorted(then_lines[:2])) if then_lines else ""
+        if not result_key or not middle:
+            continue
+
+        tcs_by_screen[(major, middle, result_key)].append({
+            "id": tc_id, "title": title,
+        })
+
+    # 같은 키에 2개 이상 → 의심 그룹
+    groups = []
+    total_suspect = 0
+    for (major, middle, result_key), tcs in tcs_by_screen.items():
+        if len(tcs) >= 2:
+            groups.append({
+                "middle": middle,
+                "common_result": result_key[:120] + ("..." if len(result_key) > 120 else ""),
+                "tcs": tcs,
+            })
+            total_suspect += len(tcs) - 1  # 통합 시 줄어들 수
+
+    return {"groups": groups, "total_suspect": total_suspect}
 
 
 def detect_duplicate_error_tcs(tc_md: str) -> dict:
