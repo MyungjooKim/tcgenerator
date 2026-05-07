@@ -1075,6 +1075,9 @@ def build_screen_user_prompt(screen_meta: dict, project_name: str, project_code:
 ⚠️ TC ID 형식: `{example_id}`, `{project_code}-{suite_code}-{next_str}`, ... (시작 번호 `{seq_str}`부터 연속 증가)
 ⚠️ 시스템 프롬프트의 'TC 생성 카테고리 4가지(UI/주요/예외/에러)'와 비율(20/35/25/20)을 반드시 따르세요.
    카테고리 3(예외)·4(에러)는 반드시 포함합니다 (Positive 만으로 구성 금지).
+⚠️ **대분류 값은 아래 분류표의 `## 대분류:` 헤더 그대로 사용** — 임의 prefix/접두자/번호 추가 절대 금지
+   (예: 분류표가 `Trade` 면 모든 TC 의 대분류 컬럼도 정확히 `Trade`. `02.Trade`, `[Trade]`,
+   `Group-Trade` 같이 변형하면 시트가 잘못 분리됨. 원칙 G 통합 TC 도 동일.)
 
 {classification_block}
 ## 화면 명세 (전문 — 이 문서의 내용에서만 TC 작성)
