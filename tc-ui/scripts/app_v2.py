@@ -8361,9 +8361,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Step 2~4: 파이프라인 통합 카드 (Gate는 별도 card3에서 사용자 개입) -->
   <div class="card hidden" id="card2">
-    <div class="card-title">
-      <span id="pipelineCardTitle">⚙️ 파이프라인 실행</span>
-      <span class="badge" id="pipelineCardBadge">Step 2</span>
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+      <span>
+        <span id="pipelineCardTitle">⚙️ 파이프라인 실행</span>
+        <span class="badge" id="pipelineCardBadge">Step 2</span>
+      </span>
+      <button type="button" onclick="restartFromScratch()"
+              style="padding:6px 12px;font-size:12px;background:#F1F5F9;color:#1F2937;border:1px solid #94A3B8;border-radius:6px;cursor:pointer;font-weight:500;">
+        ← 처음으로 (입력 변경)
+      </button>
     </div>
 
     <div class="substeps">
@@ -8390,7 +8396,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Step 3: Human Gate 카드 -->
   <div class="card hidden" id="card3">
-    <div class="card-title" id="gateTitle">🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span></div>
+    <div class="card-title" id="gateTitle" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+      <span>🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span></span>
+      <span style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button type="button" onclick="restartFromScratch()"
+                style="padding:6px 12px;font-size:12px;background:#F1F5F9;color:#1F2937;border:1px solid #94A3B8;border-radius:6px;cursor:pointer;font-weight:500;">
+          ← 처음으로 (입력 변경)
+        </button>
+      </span>
+    </div>
     <div class="info-box" id="gateInfoBox">
       AI가 생성한 분류표입니다. 하단 AI 도우미로 수정을 요청하고, 아래 표에서 결과를 확인한 뒤 승인하세요.
     </div>
