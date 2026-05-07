@@ -8621,13 +8621,42 @@ async function onProjectDropdownChange() {
     if (d2.ok && d2.has_sources && d2.sources.length > 0) {
       sources = [];
       sourceCounter = 0;
+      // spec_folder / spec_folder_prev 타입은 일반 입력 소스가 아니라 구조화 모드 박스로 분리
+      var specFolderEntry = null;
+      var specFolderPrevEntry = null;
       d2.sources.forEach(function(s) {
+        if (s.type === 'spec_folder') { specFolderEntry = s; return; }
+        if (s.type === 'spec_folder_prev') { specFolderPrevEntry = s; return; }
         var id = ++sourceCounter;
         sources.push({ id: id, type: s.type, content: s.content || '', selected_files: s.selected_files || null });
       });
       renderSources();
+
+      // 구조화 spec 폴더 자동 복원 — 박스 토글 ON + 경로 채움
+      if (specFolderEntry) {
+        var box = document.getElementById('specFolderBox');
+        var pathEl = document.getElementById('specFolderPath');
+        if (pathEl) pathEl.value = specFolderEntry.content || '';
+        if (box && box.style.display === 'none') {
+          // toggleSpecFolderMode() 호출과 동일 효과
+          if (typeof toggleSpecFolderMode === 'function') toggleSpecFolderMode();
+        }
+        // 이전 폴더가 있으면 diff 박스도 자동 복원
+        if (specFolderPrevEntry) {
+          var diffBox = document.getElementById('diffBox');
+          var prevEl = document.getElementById('prevSpecFolderPath');
+          if (prevEl) prevEl.value = specFolderPrevEntry.content || '';
+          if (diffBox && diffBox.style.display === 'none' && typeof toggleDiffMode === 'function') {
+            toggleDiffMode();
+          }
+        }
+      }
+
       if (d2.focus_area) prevFocus = d2.focus_area;  // state의 값과 sources의 값 중 존재하는 것
-      showToast('이전 소스 ' + d2.sources.length + '개를 불러왔습니다.');
+      var loadedCount = sources.length + (specFolderEntry ? 1 : 0) + (specFolderPrevEntry ? 1 : 0);
+      var msg = '이전 소스 ' + loadedCount + '개를 불러왔습니다.';
+      if (specFolderEntry) msg += ' (📁 구조화 spec 폴더 모드)';
+      showToast(msg);
     }
   } catch(e) {}
 
@@ -9866,7 +9895,10 @@ function renderSources() {
   empty && empty.classList.add('hidden');
   list.innerHTML = sources.map(src => {
     const badgeClass = src.type;
-    const badges = { pdf: '📄 PDF', url: '🔗 GitHub URL', web: '🌐 웹 URL', md: '📝 마크다운', text: '✏️ 텍스트' };
+    const badges = {
+      pdf: '📄 PDF', url: '🔗 GitHub URL', web: '🌐 웹 URL', md: '📝 마크다운', text: '✏️ 텍스트',
+      spec_folder: '📁 구조화 spec 폴더', spec_folder_prev: '📁 이전 spec 폴더'
+    };
     let body = '';
     if (src.type === 'pdf') {
       body = src.content
