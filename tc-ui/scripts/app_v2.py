@@ -1659,41 +1659,41 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     project_policies = load_project_policies(project_name)
 
     # 1) 시스템 프롬프트 블록 구성 — cache_control 적용
+    # ⚠️ Anthropic 제약: cache_control 블록은 최대 4개. 큰 블록 위주로 캐시 마커 부여하고
+    #    fewshot 같이 작은 블록은 인라인 캐시 (마커 없이 — 앞 블록의 캐시 prefix 에 포함됨)
     sys_blocks = []
     base_sys = f"""당신은 전문 소프트웨어 QA 엔지니어입니다. 화면 단위로 정밀한 테스트 케이스를 작성합니다.
 
 ## TC 작성 규칙
 {tc_rules if tc_rules else '표준 TC 형식을 따릅니다.'}
 """
-    sys_blocks.append({"type": "text", "text": base_sys})
-    if project_policies:
-        sys_blocks.append({
-            "type": "text",
-            "text": f"\n## 프로젝트별 정책 (반드시 준수)\n{project_policies[:6000]}\n",
-            "cache_control": {"type": "ephemeral"},
-        })
+    # base_sys + fewshot + project_policies 를 1블록으로 합치고 끝에 캐시 마커
+    base_combined = base_sys
     if fewshot:
-        sys_blocks.append({
-            "type": "text",
-            "text": f"\n## 참고 예시 (이 형식과 수준을 따라 작성)\n{fewshot[:5000]}\n",
-            "cache_control": {"type": "ephemeral"},
-        })
+        base_combined += f"\n## 참고 예시 (이 형식과 수준을 따라 작성)\n{fewshot[:5000]}\n"
+    if project_policies:
+        base_combined += f"\n## 프로젝트별 정책 (반드시 준수)\n{project_policies[:6000]}\n"
+    sys_blocks.append({
+        "type": "text",
+        "text": base_combined,
+        "cache_control": {"type": "ephemeral"},  # 캐시 #1
+    })
     if spec_data.get("policy_text"):
         sys_blocks.append({
             "type": "text",
             "text": f"\n## 공통 정책 문서 (전문 — 화면이 참조하는 정책)\n{spec_data['policy_text'][:20000]}\n",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": {"type": "ephemeral"},  # 캐시 #2
         })
     if spec_data.get("design_text"):
         sys_blocks.append({
             "type": "text",
             "text": f"\n## 디자인 시스템 문서 (전문 — 토큰/컴포넌트 참조)\n{spec_data['design_text'][:20000]}\n",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": {"type": "ephemeral"},  # 캐시 #3
         })
     sys_blocks.append({
         "type": "text",
         "text": f"\n## 분류표 (사용자 승인 — 최종 진실 소스)\n{approved_classification[:10000]}\n",
-        "cache_control": {"type": "ephemeral"},
+        "cache_control": {"type": "ephemeral"},  # 캐시 #4 — 마지막 마커, 앞 모든 블록 캐시 포함
     })
 
     # 2) 처리 대상 화면 필터링 (selected_domain_codes)
