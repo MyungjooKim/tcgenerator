@@ -4975,20 +4975,21 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
             selected_domain_codes=selected,
         )
 
-        # ── 5) Review (선택) — 기존 step_review 그대로 재사용 ──
+        # ── 5) Review (선택) — step_review 는 검토 보고서를 별도 파일로 저장.
+        #    반환값은 검토 보고서 텍스트이므로 TC 본문 자리에 쓰면 안 된다.
         sess["status"] = "reviewing"
         push_stage(sess, 5, "TC 검토 / 정리", 82)
-        reviewed = step_review(sess, merged_tc, project_name) if 'step_review' in globals() else merged_tc
+        try:
+            step_review(sess, merged_tc, project_name)
+        except Exception as e:
+            push_log(sess, f"[검토] 스킵 — {e}")
 
-        tc_final_path = sess["workspace"] / "tc_final.md"
-        tc_final_path.write_text(reviewed, encoding="utf-8")
-
-        # ── 6) Excel 빌드 ──
+        # ── 6) Excel 빌드 — step_build_excel 이 내부에서 tc_final.md 도 직접 생성한다.
         sess["status"] = "building_excel"
         push_stage(sess, 6, "Excel 빌드", 92)
         # total_tc 는 step_write_tc_per_screen 에서 받은 값이 정확. min_tc 는 표준 35% 공식.
         min_tc = max(1, round(total_tc * 0.35))
-        result_file = step_build_excel(sess, reviewed, project_name, total_tc, min_tc)
+        result_file = step_build_excel(sess, merged_tc, project_name, total_tc, min_tc)
         sess["result"] = str(result_file)
 
         sess["status"] = "done"
