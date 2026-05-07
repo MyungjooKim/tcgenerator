@@ -754,8 +754,9 @@ def build_classification_from_screen_list(screen_rows: list[dict], project_name:
         lines.append(f"## 대분류: {major}")
         lines.append("")
         for s in screens:
-            # 중분류 = 화면 ID + 화면명
-            screen_label = f"{s['id']} {s['name']}".strip()
+            # 중분류 = 화면명만 (화면 코드는 별도 '화면 코드' 컬럼에서 보여짐 → 중복 제거).
+            # 화면명이 비어있는 폴백 케이스에서만 ID 를 사용.
+            screen_label = (s["name"] or s["id"]).strip()
             lines.append(f"### 중분류: {screen_label}")
             lines.append("")
             lines.append("#### 소분류")
