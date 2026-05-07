@@ -9,6 +9,65 @@
 
 ---
 
+## v0.10.1 — 2026-05-07 (TC ID 화면 단위 리셋 + 계산·표시 정확성 패턴 보강)
+
+> **요약 (패치)**: v0.10.0 의 구조화 spec 모드 운영 중 발견한 버그·누락·요구사항 6건을 일괄 정정. TC ID 가 화면별 001~로 정확히 리셋되고, 코인 선물 거래소의 핵심 계산·표시 정확성 항목(ROE/PnL/Funding rate/정렬/색상 분기 등) 36 패턴이 자동 검출된다.
+
+### 🆔 TC ID 화면(SCR) 단위 001~ 리셋 (기존 인프라 재사용)
+
+**증상**: 같은 대분류(Trade)의 여러 화면 일괄 처리 시 `SM-LIT-001..035 / SM-LIT-036..091` 처럼 다른 화면임에도 ID가 누적 증가.
+
+**수정 (e63418b → 4b4a9ba)**: 이미 정의된 `tc-rules.md §2-1 유형 B (Screen-based)` 규칙 + `projects/supercycl/screen_code_map.md` 인프라를 재사용. 화면별 고유 ScreenCode (Order Confirm → ORC, Positions → POS, Open Orders List → OPO 등) 자동 매핑.
+
+**spec v0.47.2 의 미등록 13개 화면 정식 등록**:
+- 신규 7개: Login(LGN), Google Account Select(GAS)/List(GAL), Supercycl OAuth Confirm(SOC), Google Sign-in Complete(GSC), History(HIS), Fast API Key Conflict(FKC)
+- 별칭 6개: spec v0.47+ 명칭 변경 흡수 (Trade (Lite) → TLT, Open Orders List → OPO 등)
+- **45/45 자동 파생 0개**
+
+### 🧮 계산·표시 정확성 패턴 보강 (b6d5503)
+
+**증상**: 단독 처리 시 ROE/Est. receive 정확성 TC 가 별도로 들어갔는데, 일괄 처리에서는 "표시된다" 한 줄로 흡수돼 누락. SCR-401 (Markets) 처럼 공식 없는 표시·정렬 화면은 정확성 항목 0개.
+
+**수정**: `extract_minors_from_screen_md` + `_build_checklist_from_screen_meta` 의 검출 셋을 모듈 상수로 분리하고 36 패턴으로 확장:
+
+- **C 도메인 30개** (코인 선물 거래소): ROE, PnL, P&L, Liquidation price/distance, Position size, Notional value, Initial/Maintenance margin, Margin ratio, MMR/IMR, Effective leverage, Est. receive/fee, Maker/Taker fee, Funding fee/rate, Mark/Index/Last price, Spread, Available balance, Total equity, Locked/Free margin, Total Unrealized P&L, Daily PnL/ROI, Slippage, Filled amount, Avg price, Δ%
+- **C+ 일반 6 카테고리** (도메인 무관): 정렬 동작, 표시 형식 변환, 색상 분기 임계, 검색·필터 매칭, 실시간 갱신 주기, 시간 기반 트리거
+
+검증 (Supercycl 6개 화면):
+| 화면 | 이전 | 신규 |
+|---|---|---|
+| SCR-102 Trade Lite | 0 | **3** (Position size/Available balance/Δ%) |
+| SCR-104 Order Confirm | 1 | **6** |
+| SCR-106 Positions | 4 | **10** (ROE/PnL/Liquidation/Est.receive 등) |
+| SCR-116 Open Orders | 0 | **4** |
+| SCR-401 Markets | **0** | **6** (정렬/형식/색상/검색/실시간/갱신) |
+| SCR-402 Portfolio | — | **9** |
+
+위치는 상태 표(1) 직후로 설정하여 `max_minors=20` 캡 도달 시 정확성 항목이 우선 보장됨.
+
+### 🛡 대분류 임의 prefix 시트 분리 버그 fix (e03bafb)
+
+**증상**: SCR-102/104/106 일괄 결과 Excel 에 `Trade` 와 `02.Trade` 두 시트로 분리. 분류표에는 `Trade` 만 있는데 한 화면의 비기능 TC 4개가 대분류 = `02.Trade` 로 작성됨.
+
+**원인**: `tc-rules.md` 원칙 G 의 예시 명칭(`01.로그인_Gmail`, `02.Trade`) 이 너무 구체적이라 AI 가 실제 분류 값으로 차용.
+
+**수정**: tc-rules.md §G-0 예시를 추상화 ("분류표 대분류 값을 그대로 사용", 임의 prefix 금지 명시) + `build_screen_user_prompt` 에 강조문 추가.
+
+### 🐛 다수 안정화
+
+- **마지막 TC 잘림 자동 보충 호출** (cf64cc3): 마지막 ### 이후 본문에 `**테스트 단계**` / `**예상 결과**` 없으면 4096 토큰 보충 호출. parse_tc_markdown 안전망으로 빈 셀에 `⚠ (원본 응답 누락 — 재생성 필요)` 마커 자동 삽입.
+- **max_tokens 16K → 20K** (093a0fb): 화면당 TC 56개 시 잘림 빈발 해결. Anthropic SDK streaming 임계(21333) 미만 유지.
+- **'Drive 업로드 완료' 라벨 잔존 버그 fix** (bd73448): 새 결과 도착 시 `resetDriveBtn()` 으로 라벨 복원.
+- **그룹 구분 행 색상** (2f5cc68): zebra 와 명확히 구분되는 중간 회색(#BDBDBD).
+
+### ⚠️ 호환성
+
+- TC ID 형식·시트 구조 변경 없음 (기존 결과물과 호환).
+- `tc-rules.md` / `screen_code_map.md` 만 변경 → 기존 워크플로 그대로 동작.
+- 신규 정확성 패턴은 자동 검출이라 별도 설정 불필요.
+
+---
+
 ## v0.10.0 — 2026-05-07 (구조화 spec 폴더 모드 + UI 정식화 + 화면별 정밀 TC)
 
 > **요약 (마이너 메이저)**: 기획팀이 표준화한 "overview/policy/design/scr 분리 폴더" 형식을 1급 입력 모드로 도입. 분류표 LLM 호출 0회, 화면별 1:1 호출 + prompt cache 로 비용 ~98% 절감, 버전 diff 모드, resume 지원, UI 정식 레이아웃 정착. Step 1 입력 화면을 처음부터 다시 설계 — 구조화 spec 우선, 개별 소스는 보조.

@@ -53,16 +53,16 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.10.0"
+APP_VERSION         = "v0.10.1"
 APP_VERSION_DATE    = "2026-05-07"
-APP_VERSION_TAGLINE = "구조화 spec 폴더 모드 + UI 정식화 + 화면별 정밀 TC"
+APP_VERSION_TAGLINE = "TC ID 화면 단위 리셋 + 계산·표시 정확성 패턴 보강"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "📁 구조화 spec 폴더 모드 — overview/policy/design/scr 분리 폴더 1개로 화면별 정밀 TC (분류 LLM 호출 0회)",
-    "🔄 버전 diff 모드 — 이전 폴더 대비 변경/추가 SCR 만 재생성 (비용 76% 절감 가능)",
-    "🎯 분류표 계층 정상화 — 대분류>중분류(화면)>소분류(세부 시나리오) + SCR md 본문에서 자동 추출",
-    "✨ Step 1 UI 정식화 — 구조화 spec 우선 / 개별 소스는 임시 작업용 아코디언으로 분리 + 최근 사용 폴더 드롭다운",
-    "🛠 다수 안정화 — TC 갯수 정상화, focus_area SCR 일괄/범위 인식, Excel 너비 1.4배·구분 행·줄바꿈 정리",
+    "🆔 TC ID 화면(SCR) 단위 001~ 리셋 — 기존 screen_code_map.md 인프라 재사용 (SCR-104 → SM-ORC-001)",
+    "📋 spec v0.47.2 의 미등록 13개 화면 ScreenCode 정식 등록 (45/45 자동 파생 0개)",
+    "🧮 계산·표시 정확성 패턴 30+6 카테고리 — ROE/PnL/Funding rate · 정렬/형식변환/색상분기/검색/실시간 갱신",
+    "🛡 대분류 값에 임의 prefix(02.Trade) 추가하던 시트 분리 버그 fix (tc-rules.md 예시 추상화)",
+    "🐛 마지막 TC 잘림 자동 보충 + max_tokens 20K (streaming 임계 회피)",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
