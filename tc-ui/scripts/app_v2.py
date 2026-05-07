@@ -2131,82 +2131,37 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         else:
             domain_to_suite[dom["name"]] = dom["code"]
 
-    # ── v0.10.x: 화면(SCR)별 고유 SuiteCode 자동 도출 ───────────────────────────
-    # 사용자 정책: TC ID 는 화면 단위 001~ 로 리셋. 단 화면 식별자(SCR-104 등)는 ID 에
-    # 포함하지 않음. 같은 대분류의 여러 화면을 일괄 처리하면 SuiteCode 가 같아 ID 가
-    # 충돌 → 화면명에서 자동 도출한 고유 SuiteCode 로 분리.
-    # 예) Order Confirm → OCF, Positions → POS, Open Orders List → OOL, Trade (Lite) → TRD
-    used_suite_codes: set[str] = set()
+    # ── v0.10.x: 화면(SCR)별 고유 SuiteCode 결정 — 기존 인프라 재사용 ─────────
+    # tc-rules.md §2-1 유형 B (Screen-based) 규칙 적용.
+    # SM/SA 프로젝트는 SuiteCode 자리에 ScreenCode 를 사용하고 NNN 은 화면 내 001~.
+    # 우선순위:
+    #   1) projects/{project}/screen_code_map.md 에 등록된 ScreenCode (사용자 합의)
+    #   2) 미등록 화면은 resolve_screen_code() 자동 파생 (기존 함수 재사용)
+    # 두 단계 모두 used_codes 충돌 회피 내장.
+    project_code_for_id = _detect_project_code(project_name)
+    is_screen_mode = _is_screen_based(project_code_for_id)
+    screen_map = load_screen_code_map(project_name) if is_screen_mode else {}
 
-    def _make_screen_suite_code(screen_name: str, fallback: str = "SCR") -> str:
-        """화면명에서 영문 대문자 약어 SuiteCode 도출. 충돌 시 숫자 접미.
-        규칙:
-        1) 영문 단어가 있으면 단어 첫 글자 모음 (3~5자)
-            'Order Confirm'   → OC → 부족하면 'OCF' (3자 보장)
-            'Positions'       → P → 'POS' (단어 1개면 첫 3자)
-            'Open Orders List'→ OOL
-            'Trade (Lite)'    → 괄호 내용은 우선 사용 → 'LIT', 그 다음 폴백 'TRD'
-        2) 영문 없으면 SCR{NUM} 사용 (예: SCR104)
-        3) 충돌 시 마지막 글자 추가 → 그래도 충돌이면 숫자 접미(2,3,...)
-        """
-        s = (screen_name or "").strip()
-        if not s:
-            return fallback
-        # 괄호 안 우선 (예: 'Trade (Lite)' → 'Lite')
-        m_paren = re.search(r"\(([^)]+)\)", s)
-        if m_paren:
-            inner = m_paren.group(1).strip()
-            if re.search(r"[A-Za-z]", inner):
-                base = inner
-            else:
-                base = re.sub(r"\s*\([^)]*\)", "", s).strip() or s
-        else:
-            base = s
-        # 영문 단어 추출 (관사/짧은 전치사 제외)
-        STOPWORDS = {"of", "the", "a", "an", "and", "or", "to", "in", "on", "for", "with"}
-        all_words = re.findall(r"[A-Za-z][A-Za-z0-9]*", base)
-        words = [w for w in all_words if w.lower() not in STOPWORDS] or all_words
-
-        candidate = ""
-        if len(words) >= 2:
-            # 여러 단어: 각 단어 첫 글자 (최대 4자)
-            candidate = "".join(w[0] for w in words[:4]).upper()
-            # 2글자면 첫 단어의 두 번째 글자 추가해서 3자 만듦 (예: 'OC' → 'OCO')
-            if len(candidate) < 3 and len(words[0]) > 1:
-                candidate = (words[0][:2] + words[1][0]).upper()
-        elif len(words) == 1:
-            # 한 단어: 앞 3자 (4자는 어색함)
-            candidate = words[0][:3].upper()
-        else:
-            candidate = fallback
-        if len(candidate) > 6:
-            candidate = candidate[:6]
-        if not candidate:
-            candidate = fallback
-        # 충돌 회피
-        original = candidate
-        counter = 2
-        while candidate in used_suite_codes:
-            candidate = f"{original}{counter}"
-            counter += 1
-            if counter > 99:
-                break
-        used_suite_codes.add(candidate)
-        return candidate
-
-    # screen_rows 와 screens 를 미리 매핑해 화면별 고유 SuiteCode 를 미리 결정.
-    # resume 시점에도 같은 결과가 나오도록 ID 정렬 보장.
     rows_by_id_pre = {r["id"]: r for r in spec_data.get("screen_rows", [])}
     screen_to_suite: dict[str, str] = {}
+    used_screen_codes: set[str] = set()
+    # resume 시 같은 결과가 나오도록 ID 정렬 보장
     sorted_screens = sorted(spec_data["screens"], key=lambda sc: sc["id"])
     for sc in sorted_screens:
         meta_row = rows_by_id_pre.get(sc["id"], {})
-        screen_name = (sc.get("title") or meta_row.get("name") or sc["id"]).strip()
-        # 의미 있는 화면명이 없으면 SCR ID 의 숫자 부분 사용
-        if not re.search(r"[A-Za-z가-힣]", screen_name):
-            num_match = re.match(r"SCR-?(\w+)", sc["id"], re.IGNORECASE)
-            screen_name = f"SCR{num_match.group(1)}" if num_match else sc["id"]
-        screen_to_suite[sc["id"]] = _make_screen_suite_code(screen_name)
+        # screen_code_map.md 는 'Middle Name' 키로 매핑 — 화면명(title) 또는 중분류 사용.
+        # 우선 title 로 시도 (Login, Email Input 등) → 없으면 SCR-ID 자체로 시도.
+        middle_name = (sc.get("title") or meta_row.get("name") or sc["id"]).strip()
+        if is_screen_mode:
+            # 기존 resolve_screen_code() 가 1) screen_map 정확 일치 2) 자동 파생
+            #   3) used_codes 충돌 회피 모두 처리
+            code = resolve_screen_code(middle_name, screen_map, used_screen_codes)
+        else:
+            # Suite-based 프로젝트(SC, PC Web)는 대분류 단위 SuiteCode 사용
+            major = meta_row.get("major", "")
+            code = domain_to_suite.get(major, "FUNC") or "FUNC"
+        used_screen_codes.add(code)
+        screen_to_suite[sc["id"]] = code
 
     # screens 와 screen_rows 를 ID 로 조인
     rows_by_id = {r["id"]: r for r in spec_data.get("screen_rows", [])}
@@ -2240,9 +2195,11 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     seq_per_suite: dict[str, int] = {}
     total_tc = 0
 
-    # 이미 완료된 화면의 결과를 먼저 메모리에 적재 (병합 + seq 누적)
-    # v0.10.x: 화면 단위 SuiteCode 사용 → 각 화면은 자기 SuiteCode 의 001~ 사용.
-    # 화면별 starting_seq 는 항상 1 (resume 도 화면 단위라 누적 의미 없음).
+    # 이미 완료된 화면의 결과를 먼저 메모리에 적재
+    # 유형 B (Screen-based): 각 화면이 고유 SuiteCode + 001~ 라 누적 의미 없음. 그래도
+    # 다음 화면 호출에서 seq_per_suite 가 의도치 않게 사용될 가능성 차단을 위해
+    # 화면 단위로는 +1 만 표기하고 실제 starting 결정은 위쪽에서 is_screen_mode 분기.
+    # 유형 A (Suite-based): 같은 SuiteCode 화면들이 누적되도록 + scr_tc_count.
     for sc, meta_row, major in target_screens:
         if sc["id"] not in completed_ids:
             continue
@@ -2250,7 +2207,10 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         existing_text = existing_path.read_text(encoding="utf-8")
         suite_code = screen_to_suite.get(sc["id"]) or domain_to_suite.get(major, "FUNC") or "FUNC"
         scr_tc_count = count_unique_tc_ids(existing_text)
-        seq_per_suite[suite_code] = scr_tc_count + 1  # 다음 시작 (참고용 — 실제 reuse X)
+        if is_screen_mode:
+            seq_per_suite[suite_code] = scr_tc_count + 1  # 참고용 (실제 reuse X)
+        else:
+            seq_per_suite[suite_code] = seq_per_suite.get(suite_code, 1) + scr_tc_count
         total_tc += scr_tc_count
         tc_parts.append(f"<!-- {sc['id']} — {sc['title']} (resumed) -->\n\n{existing_text.strip()}")
 
@@ -2260,9 +2220,14 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
     for idx_pending, (sc, meta_row, major) in enumerate(pending, 1):
         check_stop(sess)
         idx = len(completed_ids) + idx_pending  # 전체 진행 인덱스
-        # v0.10.x: 화면 단위 고유 SuiteCode 사용 → 각 화면 001~ 부터 시작
         suite_code = screen_to_suite.get(sc["id"]) or domain_to_suite.get(major, "FUNC") or "FUNC"
-        starting = 1
+        # tc-rules.md §2-1:
+        #   - 유형 B (Screen-based, SM/SA): NNN 은 화면 내 유니크 → 항상 1 부터
+        #   - 유형 A (Suite-based, SC):     NNN 은 Suite 내 전역 유니크 → seq_per_suite 누적
+        if is_screen_mode:
+            starting = 1
+        else:
+            starting = seq_per_suite.get(suite_code, 1)
 
         # cross-ref 인용 추출
         policy_excerpts = extract_policy_excerpts(spec_data.get("policy_text", ""), sc["ref_keywords"])
@@ -2324,10 +2289,14 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
         # 화면별 즉시 저장 — resume 시 여기서 다시 시작
         (per_screen_dir / f"{sc['id']}.md").write_text(tc_clean, encoding="utf-8")
 
-        # TC 개수 카운트 (v0.10.x: 화면 단위 SuiteCode 라 다음 화면의 seq 누적은 의미 없음.
-        # seq_per_suite 는 참고용으로만 갱신, 실제 다음 호출은 starting=1 로 초기화)
+        # TC 개수 카운트 — 유형별 seq 누적 정책
         scr_tc_count = count_unique_tc_ids(tc_clean)
-        seq_per_suite[suite_code] = scr_tc_count + 1
+        if is_screen_mode:
+            # 화면 단위 리셋 — 누적 의미 없으므로 참고용으로만
+            seq_per_suite[suite_code] = scr_tc_count + 1
+        else:
+            # Suite-based: 같은 SuiteCode 끼리 NNN 전역 유니크 → 다음 화면 starting 누적
+            seq_per_suite[suite_code] = starting + scr_tc_count
         total_tc += scr_tc_count
 
         # 화면 헤더 + 본문
