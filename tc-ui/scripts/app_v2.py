@@ -2181,9 +2181,11 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
             "pct": 55 + int(25 * (idx / max(len(target_screens), 1))),
         })
 
-        # max_tokens=16000 — 기존 파이프라인과 동일. 8192 였을 때 카테고리 4 후반부가
-        # 응답 잘림으로 누락돼 화면당 TC 갯수가 절반 수준이던 문제 해결.
-        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=16000)
+        # max_tokens=32000 — Opus 4.5 출력 한도(64K) 의 절반.
+        # 16000 으로는 화면당 TC 56개 이상 만들면 잘림 빈발 (체크리스트 강제 + 카테고리
+        # 4가지 비율로 갯수 늘어난 결과). 32000 까지 풀어줘서 끝까지 작성 가능.
+        # 비용은 실사용 토큰만큼만 과금되므로 한도 상향 자체로 비용 증가 없음.
+        tc_draft = call_claude_cached(sys_blocks, user, max_tokens=32000)
 
         # 잘림 감지 + 자동 보충 호출 (기존 step_write_tc 와 동등 처리).
         # 증상 예시: 마지막 TC 가 '| 플랫' 같이 표 중간에서 끊기면 사전조건/스텝/기대결과
@@ -2198,7 +2200,7 @@ def step_write_tc_per_screen(sess: dict, approved_classification: str,
                         sys_blocks,
                         f"이전 응답이 max_tokens 한도로 잘렸습니다. 아래 미완성 TC 를 그대로 이어서 완성하세요. "
                         f"새 TC 추가 금지, 표/사전조건/테스트 단계/예상 결과/비고 누락 없이.\n\n---\n{last_tc_block}",
-                        max_tokens=4096,
+                        max_tokens=8000,  # 미완성 TC 1~2개 완성용 — 충분
                     )
                     tc_draft = tc_draft[:last_tc_match[-1].start()] + continuation
                     push_log(sess, f"[화면별 TC 작성] {sc['id']} 보충 완료")
