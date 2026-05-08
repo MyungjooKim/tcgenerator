@@ -9192,7 +9192,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="progress-bar" id="progressBar" style="width:0%"></div>
     </div>
 
-    <div class="log-box" id="logBox" style="max-height:360px; min-height:320px;"></div>
+    <div class="log-box" id="logBox" style="max-height:465px; min-height:425px;"></div>
     <div style="margin-top:12px; text-align:right;">
       <button class="btn-stop" id="stopBtn2" onclick="stopPipeline()">⏹ 파이프라인 중단</button>
     </div>
