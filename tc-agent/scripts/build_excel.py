@@ -809,6 +809,23 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                         head_clean.endswith("선택")):
                     s = f"{head}\n{m_trig_colon.group(2).strip()}"
 
+            # 5-c) State 라벨 prefix 단일라인 → prefix 제거
+            #      예: 'Error.mark-price-stale 상태 배너 및 자동' → '상태 배너 및 자동'
+            #          'Danger.near-liquidation 상태 경고' → '상태 경고'
+            #          'Empty.no-exchange 상태에서 Connect 버튼' → '상태에서 Connect 버튼'
+            #      State 식별자 (Error/Loading/Normal/Hover/Empty/Active/Disabled/Success/Failure/Danger)
+            #      + dot + 영문/숫자/하이픈/언더스코어 식별자 패턴
+            m_state_prefix = re.match(
+                r"^(Error|Loading|Normal|Hover|Empty|Active|Disabled|Success|Failure|Danger|Default)"
+                r"\.[A-Za-z][A-Za-z0-9\-_]*\s+(.+)$",
+                s,
+            )
+            if m_state_prefix:
+                rest = m_state_prefix.group(2).strip()
+                # rest 가 너무 짧으면 (단순 '상태' 만) prefix 보존
+                if len(rest) >= 8:
+                    s = rest
+
             # 6) 다중 라인 처리 — 시드/부연 패턴 정리 (시드 제거 우선순위)
             raw_lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
 
@@ -890,6 +907,52 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                         return "URL 바 정보 확인"
                 return line
 
+            def _smart_truncate(line: str, limit: int = 32) -> str:
+                """32자 한도 절단을 자연스럽게 수행.
+                전략:
+                  1) 한도 내 최대 단어 경계에서 절단
+                  2) 절단 후 끝이 어색한 패턴이면 마지막 토큰 추가 제거
+                     - 조사·접속사로 끝: '및', '또는', '에서', '시', '후', '의', '를'
+                     - 영문 단어 단독: 'Est', 'TP/SL', '시트', '포지션' (12자 이상에서 발생)
+                """
+                if len(line) <= limit:
+                    return line
+                # 단어 경계 절단
+                cut = line[:limit].rstrip()
+                last_space = cut.rfind(" ")
+                if last_space >= 16:  # 20 → 16 으로 완화 (단어 보존 우선)
+                    cut = cut[:last_space]
+                cut = cut.rstrip(" .·-—:\"'")
+                # 어색한 끝 토큰 추가 제거 — 끝의 단어 1~2개를 검사
+                awkward_endings = {
+                    "및", "또는", "에서", "시", "후", "의", "를", "을", "이",
+                    "가", "은", "는", "와", "과", "로", "으로", "에", "도",
+                    "자동", "별도", "경고",
+                    # trigger / 동작 단어 (절단 끝에 오면 부연 손실)
+                    "탭", "선택", "클릭", "진입", "표시", "노출",
+                    # 의미 없는 단독 영문 (절단 잔재)
+                    "Est",
+                }
+                # 부분 매칭 (마지막 토큰이 영문/숫자만 + 짧으면 — '시트', '포지션' 등이 아닌 '시 Est' 같은 끝)
+                tokens = cut.split()
+                while len(tokens) >= 3:
+                    last_tok = tokens[-1]
+                    if last_tok in awkward_endings:
+                        tokens = tokens[:-1]
+                        # 직전이 또 어색하면 추가 제거
+                        if tokens and tokens[-1] in awkward_endings:
+                            tokens = tokens[:-1]
+                        continue
+                    # 마지막 토큰이 (영문 or 영문/하이픈/슬래시) + 4자 이하 + 어색 → 제거
+                    if (re.match(r"^[A-Za-z][A-Za-z0-9/\-]*$", last_tok)
+                            and len(last_tok) <= 4):
+                        # 'TP/SL' 같은 의미있는 약어는 보존 — 직전이 trigger 인 경우만 제거
+                        if len(tokens) >= 2 and tokens[-2] in {"탭", "시", "선택"}:
+                            tokens = tokens[:-1]
+                            continue
+                    break
+                return " ".join(tokens).rstrip(" .·-—:\"'")
+
             cleaned_lines = []
             for line in raw_lines:
                 #  paren 안 나열형 부연 제거 (`·` 또는 `,` 또는 `/` 포함)
@@ -902,11 +965,7 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                 line = _generalize_url_line(line)
                 line = re.sub(r"\s+", " ", line).strip(" .·-—:\"'")
                 if len(line) > 32:
-                    cut = line[:32].rstrip()
-                    last_space = cut.rfind(" ")
-                    if last_space >= 20:
-                        cut = cut[:last_space]
-                    line = cut.rstrip(" .·-—:\"'")
+                    line = _smart_truncate(line, limit=32)
                 if line:
                     cleaned_lines.append(line)
             minor_display = "\n".join(cleaned_lines)
