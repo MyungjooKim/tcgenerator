@@ -877,31 +877,16 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                 if drop_seed:
                     raw_lines = [body_line] + raw_lines[2:]
 
-            # 7) 줄별 마무리 — paren 나열형 제거 + URL 축약 + 32자 제한
-            def _shorten_quoted_url(m: "re.Match") -> str:
-                """따옴표 안 URL/도메인을 'host' 형태로 축약 (scheme/path 제거).
-                   예: "www.okx.com/oauth/authorize..." → "www.okx.com"
-                       "https://www.okx.com/oauth/..." → "www.okx.com"
-                       "www.okx.com" → "www.okx.com" (변경 없음)
+            # 7) 줄별 마무리 — paren 나열형 제거 + URL 일반화 + 32자 제한
+            def _generalize_url_line(line: str) -> str:
+                """따옴표 안 URL/도메인 또는 URL 패턴이 등장하면 일반 표현으로 통일.
+                   복잡한 URL 을 그대로 두면 32자 절단·축약이 모두 어색해서
+                   사용자 제안대로 'URL 바 정보 확인' 같은 일반 표현으로 단순화.
                 """
-                content = m.group(1)
-                # scheme 제거: 'https://x', 'http://x' → 'x'
-                content = re.sub(r"^https?://", "", content)
-                # path 제거: 'host/path' → 'host'
-                if "/" in content:
-                    content = content.split("/", 1)[0]
-                # query/fragment 제거
-                content = re.split(r"[?#]", content, maxsplit=1)[0]
-                return f'"{content}"' if content else m.group(0)
-
-            def _generic_url_fallback(line: str) -> str:
-                """32자 절단으로 따옴표가 잘리거나 의미 손상되면 일반 표현으로 fallback.
-                   예: 'URL 바는 "www.okx.com" 으로 시작' (32자 초과 시) → 'URL 바 정보 확인'
-                """
-                # 따옴표가 닫히지 않은 채 잘렸거나, 따옴표 안 텍스트가 path 흔적 (/ 포함) 이면 fallback
-                quote_count = line.count('"')
-                if quote_count % 2 != 0 or re.search(r'"[^"]*/', line):
-                    if "URL" in line or "url" in line:
+                has_quoted_url = bool(re.search(r'"[^"\s]*[./][^"\s]*"', line))
+                has_naked_url = bool(re.search(r"https?://\S+", line))
+                if has_quoted_url or has_naked_url:
+                    if "URL" in line or "url" in line.lower():
                         return "URL 바 정보 확인"
                 return line
 
@@ -913,8 +898,8 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                     lambda m: " " if re.search(r"[·,/]", m.group(1)) else f" ({m.group(1)}) ",
                     line,
                 )
-                #  따옴표 안 URL 축약 — 도메인/path 가 길어 절단되는 문제 해결
-                line = re.sub(r'"([^"\s]{12,})"', _shorten_quoted_url, line)
+                #  URL 패턴 → 일반 표현 (사용자 제안: 1차 축약 없이 단순화)
+                line = _generalize_url_line(line)
                 line = re.sub(r"\s+", " ", line).strip(" .·-—:\"'")
                 if len(line) > 32:
                     cut = line[:32].rstrip()
@@ -922,8 +907,6 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                     if last_space >= 20:
                         cut = cut[:last_space]
                     line = cut.rstrip(" .·-—:\"'")
-                    #  절단 후 따옴표 mismatched 또는 path 흔적이면 일반 fallback
-                    line = _generic_url_fallback(line)
                 if line:
                     cleaned_lines.append(line)
             minor_display = "\n".join(cleaned_lines)
