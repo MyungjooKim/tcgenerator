@@ -794,6 +794,24 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
             # 5) 양쪽 공백 dash 는 줄바꿈
             s = re.sub(r"\s+[—–\-]{1,2}\s+", "\n", s)
 
+            # 5-a-2) SCR 식별자 제거 — 'SCR-104 → SCR-602 → Retry 성공 → SCR-601' 같이
+            #        화면 식별자가 길어 절단되는 케이스. '연관 화면' 컬럼에 SCR 정보 있으므로
+            #        소분류에서는 식별자만 제거하고 의미 단어 (Retry, 성공, 복귀) 는 보존.
+            #        예: 'SCR-104 → SCR-602 → Retry 성공 → SCR-601 E2E 흐름 확인'
+            #             → 'Retry 성공 E2E 흐름 확인' (SCR 식별자 + 화살표 정리)
+            new_lines = []
+            for ln in s.split("\n"):
+                # SCR-XXX (또는 SCR-XXX[A-Z]) 와 인접 화살표 정리
+                cleaned = re.sub(r"\s*SCR-\d+[A-Z]?\s*→\s*", "", ln)
+                cleaned = re.sub(r"\s*→\s*SCR-\d+[A-Z]?\s*", " ", cleaned)
+                cleaned = re.sub(r"\bSCR-\d+[A-Z]?\b", "", cleaned)
+                # 남은 화살표는 공백으로 (의미 연결자였지만 SCR 제거 후 어색)
+                cleaned = re.sub(r"\s*→\s*", " ", cleaned)
+                # 공백 정리
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                new_lines.append(cleaned if cleaned else ln)
+            s = "\n".join(new_lines)
+
             # 5-b) Trigger label 콜론 한 줄 → 줄바꿈으로 분리
             #      예: '화면 진입 시: OAuth Connect 화면 UI 요소 표시 확인'
             #            → '화면 진입 시\nOAuth Connect 화면 UI 요소 표시 확인'
