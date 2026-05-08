@@ -3493,10 +3493,11 @@ def disambiguate_duplicate_minors(tc_md: str) -> str:
             if not variant:
                 # title에서 추출 불가 → 일련번호 폴백
                 variant = f"({ord_n})"
-            # 길이 제한 (소분류 + " — " + variant 합계 60자 이내)
-            max_var_len = max(8, 60 - len(minor) - 3)
-            if len(variant) > max_var_len:
-                variant = variant[:max_var_len].rstrip()
+            # 길이 제한 — 잘림으로 인한 'Empty S' 같은 어색한 표기 방지.
+            # 합계 한도를 넉넉히 잡고(150자), 그래도 초과하면 잘리지 않고 일련번호 폴백.
+            total_max = 150
+            if len(minor) + 3 + len(variant) > total_max:
+                variant = f"({ord_n})"
             # 같은 그룹 내 variant 충돌 방지
             base_variant = variant
             n = 2
@@ -3545,24 +3546,25 @@ def _extract_minor_variant(title: str, minor: str) -> str:
     norm_minor = minor.strip()
 
     # 1) prefix/suffix 일치 — minor가 그대로 포함되면 잘라내기
+    #    (잘림 한도 제거 — disambiguate_duplicate_minors 의 total_max(150)가 최종 가드)
     if norm_minor and norm_title.startswith(norm_minor):
         leftover = norm_title[len(norm_minor):].strip(" -—:")
         if len(leftover) >= 4:
-            return _trim_leading_function_words(leftover)[:40]
+            return _trim_leading_function_words(leftover)
     if norm_minor and norm_title.endswith(norm_minor):
         leftover = norm_title[:-len(norm_minor)].strip(" -—:")
         if len(leftover) >= 4:
-            return _trim_leading_function_words(leftover)[:40]
+            return _trim_leading_function_words(leftover)
 
     # 2) minor의 단어와 title이 부분 일치 — title 자체가 더 구체적인 표현이면 그대로 사용
     minor_set = set(re.split(r"[\s\-—:_/()]+", norm_minor))
     title_words = re.split(r"[\s\-—:_/()]+", norm_title)
     # title 단어가 minor 단어보다 많으면 (= 더 구체적) title 사용
     if len([w for w in title_words if w not in minor_set and len(w) >= 2]) >= 2:
-        return norm_title[:40]
+        return norm_title
 
-    # 3) 마지막 폴백 — title 앞부분
-    return norm_title[:40]
+    # 3) 마지막 폴백 — title 그대로
+    return norm_title
 
 
 def _trim_leading_function_words(s: str) -> str:
