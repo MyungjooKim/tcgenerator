@@ -794,21 +794,6 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
             # 5) 양쪽 공백 dash 는 줄바꿈
             s = re.sub(r"\s+[—–\-]{1,2}\s+", "\n", s)
 
-            # 5-a-2) E2E 흐름 패턴 일반화 — 화살표 (→) 가 2개 이상 등장하는 라인은
-            #        구체 화면 식별자 (SCR-XXX → SCR-YYY → ...) 가 길어 절단되기 쉬움.
-            #        '연관 화면' 컬럼에 SCR 정보 있으므로 소분류는 일반 표현으로 통일.
-            #        예: 'SCR-104 → SCR-602 → Retry 성공 → SCR-601 E2E 흐름 확인'
-            #             → 'E2E 흐름 검증'
-            #        같은 묶음의 다른 TC ('Retry' vs 'Cancel') 차별화는
-            #        후속 disambiguate_duplicate_minors 가 시드 라인을 살려서 처리.
-            new_lines = []
-            for ln in s.split("\n"):
-                if ln.count("→") >= 2:
-                    new_lines.append("E2E 흐름 검증")
-                else:
-                    new_lines.append(ln)
-            s = "\n".join(new_lines)
-
             # 5-b) Trigger label 콜론 한 줄 → 줄바꿈으로 분리
             #      예: '화면 진입 시: OAuth Connect 화면 UI 요소 표시 확인'
             #            → '화면 진입 시\nOAuth Connect 화면 UI 요소 표시 확인'
