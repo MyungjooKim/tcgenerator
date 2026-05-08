@@ -876,6 +876,23 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
             while len(raw_lines) >= 2 and _is_meta_seed(raw_lines[0]):
                 raw_lines = raw_lines[1:]
 
+            #  6-a-2) 일관성 확보 — '계산 정확성' 같은 카테고리 헤딩이 첫줄인 경우
+            #         · 2줄 (`계산 정확성` / `PnL`)        → '계산 정확성 — PnL' 1줄로 압축
+            #         · 3줄 (`계산 정확성` / `Est. ...` / 부연) → 마지막 줄(부연) 만 남김
+            #         시드만 있는 케이스도 부연 있는 케이스도 모두 1줄로 통일.
+            calc_meta_pattern = re.compile(
+                r"^(계산\s*정확성|계산|정확성\s*확인|계산\s*검증)$"
+            )
+            if len(raw_lines) >= 2 and calc_meta_pattern.match(raw_lines[0].strip()):
+                if len(raw_lines) == 2:
+                    # '계산 정확성' / 'PnL' → 'PnL 계산 정확성' (한 줄)
+                    seed = raw_lines[1].strip().rstrip("()").strip()
+                    # paren 안 부연 (`(비율별 재계산)` 등) 보존
+                    raw_lines = [f"{seed} 계산 정확성"]
+                else:
+                    # 3줄 이상 — 마지막 줄(부연)만 남김
+                    raw_lines = [raw_lines[-1]]
+
             if len(raw_lines) >= 2:
                 seed_line, body_line = raw_lines[0], raw_lines[1]
                 seed_clean = re.sub(r'["\'`]', "", seed_line)
