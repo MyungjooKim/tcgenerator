@@ -900,10 +900,10 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    # 필터 & 틀 고정
+    # 필터 & 틀 고정 — 헤더(1행)만 고정
     last_col = get_column_letter(len(col_names))
     ws.auto_filter.ref = f"A1:{last_col}{r - 1}"
-    ws.freeze_panes   = f"A{data_start + 1}"
+    ws.freeze_panes   = "A2"
 
 
 # ── 통계 시트 ──────────────────────────────────────────────────────

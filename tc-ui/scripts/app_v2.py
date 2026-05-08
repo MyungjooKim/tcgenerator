@@ -4484,7 +4484,7 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
 
     # TC 전체목록 시트
     ws = wb.create_sheet("TC 전체목록")
-    ws.freeze_panes = "A3"
+    ws.freeze_panes = "A2"
 
     HEADERS = ["Smoke", "TC ID", "우선순위", "거래소", "대분류", "중분류", "소분류", "사전 조건", "스텝", "기대 결과"]
     COL_W   = [8,           18,     10,       10,      14,     14,     16,      50,       50,     50]
@@ -4555,7 +4555,7 @@ def build_excel_fallback(tc_content: str, out_dir: Path, project_name: str,
     # Smoke Test 시트 — Smoke 마킹된 TC만 모아 동일 구조로 렌더
     smoke_tcs = [t for t in tcs if t.get("_smoke")]
     ws_sm = wb.create_sheet("Smoke Test")
-    ws_sm.freeze_panes = "A3"
+    ws_sm.freeze_panes = "A2"
     for ci, (h, w) in enumerate(zip(HEADERS, COL_W), 1):
         c = ws_sm.cell(1, ci, h)
         c.font = hfont(); c.fill = fill(NAVY); c.alignment = center(); c.border = bdr()
