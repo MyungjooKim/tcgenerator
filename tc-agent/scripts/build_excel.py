@@ -789,6 +789,20 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
             # 5) 양쪽 공백 dash 는 줄바꿈
             s = re.sub(r"\s+[—–\-]{1,2}\s+", "\n", s)
 
+            # 5-b) Trigger label 콜론 한 줄 → 줄바꿈으로 분리
+            #      예: '화면 진입 시: OAuth Connect 화면 UI 요소 표시 확인'
+            #            → '화면 진입 시\nOAuth Connect 화면 UI 요소 표시 확인'
+            #      이후 6-a 메타 시드 제거에서 trigger label 자동 정리
+            m_trig_colon = re.match(r"^([^:\n]{1,12}):\s*(.+)$", s)
+            if m_trig_colon:
+                head = m_trig_colon.group(1).strip()
+                head_clean = re.sub(r'["\'`]', "", head).strip()
+                if len(head_clean) <= 12 and (
+                    head_clean.endswith("시") or head_clean.endswith("시점") or
+                    head_clean.endswith("탭") or head_clean.endswith("클릭")
+                ):
+                    s = f"{head}\n{m_trig_colon.group(2).strip()}"
+
             # 6) 다중 라인 처리 — 시드/부연 패턴 정리 (시드 제거 우선순위)
             raw_lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
 
