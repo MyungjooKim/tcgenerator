@@ -647,17 +647,31 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
         if not label:
             return
         # 정규화 — 시인성 강화 (v0.10.x):
-        #   1) Markdown ** 강조 제거
-        #   2) 콜론·따옴표·파이프 뒤의 긴 부연설명 컷 (예: "권한 목록 (Read…" → "권한 목록")
-        #   3) 백틱·HTML 코드 제거
+        #   1) Markdown ** 강조 제거 / 백틱 / HTML 태그 제거
+        #   2) 메타 마커 제거 ([정책]/[보안]/[제약]/...) — 시드 라벨이 아니라 분류 메타
+        #   3) dash(공백 — 공백) 뒤 부연 설명 cutoff
+        #   4) 콜론·괄호 뒤 부연 cutoff (trigger label 은 보호)
         label = re.sub(r"\*\*([^*]+)\*\*", r"\1", label)  # **xxx** → xxx
         label = re.sub(r"`[^`]+`", "", label)              # 백틱 코드 제거
         label = re.sub(r"<[^>]+>", "", label)              # HTML 태그 제거
+        # 메타 마커 제거 — '[정책] Cancel All 버튼 없음' → 'Cancel All 버튼 없음'
+        label = re.sub(
+            r"\s*\[(통합|미결|그룹|메모|TODO|보류|보안|정책|제약|접근성|세션|타이밍|dev|"
+            r"성능|UX|UI|에러|edge|규약|규칙)[^\]]*\]\s*",
+            " ", label, flags=re.IGNORECASE,
+        ).strip()
+        # dash 뒤 부연 cutoff — 양쪽 공백 포함 dash (— / – / -- / -)
+        # 예: 'Cancel All 버튼 없음 — Lite 는 Training Wheels futures 로 초보자...'
+        #      → 'Cancel All 버튼 없음'
+        m_dash = re.match(r"^(.+?)\s+[—–\-]{1,2}\s+(.+)$", label)
+        if m_dash:
+            head_dash = m_dash.group(1).strip()
+            if len(head_dash) >= 4:  # 너무 짧으면 보존
+                label = head_dash
         # 콜론·괄호 뒤 부연설명 cutoff — '키' 부분만 남김 (단, 너무 짧아지면 원본 유지)
         # Trigger label guard: head 가 trigger 라벨('… 시', '… 시점', '… 탭', '… 후',
         # '… 클릭') 로 끝나면 cutoff 시 의미 손실 → 전체 라벨 보존
         # 길이 제한 없음 — 'Reconnect with OKX 버튼 탭 시' 같은 긴 trigger 도 보호.
-        # 이후 build_excel 후처리에서 다중라인 정리.
         for sep in [":", "("]:
             if sep in label:
                 head = label.split(sep, 1)[0].strip()
