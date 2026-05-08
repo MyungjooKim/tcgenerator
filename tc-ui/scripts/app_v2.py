@@ -2904,6 +2904,38 @@ def build_tc_system_prompt(tc_rules: str, classification: str, project_policies:
 - ✅ 종착지: 성공/실패 결과 화면, 완료(one-way) 화면, 그룹 흐름의 마지막 화면
 - ❌ skip: 입력 화면 중간 단계, 단순 표시 화면, 모달/바텀시트(자체로 연결 시나리오 아님)
 
+## ⚠️ 누락 방지 — 자주 통합되어 사라지는 TC 패턴 (반드시 분리 작성)
+
+다음 3가지 패턴은 AI 가 "유사하니 묶자" 라고 판단해 통합하기 쉬운데, **반드시 별도 TC** 로 분리해야 합니다:
+
+### 1) 유사 계산 공식의 분리 (카테고리 2)
+같은 화면에 여러 계산 공식이 노출되면 **공식별로 별도 TC**:
+- ⛔ 통합 금지: "Position size 와 Notional value 를 한 TC 에서 검증"
+- ✅ 분리 작성:
+  - `Position size 계산 정확성` — Margin × Leverage 공식 (qty × symbol 표기 검증)
+  - `Notional value 계산 정확성` — 별도 TC, USD 환산값 검증
+  - `Liquidation price 계산` / `Mark price 갱신` / `Δ% 산출` — 각각 별도
+- 이유: 각 공식의 정확성이 독립적이며, 한 공식 실패가 다른 공식에 영향 없이 검출되어야 함
+
+### 2) 구체 성능 임계값 검증 (카테고리 4)
+일반 Loading TC 와 별도로 **구체 환경 + 정량 임계값** 케이스 분리:
+- ⛔ 통합 금지: "Loading 상태가 표시된다" 만 검증하는 일반 TC 1개
+- ✅ 분리 작성:
+  - `Loading 상태 표시` — 일반 케이스 (카테고리 1 또는 2)
+  - `3G/저사양 환경에서 5초 이내 로딩 완료` — 성능 임계값 케이스 (카테고리 4)
+  - `대량 데이터(100+ 항목) 표시 시 렌더 성능` — 부하 케이스 (카테고리 4)
+- 이유: 성능 회귀는 일반 Loading 검증으로 안 잡힘. 구체 환경 + 정량 SLA 가 명세에 있으면 별도 TC
+
+### 3) 플랫폼별 분기 동작 (카테고리 1 또는 4)
+iOS/Android, Mobile/Desktop 별로 동작 차이가 있는 trigger 는 **플랫폼별 분리**:
+- ⛔ 통합 금지: "뒤로가기 시 시트 닫힘" 한 TC 로 묶음
+- ✅ 분리 작성:
+  - `Cancel 버튼 / 배경 오버레이 탭 시 시트 닫힘` — 일반 닫기
+  - `iOS Safari 스와이프 백 제스처 시 시트 닫힘` — iOS 전용
+  - `Android Chrome 시스템 뒤로가기 시 시트 닫힘` — Android 전용
+- 다른 예: 키보드 입력 (iOS 가상 키보드 vs Android), 스크롤 관성, 햅틱 피드백
+- 이유: iOS swipe back 은 brower 레벨 처리, Android back 은 시스템 이벤트 — 구현 경로 다름
+
 ## Smoke TC 선별
 - 카테고리 1, 2에서 High 우선순위 TC를 bold 처리 (### **...**)
 - 카테고리 3에서 High Negative TC도 bold 처리
