@@ -4280,6 +4280,113 @@ def _generate_missing_tc_for_middle(sess: dict, major: str, middle: str,
     return tc_draft
 
 
+def detect_minor_quality_issues(tc_content: str) -> list:
+    """TC 초안의 소분류 품질 이슈를 규칙 기반으로 검출.
+    Returns: list of {tc_id, minor, issue_type, detail}
+    검출 패턴 (build_excel 정규화로 잡히지 않는 케이스 포함):
+      1. 키워드 중복: '계산 정확성' / '확인' 등이 2번 이상 등장
+      2. 어색한 끝: 조사·trigger 단어로 끝 (... 시, 탭, 및, 또는, 자동, 별도)
+      3. 메타마커 잔존: [정책]/[보안]/[제약] 등
+      4. State 라벨 prefix 잔존: Error.X / Danger.X / Loading.X 시작
+      5. 다중 라인 (카테고리 헤딩 잔존): '계산 정확성' / 'X' 형태
+      6. DOM 식별자 단독: '#tpSlErr' 같은 hash 식별자만
+      7. 너무 김 (40자 초과)
+    """
+    issues = []
+    # TC 블록 추출 — '### {ID} — {title}' 헤딩 + 표
+    tc_blocks = re.split(r"(?=^###\s+\*?\*?[A-Z]{2}-)", tc_content, flags=re.MULTILINE)
+    awkward_endings = {"및", "또는", "에서", "시", "후", "자동", "별도", "경고", "탭", "선택"}
+    meta_markers = ("[정책]", "[보안]", "[제약]", "[접근성]", "[세션]", "[타이밍]",
+                    "[성능]", "[UX]", "[UI]", "[에러]", "[edge]", "[규약]", "[규칙]",
+                    "[통합]", "[미결]", "[그룹]", "[메모]", "[TODO]", "[보류]")
+    state_prefix_pattern = re.compile(
+        r"^(Error|Loading|Normal|Hover|Empty|Active|Disabled|Success|Failure|Danger|Default)"
+        r"\.[A-Za-z][A-Za-z0-9\-_]*"
+    )
+    dom_only_pattern = re.compile(r"^#[A-Za-z][A-Za-z0-9_\-]*$")
+
+    for block in tc_blocks:
+        m_id = re.match(r"###\s+\*?\*?([A-Z]{2}-[A-Z][A-Z0-9\-]*-\d+)", block)
+        if not m_id:
+            continue
+        tc_id = m_id.group(1)
+        m_minor = re.search(r"\|\s*소분류\s*\|\s*(.+?)\s*\|", block)
+        if not m_minor:
+            continue
+        minor = m_minor.group(1).strip()
+        if not minor:
+            continue
+
+        # 1) 키워드 중복
+        for kw in ["계산 정확성", "정확성 확인", "확인 확인", "표시 표시", "동작 동작"]:
+            count = len(re.findall(re.escape(kw), minor))
+            if count >= 2:
+                issues.append({
+                    "tc_id": tc_id, "minor": minor,
+                    "issue_type": "키워드 중복",
+                    "detail": f"'{kw}' {count}회 등장",
+                })
+                break  # 한 항목당 1회만 보고
+
+        # 2) 어색한 끝
+        last_token = minor.rstrip(".·-—").split()[-1] if minor.split() else ""
+        if last_token in awkward_endings:
+            issues.append({
+                "tc_id": tc_id, "minor": minor,
+                "issue_type": "어색한 끝",
+                "detail": f"'{last_token}' 으로 끝남 (절단 가능성)",
+            })
+
+        # 3) 메타마커 잔존
+        for mk in meta_markers:
+            if mk in minor:
+                issues.append({
+                    "tc_id": tc_id, "minor": minor,
+                    "issue_type": "메타마커 잔존",
+                    "detail": f"'{mk}' 포함 — 분류 메타이지 라벨 아님",
+                })
+                break
+
+        # 4) State 라벨 prefix
+        if state_prefix_pattern.match(minor):
+            issues.append({
+                "tc_id": tc_id, "minor": minor,
+                "issue_type": "State prefix 잔존",
+                "detail": "내부 상태 식별자 — 부연 라벨로 교체 권장",
+            })
+
+        # 5) 다중 라인 (카테고리 헤딩 잔존)
+        if "\n" in minor:
+            lines = [l.strip() for l in minor.split("\n") if l.strip()]
+            if len(lines) >= 2:
+                first = lines[0]
+                if re.match(r"^(계산\s*정확성|에러\s*처리|UI[\s/]*UX|주요\s*기능|예외\s*기능)$", first):
+                    issues.append({
+                        "tc_id": tc_id, "minor": minor.replace("\n", " / "),
+                        "issue_type": "카테고리 헤딩 잔존",
+                        "detail": f"첫줄 '{first}' 카테고리 메타 — 1줄 압축 권장",
+                    })
+
+        # 6) DOM 식별자 단독
+        if dom_only_pattern.match(minor.strip()):
+            issues.append({
+                "tc_id": tc_id, "minor": minor,
+                "issue_type": "DOM 식별자 단독",
+                "detail": "사람이 읽기 어려움 — 부연 추가 권장",
+            })
+
+        # 7) 너무 김
+        max_line_len = max((len(l) for l in minor.split("\n")), default=0)
+        if max_line_len > 40:
+            issues.append({
+                "tc_id": tc_id, "minor": minor[:50] + ("..." if len(minor) > 50 else ""),
+                "issue_type": "너무 긴 라벨",
+                "detail": f"{max_line_len}자 — 30자 내 식별 라벨 원칙 위반",
+            })
+
+    return issues
+
+
 def step_review(sess: dict, tc_content: str, project_name: str,
                 approved_classification: str = "",
                 features_text: str = "", policy_text: str = "") -> str:
@@ -4345,7 +4452,33 @@ def step_review(sess: dict, tc_content: str, project_name: str,
 
     sess["_augmented_tc"] = augmented
 
-    # ── 3) 리포트 작성 ──────────────────────────────────────────
+    # ── 3) 소분류 품질 규칙 검출 (NEW) ──────────────────────────
+    quality_issues = detect_minor_quality_issues(augmented)
+    quality_section = ""
+    if quality_issues:
+        # 이슈 타입별 그룹핑 + 로그 요약
+        from collections import Counter
+        type_counts = Counter(i["issue_type"] for i in quality_issues)
+        summary = ", ".join(f"{t} {c}건" for t, c in type_counts.most_common())
+        push_log(sess, f"[검토-품질] 소분류 품질 이슈 {len(quality_issues)}건 탐지: {summary}")
+        # review_report 에 추가할 섹션 작성
+        quality_lines = ["", "## 소분류 품질 이슈 (규칙 기반 검출)", ""]
+        quality_lines.append(f"총 {len(quality_issues)}건 — {summary}")
+        quality_lines.append("")
+        quality_lines.append("| TC ID | 이슈 유형 | 소분류 | 상세 |")
+        quality_lines.append("|-------|----------|--------|------|")
+        for issue in quality_issues[:50]:  # 상위 50건만
+            mid = (issue["minor"][:35] + "...") if len(issue["minor"]) > 35 else issue["minor"]
+            quality_lines.append(
+                f"| {issue['tc_id']} | {issue['issue_type']} | {mid} | {issue['detail']} |"
+            )
+        if len(quality_issues) > 50:
+            quality_lines.append(f"\n_그 외 {len(quality_issues) - 50}건은 생략됨_")
+        quality_section = "\n".join(quality_lines)
+    else:
+        push_log(sess, "[검토-품질] 소분류 품질 이슈 없음 ✓")
+
+    # ── 4) AI 리뷰 리포트 작성 ──────────────────────────────────
     system = """당신은 시니어 QA 리뷰어입니다. TC 초안을 검토하고 개선 리포트를 작성합니다."""
     missing_section = ""
     if missing_pairs:
@@ -4380,6 +4513,9 @@ TC 초안 (처음 5000자):
         result = call_claude(system, user, max_tokens=3000)
     except Exception as e:
         result = f"# TC 검토 보고서\n\n검토 실행 중 오류: {e}\n"
+    # 규칙 기반 품질 검출 결과를 리포트 끝에 첨부
+    if quality_section:
+        result = result.rstrip() + "\n\n---\n" + quality_section + "\n"
     review_path = sess["workspace"] / "07_review_report.md"
     review_path.write_text(result, encoding="utf-8")
     push_log(sess, "[검토] 검토 완료")
