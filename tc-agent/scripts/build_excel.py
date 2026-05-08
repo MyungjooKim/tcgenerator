@@ -791,6 +791,48 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
 
             # 6) 다중 라인 처리 — 시드/부연 패턴 정리 (시드 제거 우선순위)
             raw_lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
+
+            # Generic state 라벨 패턴 (dot 없는 형태):
+            #   'Normal 상태 표시 및 동작' / 'Loading 상태 표시 및 동작' / 'Error 상태 표시 및 동작'
+            #   '에러 처리' / 'UI/UX 체크' / '주요 기능' (카테고리 헤딩) — 부연이 본질
+            generic_meta_seed = re.compile(
+                r"^(Normal|Loading|Error|Empty|Hover|Active|Disabled|Success|Failure|Default)"
+                r"\s+(상태\s+)?(표시|동작)(\s+(및|과)\s+(동작|표시))?$"
+                r"|^에러\s*처리$|^에러\s*케이스$"
+                r"|^UI[\s/]*UX(\s+체크)?$|^주요\s*기능$|^예외\s*기능$|^정상\s*케이스$"
+                r"|^로딩\s*상태$|^빈\s*상태$|^정상\s*상태$"
+            )
+
+            def _is_meta_seed(line: str) -> bool:
+                """카테고리/상태 라벨 메타 시드인지 판정."""
+                cleaned = re.sub(r'["\'`]', "", line).strip()
+                if generic_meta_seed.match(cleaned):
+                    return True
+                # State 라벨 dot-notation
+                if re.match(r"^(Error|Loading|Normal|Hover|Empty|Active|Disabled|Success|Failure)"
+                            r"\.[A-Za-z]+", cleaned):
+                    return True
+                # 콜론 prefix 메타 (목업 전용:, dev:, ...)
+                m_colon = re.match(r"^([^:]{1,12}):\s*(.+)$", cleaned)
+                if m_colon:
+                    prefix = m_colon.group(1).strip().lower()
+                    meta_prefixes = {"목업 전용", "목업", "dev", "테스트", "mockup",
+                                     "spec", "메모", "todo", "참고", "비고"}
+                    if prefix in meta_prefixes or "전용" in prefix:
+                        return True
+                # Trigger label
+                if len(cleaned) <= 12 and (
+                    cleaned.endswith("시") or cleaned.endswith("시점") or cleaned.endswith("탭")
+                ):
+                    return True
+                return False
+
+            #  6-a) 3+줄 카테고리 헤딩 패턴 — 위에서부터 메타 라인 제거
+            #       '에러 처리' / '연결 해제 실패' / 'Toast 3초 자동 닫힘 타이밍 정확성 확인'
+            #         → 메타 시드 제거 후 남은 두 줄 처리
+            while len(raw_lines) >= 2 and _is_meta_seed(raw_lines[0]):
+                raw_lines = raw_lines[1:]
+
             if len(raw_lines) >= 2:
                 seed_line, body_line = raw_lines[0], raw_lines[1]
                 seed_clean = re.sub(r'["\'`]', "", seed_line)
@@ -798,31 +840,13 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                 seed_words = re.split(r"[\s.·/\-—:]+", seed_no_paren)
                 seed_keywords = [w for w in seed_words if len(w) >= 3 and w.lower() not in
                                  {"확인", "동작", "표시", "상태", "버튼", "노출", "탭",
-                                  "처리", "전환", "표기", "노출됨", "전용"}]
+                                  "처리", "전환", "표기", "노출됨", "전용", "실패", "성공"}]
                 drop_seed = False
-                #  6-a) State 라벨 패턴 — 'Error.X', 'Loading.X', 'Normal.X', 'Hover.X', 'Empty.X'
-                #       부연이 본질 (시드는 mockup/spec 내부 상태 식별자)
-                if re.match(r"^(Error|Loading|Normal|Hover|Empty|Active|Disabled|Success|Failure)"
-                            r"\.[A-Za-z]+", seed_clean):
+                #  6-b) 키워드 중복 — 시드의 의미 키워드가 부연에 등장
+                if seed_keywords and any(kw.lower() in body_line.lower() for kw in seed_keywords):
                     drop_seed = True
-                #  6-b) 콜론 prefix 메타 ('목업 전용:', 'dev:', '테스트:', 'mockup:')
-                #       콜론 앞이 짧은 메타 라벨이고 부연이 본질
-                if not drop_seed:
-                    m_colon = re.match(r"^([^:]{1,12}):\s*(.+)$", seed_clean)
-                    if m_colon:
-                        prefix = m_colon.group(1).strip().lower()
-                        meta_prefixes = {"목업 전용", "목업", "dev", "테스트", "mockup",
-                                         "spec", "메모", "todo", "참고", "비고"}
-                        if prefix in meta_prefixes or "전용" in prefix:
-                            drop_seed = True
-                #  6-c) 키워드 중복 — 시드의 의미 키워드가 부연에 등장
-                if not drop_seed and seed_keywords:
-                    if any(kw.lower() in body_line.lower() for kw in seed_keywords):
-                        drop_seed = True
-                #  6-d) Trigger-style 시드 — 짧고 '시'/'시점'/'탭' 으로 끝나는 라벨
-                if not drop_seed and len(seed_line) <= 12 and (
-                    seed_line.endswith("시") or seed_line.endswith("시점") or seed_line.endswith("탭")
-                ):
+                #  6-c) 시드가 부연의 substring (4자 이상) — '연결 해제 실패' / '연결 해제 실패 후...'
+                if not drop_seed and len(seed_line) >= 4 and seed_clean in body_line:
                     drop_seed = True
                 if drop_seed:
                     raw_lines = [body_line] + raw_lines[2:]
