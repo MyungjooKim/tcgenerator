@@ -877,18 +877,22 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                 raw_lines = raw_lines[1:]
 
             #  6-a-2) 일관성 확보 — '계산 정확성' 같은 카테고리 헤딩이 첫줄인 경우
-            #         · 2줄 (`계산 정확성` / `PnL`)        → '계산 정확성 — PnL' 1줄로 압축
-            #         · 3줄 (`계산 정확성` / `Est. ...` / 부연) → 마지막 줄(부연) 만 남김
-            #         시드만 있는 케이스도 부연 있는 케이스도 모두 1줄로 통일.
+            #         · 2줄 (`계산 정확성` / `PnL`)              → 'PnL 계산 정확성' 합성
+            #         · 2줄 (`계산 정확성` / `PnL 계산 정확성 확인`) → 둘째 줄 그대로 (중복 방지)
+            #         · 3줄 (`계산 정확성` / `Est.` / 부연)        → 마지막 줄(부연) 만 남김
+            #         모두 1줄로 통일.
             calc_meta_pattern = re.compile(
                 r"^(계산\s*정확성|계산|정확성\s*확인|계산\s*검증)$"
             )
             if len(raw_lines) >= 2 and calc_meta_pattern.match(raw_lines[0].strip()):
                 if len(raw_lines) == 2:
-                    # '계산 정확성' / 'PnL' → 'PnL 계산 정확성' (한 줄)
                     seed = raw_lines[1].strip().rstrip("()").strip()
-                    # paren 안 부연 (`(비율별 재계산)` 등) 보존
-                    raw_lines = [f"{seed} 계산 정확성"]
+                    # 둘째 줄에 이미 '계산 정확성'/'정확성 확인' 키워드가 있으면 그대로 사용 (중복 방지)
+                    if re.search(r"계산\s*정확성|정확성\s*확인", seed):
+                        raw_lines = [seed]
+                    else:
+                        # 'PnL' 같은 단순 시드 → 'PnL 계산 정확성' 합성
+                        raw_lines = [f"{seed} 계산 정확성"]
                 else:
                     # 3줄 이상 — 마지막 줄(부연)만 남김
                     raw_lines = [raw_lines[-1]]
