@@ -1135,6 +1135,52 @@ def parse_approved_classification(classification_md: str, screen_rows: list = No
     return allowed_majors, screen_to_major
 
 
+def detect_suite_screen_mismatches(tcs: list, scr_to_screencode: dict) -> list:
+    """TC ID 의 SuiteCode 와 '연관 화면' SCR 의 ScreenCode 가 일치하는지 검증.
+
+    예: SM-OAC-015 (SuiteCode=OAC, OAuth Connect 화면 의미)
+        연관 화면 = SCR-014 (Google Sign-in Complete, ScreenCode=GSC)
+        → SuiteCode 'OAC' ≠ SCR-014 의 ScreenCode 'GSC' → 검출
+
+    이런 케이스는 AI 가 화면 코드를 잘못 적은 결과 — 대분류·중분류·소분류 모두
+    잘못된 화면 정보를 따라가서 일관된 듯 보이지만 실제론 다른 화면.
+
+    Args:
+        tcs:                parse_tc_markdown 결과
+        scr_to_screencode:  {SCR-014: 'GSC', SCR-801: 'OAC', ...} 매핑 (screen_code_map.md 기반)
+    Returns: 불일치 TC 리스트
+    """
+    mismatches = []
+    for tc in tcs:
+        tc_id = (tc.get("id") or "").strip()
+        screen_code = (tc.get("screen_code") or "").strip()
+        primary_scr = screen_code.split(",")[0].strip() if screen_code else ""
+        if not tc_id or not primary_scr:
+            continue
+
+        # TC ID 의 SuiteCode 추출 — {ProjectCode}-{SuiteCode}-{NNN}
+        # 예: SM-OAC-015 → OAC, SC-TRD-ORDR-001 → TRD-ORDR (다중 세그먼트 SuiteCode 도 지원)
+        m = re.match(r"^[A-Z]{2,}-([A-Z][A-Z0-9\-]*)-\d+$", tc_id)
+        if not m:
+            continue
+        tc_suite = m.group(1).upper()
+
+        # 연관 화면 SCR 의 정답 ScreenCode
+        correct_screencode = scr_to_screencode.get(primary_scr)
+        if not correct_screencode:
+            continue  # 매핑 없으면 검증 스킵
+
+        if tc_suite != correct_screencode.upper():
+            mismatches.append({
+                "tc_id":            tc_id,
+                "screen_code":      primary_scr,
+                "current_suite":    tc_suite,
+                "correct_suite":    correct_screencode,
+                "reason":           "TC ID SuiteCode 와 연관 화면 ScreenCode 불일치",
+            })
+    return mismatches
+
+
 def detect_major_mismatches(tcs: list, allowed_majors: set, screen_to_major: dict) -> list:
     """각 TC 의 대분류가 분류표와 일치하는지 검증.
     반환: 불일치 TC 리스트 [{tc_id, screen_code, current_major, correct_major, reason}, ...]
@@ -1181,20 +1227,23 @@ def detect_major_mismatches(tcs: list, allowed_majors: set, screen_to_major: dic
     return mismatches
 
 
-def build_classification_check(ws, mismatches: list) -> None:
-    """이상 검출 시트 작성. mismatches 가 비어있으면 호출되지 않음 (호출부에서 제어)."""
+def build_classification_check(ws, major_mismatches: list, suite_mismatches: list) -> None:
+    """이상 검출 시트 작성. 두 종류 불일치를 한 시트에 통합 표시.
+      - 대분류 불일치 (AI 가 분류표 외 대분류 또는 다른 영역 대분류 채택)
+      - SuiteCode/SCR 불일치 (TC ID 의 SuiteCode 가 연관 화면 SCR 의 ScreenCode 와 다름)
+    호출부에서 (둘 합쳐서) 0건이면 시트 생성 안 함.
+    """
     ws.sheet_view.showGridLines = False
-    headers = ["TC ID", "화면 코드", "AI 가 적은 대분류", "분류표 정답", "이유"]
-    col_w = [16, 13, 22, 22, 28]
+    headers = ["TC ID", "화면 코드", "유형", "현재 값", "정답", "이유"]
+    col_w = [18, 13, 22, 22, 22, 28]
 
-    # 안내 문구
+    total = len(major_mismatches) + len(suite_mismatches)
     set_cell(ws, 1, 1,
-             f"⚠ 대분류 불일치 검출 — {len(mismatches)}개 TC. 검토 후 수정 필요 (자동 정정 X).",
+             f"⚠ 분류 일관성 불일치 검출 — 총 {total}개 (대분류 {len(major_mismatches)} / SuiteCode-SCR {len(suite_mismatches)}). 검토 후 수정 필요 (자동 정정 X).",
              bold=True, bg=C_DARK, font_color=C_WHITE, size=11, align_h="left")
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
     ws.row_dimensions[1].height = 24
 
-    # 헤더
     for ci, (h, w) in enumerate(zip(headers, col_w), 1):
         c = ws.cell(2, ci, h)
         c.font = make_font(bold=True, color=C_WHITE, size=10)
@@ -1204,19 +1253,24 @@ def build_classification_check(ws, mismatches: list) -> None:
         ws.column_dimensions[get_column_letter(ci)].width = w
     ws.row_dimensions[2].height = 22
 
-    # 행
-    for ri, m in enumerate(mismatches, 3):
+    # 정렬: 대분류 불일치 먼저, 그 다음 SuiteCode 불일치
+    rows = []
+    for m in major_mismatches:
+        rows.append((m["tc_id"], m["screen_code"], "대분류 불일치",
+                     m["current_major"], m["correct_major"], m["reason"]))
+    for m in suite_mismatches:
+        rows.append((m["tc_id"], m["screen_code"], "SuiteCode 불일치",
+                     m["current_suite"], m["correct_suite"], m["reason"]))
+
+    for ri, row in enumerate(rows, 3):
         bg = C_ROW_A if (ri - 3) % 2 == 0 else C_ROW_B
-        set_cell(ws, ri, 1, m["tc_id"],         bg=bg, align_h="left")
-        set_cell(ws, ri, 2, m["screen_code"],   bg=bg, align_h="center")
-        set_cell(ws, ri, 3, m["current_major"], bg=bg, align_h="left")
-        set_cell(ws, ri, 4, m["correct_major"], bg=bg, align_h="left")
-        set_cell(ws, ri, 5, m["reason"],        bg=bg, align_h="left")
+        for ci, val in enumerate(row, 1):
+            align = "center" if ci in (2, 3) else "left"
+            set_cell(ws, ri, ci, val, bg=bg, align_h=align)
         ws.row_dimensions[ri].height = 20
 
-    # 필터
     last_col = get_column_letter(len(headers))
-    ws.auto_filter.ref = f"A2:{last_col}{len(mismatches) + 2}"
+    ws.auto_filter.ref = f"A2:{last_col}{len(rows) + 2}"
     ws.freeze_panes = "A3"
 
 
@@ -1370,25 +1424,57 @@ def run_build(phase: str, tc_path, output_dir,
     if verbose:
         print(f"  → 대분류별 시트 {len(major_order)}개 생성")
 
-    # ── 대분류 불일치 검출 (검출 전용, 자동 정정 X) ─────────────────────
-    # 분류표(classification_v1_APPROVED.md) 가 tc_path 와 같은 디렉토리에 있으면 로드.
-    # 검출된 불일치가 있을 때만 'classification_check' 시트 추가 (없으면 시트 안 만듦).
+    # ── 분류 일관성 검출 (검출 전용, 자동 정정 X) ───────────────────────
+    # 두 종류 불일치를 한 시트로 통합:
+    #   1) 대분류 불일치  — AI 가 분류표 외 또는 다른 영역 대분류 채택
+    #   2) SuiteCode/SCR 불일치 — TC ID 의 SuiteCode 와 연관 화면 SCR 의 ScreenCode 가 다름
+    # 분류표는 tc_path 디렉토리의 classification_v1_APPROVED.md 에서 로드.
     classification_path = Path(tc_path).parent / "classification_v1_APPROVED.md"
     if classification_path.exists():
         try:
             classification_md = classification_path.read_text(encoding="utf-8")
             allowed_majors, screen_to_major = parse_approved_classification(classification_md)
-            mismatches = detect_major_mismatches(tcs, allowed_majors, screen_to_major)
-            if mismatches:
+            major_mm = detect_major_mismatches(tcs, allowed_majors, screen_to_major)
+
+            # SCR → ScreenCode 매핑은 메타 주석 + 화면 ID 패턴에서 직접 추출
+            # 분류표에 '<!-- SCR: SCR-XXX -->' 다음 줄에 중분류명, 또는 직접 화면 코드
+            # screen_code_map.md 의 SCR ↔ ScreenCode 매핑이 필요해 별도 로드.
+            scr_to_screencode = {}
+            try:
+                # screen_code_map.md 는 tc-agent/projects/{project}/ 위치
+                # tc_path 가 workspace 안이므로 거기서는 직접 못 찾음. 환경 변수나
+                # 휴리스틱으로 찾기 — 일단 sibling 인 spec/projects 폴더 확인.
+                from . import build_excel as _self  # noqa
+            except Exception:
+                pass
+            # 간단 휴리스틱: TC 의 screen_code 와 SuiteCode 직접 매핑 추출
+            # (TC ID 가 보통 screen-based 면 ScreenCode = SuiteCode)
+            # → TC 들 자체에서 SCR-X → SuiteCode 빈도 집계 (가장 흔한 게 정답)
+            from collections import Counter
+            scr_suite_count: dict[str, Counter] = {}
+            for tc in tcs:
+                sc = (tc.get("screen_code") or "").split(",")[0].strip()
+                tc_id = tc.get("id", "")
+                m = re.match(r"^[A-Z]{2,}-([A-Z][A-Z0-9\-]*)-\d+$", tc_id)
+                if sc and m:
+                    scr_suite_count.setdefault(sc, Counter())[m.group(1).upper()] += 1
+            for scr, counter in scr_suite_count.items():
+                # 가장 빈번한 SuiteCode 를 정답으로 (다수결)
+                scr_to_screencode[scr] = counter.most_common(1)[0][0]
+
+            suite_mm = detect_suite_screen_mismatches(tcs, scr_to_screencode)
+
+            total_mm = len(major_mm) + len(suite_mm)
+            if total_mm > 0:
                 ws_check = wb.create_sheet("classification_check")
-                build_classification_check(ws_check, mismatches)
+                build_classification_check(ws_check, major_mm, suite_mm)
                 if verbose:
-                    print(f"  → ⚠ 대분류 불일치 {len(mismatches)}개 검출 — 'classification_check' 시트 참고")
+                    print(f"  → ⚠ 분류 불일치 {total_mm}개 검출 (대분류 {len(major_mm)} / SuiteCode {len(suite_mm)}) — 'classification_check' 시트 참고")
             elif verbose:
-                print(f"  → ✓ 대분류 일관성 검증 통과 (0개 불일치)")
+                print(f"  → ✓ 분류 일관성 검증 통과 (0개 불일치)")
         except Exception as e:
             if verbose:
-                print(f"  → 대분류 검증 스킵: {e}")
+                print(f"  → 분류 검증 스킵: {e}")
 
     # 임시 placeholder 시트 제거 (표지가 꺼졌을 때 첫 시트가 비어있는 상태 방지)
     if "_placeholder" in wb.sheetnames:
