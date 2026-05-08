@@ -770,8 +770,13 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
             s = minor_display.strip()
             # 1) ** 강조 제거
             s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
-            # 2) 메타 마커 제거 — [통합 ...], [미결 ...], [그룹 ...] 등 대괄호 안 텍스트
-            s = re.sub(r"\s*\[(통합|미결|그룹|메모|TODO|보류)[^\]]*\]\s*", " ", s)
+            # 2) 메타 마커 제거 — 대괄호 안 카테고리 메타 (TC 본문이 아니라 분류 라벨)
+            #    예: [보안] URL 바 → URL 바 / [정책] 스마트 라우팅 → 스마트 라우팅
+            s = re.sub(
+                r"\s*\[(통합|미결|그룹|메모|TODO|보류|보안|정책|제약|접근성|세션|타이밍|dev|"
+                r"성능|UX|UI|에러|edge|규약|규칙)[^\]]*\]\s*",
+                " ", s, flags=re.IGNORECASE,
+            )
             # 3) Legacy 부연설명 제거 — '…', 긴 괄호 텍스트 (15자 이상)
             s = re.sub(r"…+", "", s)
             s = re.sub(r"\s*\([^)]{15,}\)\s*", " ", s)
@@ -792,15 +797,16 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
             # 5-b) Trigger label 콜론 한 줄 → 줄바꿈으로 분리
             #      예: '화면 진입 시: OAuth Connect 화면 UI 요소 표시 확인'
             #            → '화면 진입 시\nOAuth Connect 화면 UI 요소 표시 확인'
+            #      'Reconnect with OKX 버튼 탭 시: OAuth 웹뷰 진입 확인' 같은 긴 trigger 도 처리
             #      이후 6-a 메타 시드 제거에서 trigger label 자동 정리
-            m_trig_colon = re.match(r"^([^:\n]{1,12}):\s*(.+)$", s)
+            m_trig_colon = re.match(r"^([^:\n]+):\s*(.+)$", s)
             if m_trig_colon:
                 head = m_trig_colon.group(1).strip()
                 head_clean = re.sub(r'["\'`]', "", head).strip()
-                if len(head_clean) <= 12 and (
-                    head_clean.endswith("시") or head_clean.endswith("시점") or
-                    head_clean.endswith("탭") or head_clean.endswith("클릭")
-                ):
+                if (head_clean.endswith("시") or head_clean.endswith("시점") or
+                        head_clean.endswith("탭") or head_clean.endswith("후") or
+                        head_clean.endswith("클릭") or head_clean.endswith("진입") or
+                        head_clean.endswith("선택")):
                     s = f"{head}\n{m_trig_colon.group(2).strip()}"
 
             # 6) 다중 라인 처리 — 시드/부연 패턴 정리 (시드 제거 우선순위)
@@ -834,11 +840,17 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
                                      "spec", "메모", "todo", "참고", "비고"}
                     if prefix in meta_prefixes or "전용" in prefix:
                         return True
-                # Trigger label
-                if len(cleaned) <= 12 and (
-                    cleaned.endswith("시") or cleaned.endswith("시점") or cleaned.endswith("탭")
-                ):
-                    return True
+                # Trigger label — 길이 무관, '… 시'/'… 시점'/'… 탭'/'… 후'/'… 클릭'/'… 진입'/'… 선택'
+                # 부연이 본질이므로 trigger 라벨 자체는 메타로 간주
+                if (cleaned.endswith("시") or cleaned.endswith("시점") or
+                        cleaned.endswith("탭") or cleaned.endswith("후") or
+                        cleaned.endswith("클릭") or cleaned.endswith("진입") or
+                        cleaned.endswith("선택")):
+                    # 단, 부연을 동반한 의미있는 문장은 제외 (예: '... 표시 확인')
+                    # cleaned 의 의미 단어가 6개 이하면 trigger 라벨로 판정
+                    word_count = len([w for w in re.split(r"[\s.·/\-—]+", cleaned) if len(w) >= 2])
+                    if word_count <= 6:
+                        return True
                 return False
 
             #  6-a) 3+줄 카테고리 헤딩 패턴 — 위에서부터 메타 라인 제거

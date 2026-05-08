@@ -654,22 +654,23 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
         label = re.sub(r"`[^`]+`", "", label)              # 백틱 코드 제거
         label = re.sub(r"<[^>]+>", "", label)              # HTML 태그 제거
         # 콜론·괄호 뒤 부연설명 cutoff — '키' 부분만 남김 (단, 너무 짧아지면 원본 유지)
-        # Trigger label guard: head 가 trigger 라벨('… 시', '… 시점', '… 탭') 이면
-        # cutoff 시 의미 손실 → 전체 라벨 보존 (이후 build_excel 후처리에서 다중라인 정리)
-        # 예: '화면 진입 시: OAuth Connect 화면 UI 요소 표시 확인' → cutoff 하면
-        #      '화면 진입 시' 만 남아 핵심 부연이 사라짐
+        # Trigger label guard: head 가 trigger 라벨('… 시', '… 시점', '… 탭', '… 후',
+        # '… 클릭') 로 끝나면 cutoff 시 의미 손실 → 전체 라벨 보존
+        # 길이 제한 없음 — 'Reconnect with OKX 버튼 탭 시' 같은 긴 trigger 도 보호.
+        # 이후 build_excel 후처리에서 다중라인 정리.
         for sep in [":", "("]:
             if sep in label:
                 head = label.split(sep, 1)[0].strip()
                 if len(head) >= 6:
                     head_clean = re.sub(r'["\'`]', "", head).strip()
                     is_trigger = (
-                        len(head_clean) <= 12 and (
-                            head_clean.endswith("시") or
-                            head_clean.endswith("시점") or
-                            head_clean.endswith("탭") or
-                            head_clean.endswith("클릭")
-                        )
+                        head_clean.endswith("시") or
+                        head_clean.endswith("시점") or
+                        head_clean.endswith("탭") or
+                        head_clean.endswith("후") or
+                        head_clean.endswith("클릭") or
+                        head_clean.endswith("진입") or
+                        head_clean.endswith("선택")
                     )
                     if not is_trigger:
                         label = head
