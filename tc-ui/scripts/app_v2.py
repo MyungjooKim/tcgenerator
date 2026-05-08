@@ -646,8 +646,26 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
         label = label.strip().rstrip(".·")
         if not label:
             return
-        if len(label) > 50:
-            label = label[:50].rstrip() + "…"
+        # 정규화 — 시인성 강화 (v0.10.x):
+        #   1) Markdown ** 강조 제거
+        #   2) 콜론·따옴표·파이프 뒤의 긴 부연설명 컷 (예: "권한 목록 (Read…" → "권한 목록")
+        #   3) 백틱·HTML 코드 제거
+        label = re.sub(r"\*\*([^*]+)\*\*", r"\1", label)  # **xxx** → xxx
+        label = re.sub(r"`[^`]+`", "", label)              # 백틱 코드 제거
+        label = re.sub(r"<[^>]+>", "", label)              # HTML 태그 제거
+        # 콜론·괄호 뒤 부연설명 cutoff — '키' 부분만 남김 (단, 너무 짧아지면 원본 유지)
+        for sep in [":", "("]:
+            if sep in label:
+                head = label.split(sep, 1)[0].strip()
+                if len(head) >= 6:
+                    label = head
+                    break
+        # 짧은 라벨 (32자) 보장 — 길면 '…' 없이 깔끔하게 잘라냄
+        label = re.sub(r"\s+", " ", label).strip(" .·-—")
+        if len(label) > 32:
+            label = label[:32].rstrip()
+        if len(label) < 3:
+            return
         key = re.sub(r"\s+", "", label.lower())
         if key in seen_keys:
             return

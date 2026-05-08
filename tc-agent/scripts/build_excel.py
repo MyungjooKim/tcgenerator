@@ -759,12 +759,55 @@ def build_tc_list(ws, tcs, config, include_reason=False, group_by="domain",
         # 중분류/소분류
         middle_display = tc.get("middle") or DOMAIN_LABELS.get(tc["domain"], tc["domain"])
         minor_display  = tc.get("minor") or ""
-        # 소분류 정규화: 'A — B' / 'A - B' / 'A – B' 형태로 두 문장 이상 연결된 경우
-        # 가독성을 위해 줄바꿈으로 분리. 한 문장이면 그대로 유지.
-        # 단, 단순 하이픈 단어(예: 'TP/SL', 'iOS Safari')는 양쪽 공백이 있는 dash 만 분리.
+        # 소분류 간결화 (v0.10.x):
+        #   1) Markdown ** 강조 제거 — '**destructive 가드**' → 'destructive 가드'
+        #   2) 메타 마커 제거 — '[통합 — 그룹 대표 화면 검증]' '[미결]' 등 대괄호 메타
+        #   3) 중복 라벨 제거 — 'Normal 상태 표시 및 동작 — Normal 상태 UI 표시' 처럼
+        #      앞뒤가 같은 키워드를 반복하면 시드 부분 제거
+        #   4) 'A — B' 형태 두 문장 연결은 가독성을 위해 줄바꿈
+        #   5) 너무 길면 절단 (35자 + 두 번째 줄도 35자)
         if minor_display:
-            # 양쪽 공백 있는 em/en/double dash 또는 일반 hyphen 패턴만 줄바꿈
-            minor_display = re.sub(r"\s+[—–\-]{1,2}\s+", "\n", minor_display)
+            s = minor_display.strip()
+            # 1) ** 강조 제거
+            s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+            # 2) 메타 마커 제거 — [통합 ...], [미결 ...], [그룹 ...] 등 대괄호 안 텍스트
+            s = re.sub(r"\s*\[(통합|미결|그룹|메모|TODO|보류)[^\]]*\]\s*", " ", s)
+            # 3) Legacy 부연설명 제거 — '…', 긴 괄호 텍스트 (15자 이상)
+            #    예: '권한 목록 (Read account / Read balances / Withdrawals…)' → '권한 목록'
+            s = re.sub(r"…+", "", s)
+            s = re.sub(r"\s*\([^)]{15,}\)\s*", " ", s)
+            # 3-b) Mismatched paren — 닫는 괄호 없이 긴 슬래시 나열 등은 '(' 이후 일부 보존
+            #      예: '권한 목록 (Read account / Read balances / Withdrawals 항목 비활성 ...'
+            #           → 닫는 ')' 부재 + 슬래시 2개 이상 → '(' 직전까지만 사용
+            m_open = re.match(r"^(.+?)\s*\(([^)]+)$", s)
+            if m_open and m_open.group(2).count("/") >= 2 and len(m_open.group(2)) > 20:
+                s = m_open.group(1).strip()
+            # 4) 'X — Y' 중복 키워드 제거: X 의 첫 단어가 Y 에 다시 등장하면 X 제거
+            #    예: 'Normal 상태 표시 및 동작 — Normal 상태 UI 표시 확인' → 'Normal 상태 UI 표시 확인'
+            m_dash = re.match(r"^(.+?)\s+[—–\-]{1,2}\s+(.+)$", s)
+            if m_dash:
+                seed, body = m_dash.group(1).strip(), m_dash.group(2).strip()
+                seed_first = re.split(r"[\s/]", seed)[0]
+                if len(seed_first) >= 3 and seed_first.lower() in body.lower():
+                    s = body
+            # 5) 짧은 괄호는 ', ' 로 변환 (단순 동의어/예시는 유지)
+            s = re.sub(r"\s*\(([^)]{1,14})\)\s*", r" (\1) ", s)
+            # 6) 양쪽 공백 dash 는 줄바꿈 (남아있는 경우만)
+            s = re.sub(r"\s+[—–\-]{1,2}\s+", "\n", s)
+            # 7) 줄별 길이 제한 32자 (한글 가독성, 30자 내 목표)
+            cleaned_lines = []
+            for line in s.split("\n"):
+                line = re.sub(r"\s+", " ", line).strip(" .·-—:")
+                if len(line) > 32:
+                    # 마지막 공백 위치에서 절단해 단어 보존
+                    cut = line[:32].rstrip()
+                    last_space = cut.rfind(" ")
+                    if last_space >= 20:
+                        cut = cut[:last_space]
+                    line = cut.rstrip(" .·-—:")
+                if line:
+                    cleaned_lines.append(line)
+            minor_display = "\n".join(cleaned_lines)
 
         # 거래소 정보 추출
         exchange_text = ""
