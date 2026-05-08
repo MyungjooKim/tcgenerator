@@ -12826,6 +12826,17 @@ async function openDriveFolderModal(email) {
   modal.classList.add('open');
   document.getElementById('driveFolderEmail').textContent = email ? '로그인 계정: ' + email : '';
   document.getElementById('driveFolderSearch').value = '';
+  // 업로드 버튼 상태 초기화 — 이전 업로드 직후 '⏳ 업로드 중...' 텍스트가
+  // 잔존하던 버그 차단. 폴더 미선택 상태로 시작하므로 disabled 도 true.
+  const uploadBtn = document.getElementById('driveUploadBtn');
+  if (uploadBtn) {
+    uploadBtn.textContent = '✅ 이 폴더에 업로드';
+    uploadBtn.disabled = true;
+  }
+  // 이전 선택 폴더 표시도 리셋
+  _selectedDriveFolder = null;
+  const status = document.getElementById('driveSelectedFolder');
+  if (status) status.textContent = '';
   await loadDriveFolders('');
   document.getElementById('driveFolderSearch').focus();
 }
