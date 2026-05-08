@@ -1082,6 +1082,144 @@ def build_change_history(ws, tcs) -> int:
 # ── 시트명 생성 ────────────────────────────────────────────────────
 # Excel 제약: 31자 이내, `: \ / ? * [ ]` 금지, 같은 이름 중복 금지.
 
+def parse_approved_classification(classification_md: str, screen_rows: list = None) -> tuple[set, dict]:
+    """분류표 마크다운에서 ground truth 추출.
+    반환: (allowed_majors, screen_to_major)
+      - allowed_majors: 분류표의 모든 '## 대분류:' 값 set
+      - screen_to_major: SCR-XXX → 정답 대분류 dict
+
+    SCR 매핑 우선순위:
+      1) screen_rows (parse_screen_list_table 결과) — 가장 정확한 ground truth
+      2) classification_md 안의 소분류 라인에서 SCR-XXX 추출 (중분류명만 있어
+         SCR ID 가 분류표에 없는 경우 대비 폴백)
+    """
+    allowed_majors: set[str] = set()
+    screen_to_major: dict[str, str] = {}
+    current_major = ""
+
+    # 1) screen_rows 우선 사용 (가장 정확)
+    if screen_rows:
+        for r in screen_rows:
+            scr = (r.get("id") or "").upper()
+            major = (r.get("major") or "").strip()
+            if scr and major:
+                screen_to_major[scr] = major
+                allowed_majors.add(major)
+
+    # 2) classification_md 파싱 (대분류 set 보강 + screen_rows 누락 SCR 폴백)
+    #    인식 패턴:
+    #      A) '## 대분류: XXX' — allowed_majors 등록
+    #      B) '<!-- SCR: SCR-001 -->' 메타 주석 — build_classification_from_screen_list 가 삽입
+    #      C) 소분류 라인 안 'SCR-XXX' — 자유 형식 폴백
+    scr_meta_pat = re.compile(r"<!--\s*SCR:\s*(SCR-[A-Za-z0-9]+)\s*-->", re.IGNORECASE)
+    for line in classification_md.splitlines():
+        m_major = re.match(r"^##\s+대분류[:\s]+(.+?)\s*$", line)
+        if m_major:
+            current_major = m_major.group(1).strip()
+            allowed_majors.add(current_major)
+            continue
+        if current_major:
+            # B) 메타 주석 우선
+            m_meta = scr_meta_pat.search(line)
+            if m_meta:
+                scr = m_meta.group(1).upper()
+                if scr not in screen_to_major:
+                    screen_to_major[scr] = current_major
+                continue
+            # C) 소분류 라인의 SCR 패턴 폴백
+            if line.lstrip().startswith("-"):
+                for m in re.finditer(r"\bSCR-[A-Za-z0-9]+\b", line):
+                    scr = m.group(0).upper()
+                    if scr not in screen_to_major:
+                        screen_to_major[scr] = current_major
+    return allowed_majors, screen_to_major
+
+
+def detect_major_mismatches(tcs: list, allowed_majors: set, screen_to_major: dict) -> list:
+    """각 TC 의 대분류가 분류표와 일치하는지 검증.
+    반환: 불일치 TC 리스트 [{tc_id, screen_code, current_major, correct_major, reason}, ...]
+    자동 정정 안 함 — 검출만.
+
+    검증 우선순위:
+      1) 대분류 값이 분류표(allowed_majors)에 없음 → 명백한 오류
+      2) 대분류 값은 분류표에 있지만, 이 TC 의 SCR 정답과 일치하지 않음 → 영역 혼동
+    SCR 컨텍스트 없으면 (1)만 검증, (2)는 스킵.
+    """
+    mismatches = []
+    for tc in tcs:
+        current = (tc.get("major") or "").strip()
+        scr_code = (tc.get("screen_code") or "").strip()
+        # 첫 SCR 만 사용 (쉼표로 여러 개 있을 때)
+        primary_scr = scr_code.split(",")[0].strip() if scr_code else ""
+
+        if not current:
+            continue  # 빈 대분류는 검증 스킵
+
+        # (1) 분류표에 없는 대분류
+        if current not in allowed_majors:
+            correct = screen_to_major.get(primary_scr) if primary_scr else None
+            mismatches.append({
+                "tc_id":          tc.get("id", ""),
+                "screen_code":    primary_scr or "(컨텍스트 없음)",
+                "current_major":  current,
+                "correct_major":  correct or "(분류표에서 SCR 매핑 못 찾음)",
+                "reason":         "분류표 미등록 대분류",
+            })
+            continue
+
+        # (2) 분류표에는 있지만 SCR 정답과 다름 (SCR 컨텍스트 있을 때만)
+        if primary_scr and primary_scr in screen_to_major:
+            correct = screen_to_major[primary_scr]
+            if current != correct:
+                mismatches.append({
+                    "tc_id":          tc.get("id", ""),
+                    "screen_code":    primary_scr,
+                    "current_major":  current,
+                    "correct_major":  correct,
+                    "reason":         "SCR 소속 대분류와 불일치",
+                })
+    return mismatches
+
+
+def build_classification_check(ws, mismatches: list) -> None:
+    """이상 검출 시트 작성. mismatches 가 비어있으면 호출되지 않음 (호출부에서 제어)."""
+    ws.sheet_view.showGridLines = False
+    headers = ["TC ID", "화면 코드", "AI 가 적은 대분류", "분류표 정답", "이유"]
+    col_w = [16, 13, 22, 22, 28]
+
+    # 안내 문구
+    set_cell(ws, 1, 1,
+             f"⚠ 대분류 불일치 검출 — {len(mismatches)}개 TC. 검토 후 수정 필요 (자동 정정 X).",
+             bold=True, bg=C_DARK, font_color=C_WHITE, size=11, align_h="left")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    ws.row_dimensions[1].height = 24
+
+    # 헤더
+    for ci, (h, w) in enumerate(zip(headers, col_w), 1):
+        c = ws.cell(2, ci, h)
+        c.font = make_font(bold=True, color=C_WHITE, size=10)
+        c.fill = make_fill(C_DARK)
+        c.alignment = make_align(wrap=True, h="center")
+        c.border = make_border()
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[2].height = 22
+
+    # 행
+    for ri, m in enumerate(mismatches, 3):
+        bg = C_ROW_A if (ri - 3) % 2 == 0 else C_ROW_B
+        set_cell(ws, ri, 1, m["tc_id"],         bg=bg, align_h="left")
+        set_cell(ws, ri, 2, m["screen_code"],   bg=bg, align_h="center")
+        set_cell(ws, ri, 3, m["current_major"], bg=bg, align_h="left")
+        set_cell(ws, ri, 4, m["correct_major"], bg=bg, align_h="left")
+        set_cell(ws, ri, 5, m["reason"],        bg=bg, align_h="left")
+        ws.row_dimensions[ri].height = 20
+
+    # 필터
+    last_col = get_column_letter(len(headers))
+    ws.auto_filter.ref = f"A2:{last_col}{len(mismatches) + 2}"
+    ws.freeze_panes = "A3"
+
+
 def _sheet_title_for_major(major_name: str, existing: list) -> str:
     """대분류명을 엑셀 시트명으로 변환. 중복이면 번호를 붙여 유일화."""
     s = re.sub(r'[:\\/\?\*\[\]]', ' ', major_name).strip() or "Sheet"
@@ -1231,6 +1369,26 @@ def run_build(phase: str, tc_path, output_dir,
 
     if verbose:
         print(f"  → 대분류별 시트 {len(major_order)}개 생성")
+
+    # ── 대분류 불일치 검출 (검출 전용, 자동 정정 X) ─────────────────────
+    # 분류표(classification_v1_APPROVED.md) 가 tc_path 와 같은 디렉토리에 있으면 로드.
+    # 검출된 불일치가 있을 때만 'classification_check' 시트 추가 (없으면 시트 안 만듦).
+    classification_path = Path(tc_path).parent / "classification_v1_APPROVED.md"
+    if classification_path.exists():
+        try:
+            classification_md = classification_path.read_text(encoding="utf-8")
+            allowed_majors, screen_to_major = parse_approved_classification(classification_md)
+            mismatches = detect_major_mismatches(tcs, allowed_majors, screen_to_major)
+            if mismatches:
+                ws_check = wb.create_sheet("classification_check")
+                build_classification_check(ws_check, mismatches)
+                if verbose:
+                    print(f"  → ⚠ 대분류 불일치 {len(mismatches)}개 검출 — 'classification_check' 시트 참고")
+            elif verbose:
+                print(f"  → ✓ 대분류 일관성 검증 통과 (0개 불일치)")
+        except Exception as e:
+            if verbose:
+                print(f"  → 대분류 검증 스킵: {e}")
 
     # 임시 placeholder 시트 제거 (표지가 꺼졌을 때 첫 시트가 비어있는 상태 방지)
     if "_placeholder" in wb.sheetnames:

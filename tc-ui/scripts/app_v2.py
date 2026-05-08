@@ -882,6 +882,9 @@ def build_classification_from_screen_list(screen_rows: list[dict], project_name:
             # 화면명이 비어있는 폴백 케이스에서만 ID 를 사용.
             screen_label = (s["name"] or s["id"]).strip()
             lines.append(f"### 중분류: {screen_label}")
+            # 메타 주석 — build_excel 의 대분류 검증용 SCR 매핑 ground truth.
+            # 사용자에게 보이는 분류표 시각에는 영향 없음 (HTML 주석).
+            lines.append(f"<!-- SCR: {s['id']} -->")
             lines.append("")
             lines.append("#### 소분류")
 
