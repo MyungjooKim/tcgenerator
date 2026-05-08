@@ -146,10 +146,23 @@ def parse_tc_markdown(filepath):
     with open(filepath, encoding="utf-8") as f:
         content = f.read()
 
+    # ── v0.10.x: 화면 컨텍스트 추적 — step_write_tc_per_screen 이 TC 본문 앞에
+    #    '<!-- SCR-XXX — Title -->' 주석을 삽입해 화면 단위 헤더로 사용함.
+    #    AI 가 TC 의 "연관 화면" 필드에 SCR-ID 를 빼먹고 화면명만 적은 경우(예:
+    #    'Portfolio Overview') screen_code 컬럼이 빈 칸이 되는 버그 방어.
+    #    각 블록 직전의 가장 최근 SCR 컨텍스트를 추적해 빈 코드일 때 보충.
+    scr_context_pat = re.compile(r"<!--\s*(SCR-[A-Z0-9]+)\s*[—\-:]", re.IGNORECASE)
+
     tcs = []
     blocks = re.split(r'\n(?=### )', content)
+    current_scr_context = ""  # 현재 위치까지 등장한 가장 최근 SCR 컨텍스트
 
     for block in blocks:
+        # 블록 안에 SCR 컨텍스트 헤더가 있으면 갱신 (다음 TC 들이 이 화면 소속)
+        m_ctx = scr_context_pat.search(block)
+        if m_ctx:
+            current_scr_context = m_ctx.group(1).upper()
+
         if not block.strip().startswith('###'):
             continue
 
@@ -219,6 +232,12 @@ def parse_tc_markdown(filepath):
         code_pat = re.compile(r"(?:SCR|SCREEN|PAGE)-[A-Za-z0-9]+")
         codes_found = code_pat.findall(tc["screen"]) if tc["screen"] else []
         tc["screen_code"] = ", ".join(dict.fromkeys(codes_found))  # 중복 제거 · 순서 유지
+
+        # 안전망: AI 가 "연관 화면" 에 SCR-ID 없이 화면명만 적은 경우(예: 'Portfolio
+        # Overview') 화면 코드 컬럼이 빈 칸이 됨. step_write_tc_per_screen 의
+        # '<!-- SCR-XXX -->' 컨텍스트 주석을 사용해 자동 보충.
+        if not tc["screen_code"] and current_scr_context:
+            tc["screen_code"] = current_scr_context
 
         # 대분류/중분류/소분류 추출 (신규 형식)
         # 대분류 필드 예: "Authentication & Onboarding (AUTH)" → "AUTH" 코드 파싱
