@@ -619,6 +619,13 @@ def _mark_smoke(tcs):
     """
     from collections import defaultdict
 
+    # 작성자 명시 Smoke 우선 — 헤딩에 ** bold 처리된 TC (tc["star"]) 는
+    # 작성자가 의도적으로 Smoke 로 표시한 것이므로 smoke=True 로 승격.
+    # 이후 자동 보충 로직은 작성자 마킹이 부족한 영역만 채움.
+    for tc in tcs:
+        if tc.get("star"):
+            tc["smoke"] = True
+
     # 중분류별 그룹핑 (domain + middle)
     mid_groups = defaultdict(list)
     for tc in tcs:
@@ -626,6 +633,10 @@ def _mark_smoke(tcs):
         mid_groups[key].append(tc)
 
     for key, group in mid_groups.items():
+        # 작성자가 이미 Smoke 마킹한 그룹은 자동 보충 skip (의도 존중)
+        if any(tc.get("smoke") for tc in group):
+            continue
+
         # 1. 대표 Positive 1개: High > Medium > Low 순
         pos_picked = False
         for pri_target in [("high", "높음"), ("medium", "보통"), ("low", "낮음")]:
@@ -1666,8 +1677,19 @@ def build_obligatory_check(ws, missing: list, total_patterns: int) -> None:
 def _sheet_title_for_major(major_name: str, existing: list) -> str:
     """대분류명을 엑셀 시트명으로 변환. 중복이면 번호를 붙여 유일화."""
     s = re.sub(r'[:\\/\?\*\[\]]', ' ', major_name).strip() or "Sheet"
-    # 괄호 코드 제거 — 시트명은 사람 친화형
-    s = re.sub(r"\s*[\(\（][A-Z]{2,8}[\)\）]", "", s).strip()
+    # 괄호 코드 제거 — 시트명은 사람 친화형 (예: 'Footer (FOOT)' → 'Footer')
+    # 단, 의미있는 단어 (혼합 케이스 또는 길이 4자+ 의 의미 단어) 는 보존
+    # 'Footer (FOOT)' 의 'FOOT' 는 전부 대문자 약어 → 제거
+    # 'Trade(Combo)' 의 'Combo' 는 카멜 케이스 → 보존
+    # 보수적 규칙: 괄호 안이 전체 대문자 + 2~8자 일 때만 약어로 간주
+    def _is_abbrev_paren(m):
+        inner = m.group(1)
+        return inner.isupper() and 2 <= len(inner) <= 8
+    s = re.sub(
+        r"\s*[\(\（]([A-Za-z]{2,8})[\)\）]",
+        lambda m: "" if _is_abbrev_paren(m) else m.group(0),
+        s,
+    ).strip()
     candidate = s
     if len(candidate) > 31:
         candidate = candidate[:31]

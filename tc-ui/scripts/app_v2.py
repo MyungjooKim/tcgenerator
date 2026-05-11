@@ -53,16 +53,20 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.10.1"
-APP_VERSION_DATE    = "2026-05-07"
-APP_VERSION_TAGLINE = "TC ID 화면 단위 리셋 + 계산·표시 정확성 패턴 보강"
+APP_VERSION         = "v0.11.0"
+APP_VERSION_DATE    = "2026-05-11"
+APP_VERSION_TAGLINE = "Combo 모드 — 옵션 조합 + 사용자 시나리오 그레이박스 TC"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆔 TC ID 화면(SCR) 단위 001~ 리셋 — 기존 screen_code_map.md 인프라 재사용 (SCR-104 → SM-ORC-001)",
-    "📋 spec v0.47.2 의 미등록 13개 화면 ScreenCode 정식 등록 (45/45 자동 파생 0개)",
-    "🧮 계산·표시 정확성 패턴 30+6 카테고리 — ROE/PnL/Funding rate · 정렬/형식변환/색상분기/검색/실시간 갱신",
-    "🛡 대분류 값에 임의 prefix(02.Trade) 추가하던 시트 분리 버그 fix (tc-rules.md 예시 추상화)",
-    "🐛 마지막 TC 잘림 자동 보충 + max_tokens 20K (streaming 임계 회피)",
+    "🧩 Combo 모드 신규 — 옵션 조합 매트릭스 + 페르소나 시나리오 기반 그레이박스 TC 자동 생성",
+    "🤖 AI 가 spec 폴더 분석해 *_combinations.md 명세 초안 작성 (참조 명세 일관성)",
+    "📋 시나리오 체크박스 선택 UI — 파일 그룹 + 출처 라벨 + 중복 도메인 강조",
+    "🗑️ 명세 파일 UI 삭제 버튼 (Soft delete — *.deleted_<timestamp> 백업)",
+    "🆔 도메인별 SuiteCode 분리 (SM-ORDR-COMBO / SM-LITE-COMBO) — TC ID 충돌 방지",
+    "🔄 Combo 모드 자동 복원 — 프로젝트 재선택 시 라디오/파일/시나리오 체크 상태 복원",
+    "⚡ Combo only 단축 경로 — SCR 분류·Gate·TC 생성 모두 skip, 바로 Combo TC",
+    "🛡 소분류 정규화 강화 — State 라벨, trigger label, 카테고리 헤딩, URL 일반화",
+    "📐 시트 1행만 고정으로 통일, TC 검토에 규칙 기반 품질 검출 통합",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -3145,6 +3149,615 @@ def load_screen_code_map(project_name: str) -> dict[str, dict[str, str]]:
     return mapping
 
 
+# ── 옵션 조합 명세 (order_combinations.md) 파서 ──────────────────────────
+def parse_order_combinations(project_name: str) -> dict:
+    """projects/{project}/order_combinations.md 를 파싱.
+
+    파일 구조 (가정):
+      ## 3. 옵션 조합 매트릭스 (Decision Table)
+        ### 3.1 정상 케이스 ...
+          | OC-ID | ... | 기대 결과 |
+          | OC-001 | ... |
+      ## 4. 사용자 시나리오 (Use Case Sequence)
+        ### S1: ...
+          **페르소나:** ...
+          **특성:** ...
+          | Step | 동작 | 사용 OC | 검증 |
+          | S1-1 | ... |
+
+    Returns:
+        {
+          "raw_md": str (전문),
+          "combos": [{id, category, raw_row, headers, cells}],  # 옵션 조합
+          "scenarios": [{id, title, persona, traits, steps:[{step_id, action, oc_ref, verify}]}],
+        }
+    파일 없으면 None 반환.
+    """
+    if not PROJECTS_RULES_DIR.exists():
+        return None
+    pname_lower = project_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+    md_path = None
+    for folder in PROJECTS_RULES_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        fname_lower = folder.name.lower().replace(" ", "").replace("-", "").replace("_", "")
+        if fname_lower not in pname_lower and pname_lower not in fname_lower:
+            continue
+        candidate = folder / "order_combinations.md"
+        if candidate.exists():
+            md_path = candidate
+            break
+    if not md_path:
+        return None
+
+    text = md_path.read_text(encoding="utf-8")
+    result = {"raw_md": text, "combos": [], "scenarios": []}
+
+    # 현재 카테고리 (### 3.1 정상 케이스 등) 추적
+    current_category = None
+    current_table_headers: list[str] = []
+    in_section3 = False
+    in_section4 = False
+    current_scenario = None
+    current_step_table_headers: list[str] = []
+
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        stripped = line.strip()
+
+        # 섹션 진입 판단
+        if stripped.startswith("## 3.") or stripped.startswith("## 3 "):
+            in_section3 = True
+            in_section4 = False
+        elif stripped.startswith("## 4.") or stripped.startswith("## 4 "):
+            in_section3 = False
+            in_section4 = True
+        elif stripped.startswith("## 5.") or stripped.startswith("## 5 "):
+            in_section3 = False
+            in_section4 = False
+
+        if in_section3 and stripped.startswith("### 3."):
+            current_category = re.sub(r"^###\s+3\.\d+\s+", "", stripped)
+            current_table_headers = []
+        if in_section4 and re.match(r"^###\s+(?:⭐\s*)?S\d+", stripped):
+            # 신규 시나리오 시작
+            m = re.match(r"^###\s+(?:⭐\s*)?(S\d+):\s*(.+)$", stripped)
+            if m:
+                current_scenario = {
+                    "id": m.group(1),
+                    "title": m.group(2).strip(),
+                    "persona": "",
+                    "traits": "",
+                    "steps": [],
+                }
+                result["scenarios"].append(current_scenario)
+                current_step_table_headers = []
+            else:
+                current_scenario = None
+
+        # 페르소나/특성 라인 추출 (시나리오 안에서)
+        if current_scenario and stripped.startswith("**페르소나:**"):
+            current_scenario["persona"] = stripped.replace("**페르소나:**", "").strip()
+        elif current_scenario and stripped.startswith("**특성:**"):
+            current_scenario["traits"] = stripped.replace("**특성:**", "").strip()
+
+        # 표 행 파싱
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            # 헤더 / 구분선 거르기
+            if not cells or set(cells[0]) <= set("-"):
+                i += 1
+                continue
+            first = cells[0]
+            # 섹션 3: OC 행 (헤더 또는 데이터)
+            if in_section3:
+                if first.upper().startswith("OC-ID") or first.upper() == "OC-ID":
+                    current_table_headers = cells
+                elif re.match(r"^OC-\d+$", first, re.IGNORECASE) and current_table_headers:
+                    combo = {
+                        "id": first.upper(),
+                        "category": current_category or "(unknown)",
+                        "headers": current_table_headers,
+                        "cells": cells,
+                    }
+                    result["combos"].append(combo)
+            # 섹션 4: 시나리오 step
+            if in_section4 and current_scenario is not None:
+                if first.lower() == "step":
+                    current_step_table_headers = cells
+                elif re.match(r"^S\d+-\d+[a-z]?$", first, re.IGNORECASE) and current_step_table_headers:
+                    # cells: [step_id, 동작, 사용 OC, 검증]
+                    step = {
+                        "step_id": first,
+                        "action": cells[1] if len(cells) > 1 else "",
+                        "oc_ref": cells[2] if len(cells) > 2 else "",
+                        "verify": cells[3] if len(cells) > 3 else "",
+                    }
+                    current_scenario["steps"].append(step)
+        i += 1
+
+    return result
+# ── /옵션 조합 명세 파서 ─────────────────────────────────────────────
+
+
+def step_draft_combo_spec(spec_folder: str, domain: str,
+                          target_scrs: list[str] | None = None,
+                          existing_md: str = "") -> tuple[str, dict]:
+    """spec 폴더 분석 → Combo 명세 (order_combinations.md 형식) 초안 작성.
+
+    Args:
+        spec_folder: 구조화 spec 폴더 경로 (overview/policy/design/scr 분리)
+        domain: 'Trade' / 'Exchange' / 'Portfolio' / 'Markets' / 사용자 입력
+        target_scrs: 분석 대상 SCR ID 리스트 (None=전체)
+        existing_md: 기존 명세 있으면 → 갱신 모드 (참고용)
+    Returns:
+        markdown 형식 명세 초안 (사용자 검토용)
+    """
+    folder = Path(spec_folder).expanduser()
+    if not folder.exists() or not folder.is_dir():
+        raise RuntimeError(f"spec 폴더 없음: {spec_folder}")
+
+    # 분석 대상 spec 수집
+    cls = classify_spec_files(folder)
+    overview_text = ""
+    policy_text = ""
+    if cls.get("overview") and cls["overview"].exists():
+        overview_text = cls["overview"].read_text(encoding="utf-8")[:30000]
+    if cls.get("policy"):
+        policy_text = "\n\n".join(p.read_text(encoding="utf-8") for p in cls["policy"][:3])[:30000]
+
+    # 화면 md 수집 — target_scrs 필터 (없으면 도메인 키워드 기반 추출)
+    screens_md_parts = []
+    domain_keywords = {
+        "Trade": ["order", "trade", "lite", "position", "주문", "거래", "포지션"],
+        "Exchange": ["exchange", "oauth", "api", "connect", "거래소", "연동", "연결"],
+        "Portfolio": ["portfolio", "pnl", "balance", "포트폴리오"],
+        "Markets": ["market", "마켓", "시세"],
+    }
+    keywords = domain_keywords.get(domain, [domain.lower()])
+    for scr_md in sorted(folder.glob("scr/SCR-*.md")):
+        scr_id = scr_md.stem  # SCR-104
+        if target_scrs:
+            if scr_id not in target_scrs:
+                continue
+        else:
+            # 키워드 매칭 (파일명 또는 첫 1000자 본문)
+            content = scr_md.read_text(encoding="utf-8")[:2000].lower()
+            if not any(kw in content for kw in keywords):
+                continue
+        screens_md_parts.append(f"### {scr_id}\n{scr_md.read_text(encoding='utf-8')[:5000]}")
+    screens_md = "\n\n---\n\n".join(screens_md_parts[:10])  # 최대 10개 (토큰 절약)
+
+    # 갱신 모드 안내
+    update_note = ""
+    if existing_md:
+        update_note = f"\n\n## 기존 명세 (갱신 대상)\n\n{existing_md[:15000]}\n\n→ 이 명세를 spec 변경 사항을 반영해 갱신하세요. 기존 OC/시나리오 ID 는 가능한 유지."
+
+    # 참조 명세 자동 탐색 — 형식·구조 일관성 확보용
+    # 우선순위: 1) spec 폴더 안 같은 도메인 / 2) spec 폴더 안 다른 도메인 / 3) projects/*/order_combinations.md
+    reference_md = ""
+    reference_source = ""
+    if not existing_md:  # 갱신 모드 아닐 때만 (갱신 모드는 existing_md 가 더 정확한 참조)
+        # 1) 현재 spec 폴더 안 *_combinations.md 들 찾기
+        spec_combos = list(folder.glob("*_combinations.md"))
+        # 같은 도메인 우선 (파일명 stem 이 domain 키워드 포함하면 같은 도메인으로 간주)
+        domain_lower = domain.lower()
+        same_domain = [p for p in spec_combos if domain_lower in p.stem.lower()]
+        other_domain = [p for p in spec_combos if domain_lower not in p.stem.lower()]
+        ref_candidates = same_domain + other_domain
+        # 2) projects/{name}/order_combinations.md 도 후보
+        if PROJECTS_RULES_DIR.exists():
+            for proj_folder in PROJECTS_RULES_DIR.iterdir():
+                if proj_folder.is_dir():
+                    for p in proj_folder.glob("*_combinations.md"):
+                        if p not in ref_candidates:
+                            ref_candidates.append(p)
+        # 첫 후보 사용 (없으면 빈 값)
+        if ref_candidates:
+            ref_path = ref_candidates[0]
+            try:
+                reference_md = ref_path.read_text(encoding="utf-8")[:20000]
+                reference_source = ref_path.name
+            except Exception:
+                reference_md = ""
+    reference_note = ""
+    if reference_md:
+        reference_note = (
+            f"\n\n## 참조용 형식 예시 ({reference_source})\n\n"
+            f"다른 도메인의 기존 명세입니다. **이 파일의 구조·형식·일관성을 그대로 따라 작성**하세요.\n"
+            f"(내용은 다르지만 옵션 차원 표 / Decision Table 카테고리 / 시나리오 페르소나 / 위험 등급 형식 동일하게):\n\n"
+            f"```markdown\n{reference_md}\n```\n"
+        )
+
+    system_prompt = f"""당신은 블랙박스 테스트 도메인 전문가입니다.
+사용자가 제공한 기획서(spec)를 분석하여 **옵션 조합 + 사용자 시나리오 기반 그레이박스 테스트 명세** (`order_combinations.md` 형식) 의 초안을 작성합니다.
+
+## 출력 형식 (반드시 준수)
+
+```markdown
+# {{프로젝트}} — 주문 옵션 조합 명세 (그레이박스 TC)
+
+> ... (1-2 문장 도메인 설명) ...
+
+## 1. {domain} 옵션 차원 (Reference)
+
+| 차원 | 가능한 값 | 비고 |
+|------|----------|------|
+| (도메인에서 추출한 옵션 차원들 — 6~12개) | | |
+
+## 2. 도메인 룰 (Reference)
+
+**계산:** (있다면)
+- (수식 또는 공식)
+
+**검증 룰:**
+- (입력 검증, 상태 전환 규칙)
+
+**테스트 실행 위험 등급:**
+| 등급 | 조건 | 권장 안내 메시지 템플릿 |
+|------|------|---------------------|
+| 🔴 고위험 | ... | "..." |
+| 🟡 중위험 | ... | "..." |
+| 🟢 저위험 | ... | "..." |
+| ⚪ 위험 없음 | ... | (생략) |
+
+## 3. 옵션 조합 매트릭스 (Decision Table)
+
+### 3.1 정상 케이스 (Positive — 표준 흐름)
+
+| OC-ID | (차원1) | (차원2) | ... | 검증 의도 | 기대 결과 |
+|-------|---------|---------|-----|---------|---------|
+| OC-001 | ... | ... |  | ... | ... |
+(5~8개)
+
+### 3.2 경계값 / 위험 조합 (Boundary)
+| OC-ID | ... |
+(4~6개)
+
+### 3.3 입력 검증 실패 (Negative)
+| OC-ID | ... |
+(4~6개)
+
+### 3.4 시스템 에러 케이스
+| OC-ID | 상태 | 검증 의도 | 기대 결과 |
+(3~5개)
+
+## 4. 사용자 시나리오 (Use Case Sequence)
+
+### S1: {{페르소나 이름}}
+
+**페르소나:** ...
+**특성:** ...
+**총 {{N}} TC**
+
+| Step | 동작 | 사용 OC | 검증 |
+|------|------|---------|------|
+| S1-1 | ... | OC-XXX | ... |
+(3~6개)
+
+### S2: ...
+(2~4개 시나리오)
+
+## 5. 운영 가이드
+... (간략히)
+```
+
+## 작성 원칙
+
+1. **spec 본문에서 추출** — 명세에 없는 임의의 룰 만들지 마세요.
+2. **도메인 차원** — 사용자/시스템 입력 가능한 옵션을 모두 차원으로 정리.
+3. **OC 매트릭스** — 도메인 폭발 방지를 위해 의미있는 조합만. 표준 6 + 경계 5 + Negative 5 + 에러 4 정도.
+4. **시나리오** — 페르소나 기반 (실제 사용자 그룹 가정). 3~5개.
+5. **위험 등급** — 실데이터 테스트 시 자금/계정 영향 등급. 도메인에 따라 적절히.
+6. **블랙박스 표현** — 기대 결과에 DOM ID, state, 함수명 노출 금지.
+7. **갱신 모드** — 기존 명세 주어지면 ID 유지하며 변경 사항만 반영.
+
+⚠️ 응답은 markdown 명세 본문만. 설명/요약 텍스트 추가 금지.
+"""
+
+    user_prompt = f"""다음 기획서를 분석해 **{domain}** 도메인의 옵션 조합 명세 초안을 작성하세요.
+
+## Overview (01_spec.md)
+{overview_text}
+
+## Policy (정책 문서)
+{policy_text}
+
+## 화면 명세 ({len(screens_md_parts)}개 SCR)
+
+{screens_md}
+{update_note}{reference_note}
+
+위 정보를 바탕으로 **{domain}** 도메인의 옵션 조합 명세 markdown 을 작성하세요.
+파일명은 `{domain.lower()}_combinations.md` 가정.
+"""
+    draft_md = call_claude(system_prompt, user_prompt, max_tokens=16000)
+    meta = {
+        "overview_size": len(overview_text),
+        "policy_size": len(policy_text),
+        "screens_count": len(screens_md_parts),
+        "reference_source": reference_source,
+        "reference_size": len(reference_md),
+    }
+    return draft_md, meta
+
+
+def step_write_combo_tc(sess: dict | None, project_name: str,
+                        combo_data: dict, project_code: str = "SM",
+                        suite_combo: str = "COMBO",
+                        suite_flow: str = "FLOW") -> tuple[str, int]:
+    """옵션 조합 + 시나리오 → TC 변환 (그레이박스, 1회 LLM 호출).
+
+    Args:
+        sess: Flask 세션 (있으면 push_log; CLI 테스트는 None 가능)
+        project_name: "supercycl" 등
+        combo_data: parse_order_combinations() 반환값
+        project_code: TC ID prefix (기본 SM)
+        suite_combo: 옵션 조합 SuiteCode (예: 'ORDR-COMBO', 'LITE-COMBO')
+        suite_flow: 시나리오 SuiteCode (예: 'ORDR-FLOW', 'LITE-FLOW')
+    Returns:
+        (tc_markdown, total_tc_count)
+    """
+    def _log(msg):
+        if sess is not None:
+            push_log(sess, msg)
+        else:
+            print(msg)
+
+    tc_rules = load_tc_rules()
+    project_policies = load_project_policies(project_name)
+
+    total_combos = len(combo_data["combos"])
+    total_steps = sum(len(s["steps"]) for s in combo_data["scenarios"])
+    expected_total = total_combos + total_steps
+    _log(f"[Combo TC] 옵션 조합 {total_combos}개 + 시나리오 step {total_steps}개 = 총 {expected_total}개 TC 변환 시작")
+
+    # 시스템 프롬프트 — 그레이박스 정책 명시
+    system_prompt = f"""당신은 선물 거래 도메인의 시니어 QA 엔지니어입니다.
+주문 옵션 조합 명세 (order_combinations.md) 를 읽고 **그레이박스 테스트 케이스** 를 작성합니다.
+
+## 핵심 원칙 (그레이박스 정책)
+
+1. **기대 결과는 사용자 가시 동작/결과만** (블랙박스 표현)
+   - ✅ "검증 실패 메시지가 표시된다. TP/SL 값이 저장되지 않는다. 시트는 닫히지 않고 유지된다."
+   - ⛔ "#tpSlErr 표시, saveTpSl() 실패" (DOM/함수명 노출 금지)
+
+2. **사전 조건의 마지막 줄에 (선택) 기술 힌트** — DOM ID/식별자 1~2개
+   예: `3. (기술 참고) TP 입력 #tpSlTpInput, 에러 영역 #tpSlErr`
+   힌트가 없는 OC 는 사전 조건에서 생략.
+
+3. **테스트 단계** — 사용자 동작 위주 (탭, 입력, 슬라이드)
+
+4. **소분류는 식별 라벨 (간결)** — 30자 내. 검증 내용은 단계/기대결과에.
+
+## TC ID 규칙
+
+- 옵션 조합 (Decision Table): `{project_code}-COMBO-NNN` (001부터 OC 순서대로)
+- 시나리오 step: `{project_code}-FLOW-NNN` (001부터 S1-1, S1-2, ..., S6-N 순서대로)
+- 대분류: "Trade(Combo)" — 화면 중심 'Trade' 시트와 분리하기 위한 전용 대분류명 (시트도 이 이름으로 생성됨)
+- 중분류:
+  - Combo TC: "Order Combo"
+  - Flow TC: "User Flow"
+- 소분류:
+  - Combo: "OC-XXX 한 줄 검증 의도 요약" (예: "OC-001 Limit 5x Conservative")
+  - Flow: "SX-N 단계 요약" (예: "S5-1 Limit 입력")
+
+## 분류 규칙
+
+- 정상 케이스 / 시나리오 정상 step → Positive, 우선순위 High~Medium
+- 경계값 / 위험 조합 → Edge, Medium
+- 입력 검증 실패 / 실수 시나리오 → Negative, High
+- 시세/시스템 에러 → Edge, Medium
+- 행위 가드 (더블 탭) → Negative, High
+
+## TC 출력 형식 (반드시 준수)
+
+```
+### {project_code}-{suite_combo}-001 — [제목]
+
+| 항목 | 내용 |
+|------|------|
+| 대분류 | Trade(Combo) |
+| 중분류 | Order Combo |
+| 소분류 | OC-001 Limit 5x Conservative |
+| 분류 | Positive |
+| 우선순위 | High |
+| 플랫폼 | Web(Mobile) |
+| 연관 화면 | SCR-102, SCR-104, SCR-601 |
+
+**사전 조건**
+1. 거래소가 1개 이상 연동된 상태
+2. 충분한 잔고가 있는 상태
+3. (기술 참고) Limit price 입력 #liteLimitPriceInput102, Δ% 표시 #liteLimitPriceDelta102
+4. ⚠️ 🟢 저위험 — 5x, Limit 미체결 시 Cancel 환원
+
+**테스트 단계**
+1. SCR-102 에서 Long + Limit + Cross + 5x + Conservative 옵션을 설정한다.
+2. Limit price 를 Mark price 보다 −1% 낮게 입력한다.
+3. Long 버튼 → SCR-104 진입 → Confirm 탭한다.
+
+**예상 결과**
+- Open Order 가 등록된다.
+- Open Orders 카드에 Δ% 가 −1% 로 표시된다.
+- Mark price 가 Limit price 에 도달하면 자동 체결되어 Position 카드로 전환된다.
+- 체결 시 TP +10% / SL −5% 가 자동 등록된다.
+```
+
+## Smoke TC 선별 (Combo 전용 — SCR Smoke 와 차별)
+
+**원칙: SCR (화면 중심) Smoke 와 겹치지 않게 선별.**
+
+SCR Smoke 가 이미 다루는 영역:
+- 화면 진입 / UI 표시 / 버튼 클릭
+- 단일 화면 안의 기본 동작 (예: "Long 버튼 탭 → SCR-104 진입")
+- 단순 폼 입력
+
+**Combo Smoke 는 SCR 가 못 다루는 영역만 bold (`### **{{ID}}**` 형식):**
+- ✅ **여러 화면 걸친 상태 전환** (Limit 등록 → Mark 도달 → 체결 → Position 카드)
+- ✅ **옵션 조합 정합성** (100x + Liquidation 임박 검증, Hedge 양방향 분리, 코인별 정밀도)
+- ✅ **타겟 페르소나 핵심 흐름** (S5 Limit lifecycle 의 첫·마지막 step)
+- ✅ **회복 경로** (실패 → Retry → 성공)
+- ✅ **위험 가드** (TP 방향 위반, 더블 탭, 잔고 80% 경고)
+
+**Combo Smoke 권장 갯수: 81 중 8~12개 (10~15%)**
+
+**선별 우선순위 (점수 높은 것부터):**
+1. ⭐ S5 Limit lifecycle (S5-1 입력 + S5-4 체결) — 2개
+2. 표준 + 보수 조합 (OC-001 Limit 5x Conservative) — 1개
+3. 100x 위험 (OC-011) — 1개
+4. Hedge 분리 (OC-030) — 1개
+5. TP 방향 위반 (OC-020) — 1개
+6. 더블 탭 가드 (OC-061 빠른) — 1개
+7. 코인 차원 대표 (OC-072 SOL 정밀도) — 1개
+8. S7 다중 코인 카드 분리 (S7-5) — 1개
+
+**Smoke 마킹: TC 헤딩에 `**` 추가**
+- 일반: `### {project_code}-{suite_combo}-001 — Limit 5x Conservative 표준 주문`
+- Smoke: `### **{project_code}-{suite_combo}-001** — Limit 5x Conservative 표준 주문`
+
+## ⚠️ 테스트 실행 위험 안내 (사전 조건에 짧게 통합)
+
+**위험 안내는 사전 조건의 마지막 한 줄로 작성**하세요. 별도 섹션 만들지 마세요.
+자금 영향 없는 케이스 (입력 검증 실패, UI 표시 검증 등) 는 위험 줄도 생략.
+
+**⚠️ 길이 제한: 60자 이내** (Excel 사전조건 컬럼 절단 방지)
+
+**작성 형식:**
+```
+N. ⚠️ [등급] — [핵심 위험 — 짧게]
+```
+
+**4단계 등급:**
+- 🔴 고위험: Leverage ≥ 50x 또는 잔고 사용 ≥ 80% 또는 다수 회전
+- 🟡 중위험: Leverage 10~25x 또는 잔고 사용 50~79% 또는 Hedge 양방향
+- 🟢 저위험: Leverage ≤ 5x 또는 작은 Margin
+- ⚪ 위험 없음 (생략): 입력 검증 실패 / UI 표시 / Loading / 시세 끊김
+
+**예시 (모두 60자 이내):**
+- 🟢 `5. ⚠️ 🟢 저위험 — 5x, max 손실 ≈ Margin × 5%`
+- 🟢 `5. ⚠️ 🟢 저위험 — 3x, 소액. Limit 미체결 시 Cancel 환원`
+- 🟡 `5. ⚠️ 🟡 중위험 — 25x Isolated, max 손실 ≈ Margin 전액`
+- 🟡 `5. ⚠️ 🟡 중위험 — Hedge 양방향, 자금 2배 노출`
+- 🔴 `5. ⚠️ 🔴 고위험 — 100x, 1% 변동에 Margin 전액 손실. 테스트 계정 권장`
+- 🔴 `5. ⚠️ 🔴 고위험 — 100x 스캘퍼, 누적 수수료 + 청산 위험`
+
+**작성 원칙 (짧게 쓰기):**
+- "Leverage" 같은 자명한 단어 생략 → "100x" 만
+- 추정 손실은 "max 손실 ≈ Margin 전액" 정도로 (정확한 USDT 값 불필요)
+- 권장사항은 핵심 한마디만 (예: "테스트 계정 권장")
+- 형용사·접속사 최소화
+
+**판단 가이드:**
+- Limit 미체결: 위험 한 단계 낮춤
+- Hedge 양방향: 한 단계 올림
+- 입력 검증 실패: 줄 자체 생략
+
+## 도메인 룰 (계산/검증 참조)
+
+{tc_rules}
+
+## 프로젝트 정책
+
+{project_policies}
+"""
+
+    # 샘플 모드 표시 (CLI 테스트용)
+    sample_note = ""
+    if combo_data.get("_sample_mode"):
+        # 처리할 OC ID 와 시나리오 ID 명시
+        oc_ids = [c["id"] for c in combo_data["combos"]]
+        scn_ids = [f"{s['id']}({len(s['steps'])}step)" for s in combo_data["scenarios"]]
+        sample_note = (
+            f"\n## ⚠️ 샘플 모드 (테스트용)\n\n"
+            f"전체 명세 중 **다음 항목만** 변환하세요. 나머지는 무시:\n"
+            f"- OC: {', '.join(oc_ids)}\n"
+            f"- 시나리오: {', '.join(scn_ids)}\n"
+        )
+
+    # User 프롬프트 — order_combinations.md 전문 + 생성 지시
+    user_prompt = f"""다음은 주문 옵션 조합 명세입니다. 이 명세를 바탕으로 그레이박스 TC 를 작성하세요.
+
+명세 전문:
+---
+{combo_data['raw_md']}
+---
+{sample_note}
+## 작성 지시
+
+1. **옵션 조합 {total_combos}개**를 `{project_code}-{suite_combo}-001` ~ `{project_code}-{suite_combo}-{total_combos:03d}` 로 변환.
+   - 표의 OC-NNN 순서대로 1:1 매핑.
+   - 소분류에 원본 OC-ID 포함 (예: "OC-001 ...").
+
+2. **시나리오 step {total_steps}개**를 `{project_code}-{suite_flow}-001` ~ `{project_code}-{suite_flow}-{total_steps:03d}` 로 변환.
+   - S1-1, S1-2, ..., S2-1, S2-2, ..., S6-N 순서대로 1:1 매핑.
+   - 소분류에 원본 step ID 포함 (예: "S1-2 SCR-102 입력").
+   - 시나리오 페르소나/특성을 사전 조건에 반영 (예: "신규 사용자, 잔고 50 USDT 인 상태").
+
+3. **총 {expected_total}개 TC** 를 만든다. 빠짐 없이.
+
+4. 응답은 TC markdown 만. 설명/요약 텍스트는 제외.
+
+5. 모든 TC 사이에는 `---` 구분선 1줄.
+
+지금 작성을 시작하세요."""
+
+    # 분할 호출 — COMBO 와 FLOW 를 따로 (max_tokens 20K 한도 회피)
+    # 총 81 TC × 평균 ~350 토큰 ≈ 28K → 1회 호출은 안전하지 않음
+    # 분할: (1) Combo 만, (2) Flow 만 — 각각 ~15K 안에 수렴
+    _log("[Combo TC] LLM 분할 호출 시작 — 1/2: Order Combo")
+
+    # 1단계: Order Combo 만
+    user_prompt_combo = user_prompt + (
+        f"\n\n## ⚠️ 이번 호출은 1/2: **Order Combo 전용**\n"
+        f"- 옵션 조합 {total_combos}개 ({project_code}-{suite_combo}-001 ~ {total_combos:03d}) 만 작성.\n"
+        f"- 시나리오 step ({project_code}-{suite_flow}-*) 은 다음 호출에서 처리. **이번 호출에서 작성 금지**.\n"
+        f"- Smoke 선별: 이 호출에서 **최대 5개** (OC-001 표준, OC-011 100x, OC-020 TP 위반, "
+        f"OC-030 Hedge, OC-061 더블 탭 또는 OC-072 코인 대표 — 가이드 참조).\n"
+    )
+    try:
+        combo_md = call_claude(system_prompt, user_prompt_combo, max_tokens=16000)
+    except Exception as e:
+        _log(f"[Combo TC] LLM 호출 1/2 실패: {e}")
+        raise
+    combo_count = len(re.findall(rf"^###\s+\*?\*?{re.escape(project_code)}-{re.escape(suite_combo)}-\d+",
+                                 combo_md, re.MULTILINE))
+    _log(f"[Combo TC] 1/2 완료 — {suite_combo} {combo_count}개 (기대 {total_combos})")
+
+    # 2단계: Flow 만 (Flow 가 0이면 skip)
+    flow_md = ""
+    flow_count = 0
+    if total_steps > 0:
+        _log("[Combo TC] LLM 분할 호출 2/2: User Flow")
+        user_prompt_flow = user_prompt + (
+            f"\n\n## ⚠️ 이번 호출은 2/2: **User Flow 전용**\n"
+            f"- 시나리오 step {total_steps}개 ({project_code}-{suite_flow}-001 ~ {total_steps:03d}) 만 작성.\n"
+            f"- Order Combo ({project_code}-{suite_combo}-*) 는 이전 호출에서 완료. **이번 호출에서 작성 금지**.\n"
+            f"- Smoke 선별: 이 호출에서 **최대 5개** (S5-1 / S5-4 Limit lifecycle 핵심, "
+            f"S4-1 near-liquidation, S7-5 다중 코인 카드, 그리고 페르소나 대표 1개 — 가이드 참조).\n"
+        )
+        try:
+            flow_md = call_claude(system_prompt, user_prompt_flow, max_tokens=16000)
+        except Exception as e:
+            _log(f"[Combo TC] LLM 호출 2/2 실패: {e}")
+            raise
+        flow_count = len(re.findall(rf"^###\s+\*?\*?{re.escape(project_code)}-{re.escape(suite_flow)}-\d+",
+                                    flow_md, re.MULTILINE))
+        _log(f"[Combo TC] 2/2 완료 — {suite_flow} {flow_count}개 (기대 {total_steps})")
+
+    # 합치기 — 두 블록 사이에 구분선
+    if flow_md:
+        result = combo_md.rstrip() + "\n\n---\n\n" + flow_md.lstrip()
+    else:
+        result = combo_md
+
+    actual_count = combo_count + flow_count
+    _log(f"[Combo TC] 총 {actual_count}개 TC 생성 완료 (예상 {expected_total}개)")
+
+    return result, actual_count
+
+
 def resolve_screen_code(middle_name: str, screen_map: dict,
                          used_codes: set | None = None) -> str:
     """중분류 이름을 ScreenCode로 변환 (v0.9.7b 규칙).
@@ -5916,8 +6529,132 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
     """
     focus_area = sess.get("focus_area", "")
     diff_mode = bool(prev_folder_path)
+    # Combo only 모드 — Stage 2~4 (분류표 / Human Gate / SCR TC) 모두 skip
+    is_combo_only = sess.get("generation_mode") == "combo_only"
+
     try:
-        # ── 1) 폴더 파싱 (LLM 호출 없음) ──
+        # ── 0) Combo only 단축 경로 — 분류 단계 모두 건너뛰고 바로 Combo TC 생성
+        if is_combo_only:
+            push_log(sess, "[Combo Only 모드] SCR 분류 단계 skip — Combo TC 만 생성합니다.")
+            sess["status"] = "tc_writing"
+            push_stage(sess, 1, "Combo TC 생성 시작", 30)
+
+            # workspace 준비
+            if "workspace" not in sess:
+                sess["workspace"] = Path(__file__).parent.parent / "workspace" / sess["id"]
+                sess["workspace"].mkdir(parents=True, exist_ok=True)
+
+            combo_opts = sess.get("combo_opts")
+            if not combo_opts or not combo_opts.get("file_paths"):
+                raise RuntimeError("Combo 모드인데 명세 파일이 지정되지 않았습니다.")
+
+            merged_tc = ""
+            total_tc = 0
+            combo_md_parts = []
+            combo_count = 0
+            project_code = _detect_project_code(project_name)
+
+            for fp in combo_opts["file_paths"]:
+                p = Path(fp).expanduser()
+                if not p.exists():
+                    push_log(sess, f"[Combo] 파일 없음: {p}")
+                    continue
+                cdata = _parse_combo_file_direct(p)
+                if not cdata:
+                    push_log(sess, f"[Combo] 파싱 실패: {p.name}")
+                    continue
+                # 필터 적용
+                combos_list = cdata["combos"]
+                scenarios_list = cdata["scenarios"]
+                oc_f = (combo_opts.get("oc_filter") or "").strip()
+                scn_f = (combo_opts.get("scn_filter") or "").strip()
+                is_filter = bool(oc_f or scn_f)
+                if oc_f:
+                    ids = [s.strip().upper() for s in oc_f.split(",")]
+                    def _match(c_id):
+                        for pat in ids:
+                            if pat.endswith("*"):
+                                if c_id.startswith(pat[:-1]):
+                                    return True
+                            elif c_id == pat:
+                                return True
+                        return False
+                    combos_list = [c for c in combos_list if _match(c["id"])]
+                elif is_filter:
+                    combos_list = []
+                if scn_f:
+                    ids = [s.strip().upper() for s in scn_f.split(",")]
+                    scenarios_list = [s for s in scenarios_list if s["id"].upper() in ids]
+                elif is_filter:
+                    scenarios_list = []
+
+                domain = _parse_combo_md_lite(p)["domain"]
+                if is_filter:
+                    new_raw = _rebuild_raw_md_for_combo(
+                        cdata["raw_md"],
+                        [c["id"] for c in combos_list],
+                        [s["id"] for s in scenarios_list],
+                    )
+                else:
+                    new_raw = cdata["raw_md"]
+                trimmed = {
+                    "raw_md": new_raw, "combos": combos_list, "scenarios": scenarios_list,
+                    "_sample_mode": is_filter,
+                }
+                # 파일별 SuiteCode 추출 — TC ID 충돌 방지
+                # 예: order_combinations.md → ORDR / trade_lite__combinations.md → LITE
+                suite_code = _derive_combo_suite_code(p.name)
+                suite_combo = f"{suite_code}-COMBO"
+                suite_flow = f"{suite_code}-FLOW"
+
+                push_log(sess, f"[Combo] {p.name} 처리 — OC {len(combos_list)} + scenarios {len(scenarios_list)} ({sum(len(s['steps']) for s in scenarios_list)}step) → SuiteCode '{suite_code}'")
+                try:
+                    combo_tc_md, c_count = step_write_combo_tc(sess, project_name, trimmed,
+                                                                 project_code=project_code,
+                                                                 suite_combo=suite_combo,
+                                                                 suite_flow=suite_flow)
+                    if domain != "Trade(Combo)":
+                        combo_tc_md = combo_tc_md.replace(
+                            "| 대분류 | Trade(Combo) |",
+                            f"| 대분류 | {domain} |",
+                        )
+                    combo_md_parts.append(combo_tc_md)
+                    combo_count += c_count
+                    push_log(sess, f"[Combo] {p.name} → {c_count} TC ({domain})")
+                except Exception as ce:
+                    push_log(sess, f"[Combo] LLM 호출 실패 ({p.name}): {ce}")
+                check_stop(sess)
+
+            if not combo_md_parts:
+                raise RuntimeError("Combo TC 가 1개도 생성되지 않았습니다.")
+
+            merged_tc = "\n\n---\n\n".join(combo_md_parts)
+            total_tc = combo_count
+            push_log(sess, f"[Combo] 통합 완료 — 총 {total_tc} TC")
+
+            # ── Excel 빌드 ──
+            sess["status"] = "building_excel"
+            push_stage(sess, 2, "Excel 빌드", 90)
+            min_tc = max(1, round(total_tc * 0.35))
+            result_file = step_build_excel(sess, merged_tc, project_name, total_tc, min_tc)
+            excel_path = Path(result_file)
+            sess["result"] = str(excel_path)
+
+            sess["status"] = "done"
+            push_stage(sess, 3, "완료", 100)
+            smoke_count = len(re.findall(r"^###\s+\*\*[A-Z]{2}-", merged_tc, re.MULTILINE))
+            push(sess, "done", {
+                "filename":  excel_path.name,
+                "size":      excel_path.stat().st_size if excel_path.exists() else 0,
+                "sid":       sess["id"],
+                "total_tc":  total_tc,
+                "min_tc":    min_tc,
+                "smoke_tc":  smoke_count,
+            })
+            clear_pipeline_state(project_name)
+            return
+
+        # ── 1) 폴더 파싱 (LLM 호출 없음) ── [일반 SCR 모드]
         sess["status"] = "parsing"
         if diff_mode:
             push_stage(sess, 1, "구조화 spec 폴더 + diff 비교", 8)
@@ -6035,19 +6772,99 @@ def run_pipeline_structured(sess: dict, folder_path: str, project_name: str,
             "suite_codes": sess.get("suite_codes"),
         })
         selected = sess.get("selected_domains")
+        # Note: is_combo_only 는 함수 시작부에서 단축 경로로 분기 — 여기에 안 옴
         merged_tc, total_tc = step_write_tc_per_screen(
             sess, approved, spec_data, project_name,
             selected_domain_codes=selected,
         )
 
-        # ── 5) Review (선택) — step_review 는 검토 보고서를 별도 파일로 저장.
-        #    반환값은 검토 보고서 텍스트이므로 TC 본문 자리에 쓰면 안 된다.
+        # ── 5) Review (선택)
         sess["status"] = "reviewing"
         push_stage(sess, 5, "TC 검토 / 정리", 82)
         try:
             step_review(sess, merged_tc, project_name)
         except Exception as e:
             push_log(sess, f"[검토] 스킵 — {e}")
+
+        # ── 5.5) Combo TC 생성 (combo_only 모드에서 단독, 또는 향후 확장 시 추가)
+        combo_opts = sess.get("combo_opts")
+        if combo_opts and combo_opts.get("file_paths"):
+            push_stage(sess, 5, "Combo TC 생성", 88)
+            push_log(sess, f"[Combo] {len(combo_opts['file_paths'])}개 명세 파일 처리 시작")
+            combo_md_parts = []
+            combo_total = 0
+            for fp in combo_opts["file_paths"]:
+                p = Path(fp).expanduser()
+                if not p.exists():
+                    push_log(sess, f"[Combo] 파일 없음: {p}")
+                    continue
+                cdata = _parse_combo_file_direct(p)
+                if not cdata:
+                    push_log(sess, f"[Combo] 파싱 실패: {p.name}")
+                    continue
+                # 필터 적용
+                combos_list = cdata["combos"]
+                scenarios_list = cdata["scenarios"]
+                oc_f = (combo_opts.get("oc_filter") or "").strip()
+                scn_f = (combo_opts.get("scn_filter") or "").strip()
+                is_filter = bool(oc_f or scn_f)
+                if oc_f:
+                    ids = [s.strip().upper() for s in oc_f.split(",")]
+                    def _match(c_id):
+                        for pat in ids:
+                            if pat.endswith("*"):
+                                if c_id.startswith(pat[:-1]):
+                                    return True
+                            elif c_id == pat:
+                                return True
+                        return False
+                    combos_list = [c for c in combos_list if _match(c["id"])]
+                elif is_filter:
+                    combos_list = []
+                if scn_f:
+                    ids = [s.strip().upper() for s in scn_f.split(",")]
+                    scenarios_list = [s for s in scenarios_list if s["id"].upper() in ids]
+                elif is_filter:
+                    scenarios_list = []
+
+                domain = _parse_combo_md_lite(p)["domain"]
+                if is_filter:
+                    new_raw = _rebuild_raw_md_for_combo(
+                        cdata["raw_md"],
+                        [c["id"] for c in combos_list],
+                        [s["id"] for s in scenarios_list],
+                    )
+                else:
+                    new_raw = cdata["raw_md"]
+                trimmed = {
+                    "raw_md": new_raw, "combos": combos_list, "scenarios": scenarios_list,
+                    "_sample_mode": is_filter,
+                }
+                try:
+                    project_code = _detect_project_code(project_name)
+                    # 파일별 SuiteCode — TC ID 충돌 방지
+                    suite_code = _derive_combo_suite_code(p.name)
+                    combo_tc_md, c_count = step_write_combo_tc(
+                        sess, project_name, trimmed,
+                        project_code=project_code,
+                        suite_combo=f"{suite_code}-COMBO",
+                        suite_flow=f"{suite_code}-FLOW",
+                    )
+                    # 대분류 치환 (Trade(Combo) → 파일별 도메인)
+                    if domain != "Trade(Combo)":
+                        combo_tc_md = combo_tc_md.replace(
+                            "| 대분류 | Trade(Combo) |",
+                            f"| 대분류 | {domain} |",
+                        )
+                    combo_md_parts.append(combo_tc_md)
+                    combo_total += c_count
+                    push_log(sess, f"[Combo] {p.name} → {c_count} TC ({domain})")
+                except Exception as ce:
+                    push_log(sess, f"[Combo] LLM 호출 실패: {ce}")
+            if combo_md_parts:
+                merged_tc = merged_tc.rstrip() + "\n\n---\n\n" + "\n\n---\n\n".join(combo_md_parts)
+                total_tc += combo_total
+                push_log(sess, f"[Combo] 통합 완료 — Combo TC {combo_total}개 추가 (총 {total_tc})")
 
         # ── 6) Excel 빌드 — step_build_excel 이 내부에서 tc_final.md 도 직접 생성한다.
         sess["status"] = "building_excel"
@@ -6092,6 +6909,8 @@ def start_spec_folder():
     prev_folder  = (data.get("prev_folder_path") or "").strip()
     include_unchanged = bool(data.get("include_unchanged"))
     resume       = bool(data.get("resume"))
+    generation_mode = (data.get("generation_mode") or "").strip()
+    combo_opts   = data.get("combo") or None  # {file_paths, oc_filter, scn_filter}
 
     # resume 모드 — 저장된 체크포인트 복원
     if resume:
@@ -6155,15 +6974,35 @@ def start_spec_folder():
             },
         }), 400
 
+    # Combo 모드 검증 — 명세 파일이 실제 존재하는지
+    if generation_mode == "combo_only":
+        if not combo_opts or not combo_opts.get("file_paths"):
+            return jsonify({
+                "ok": False,
+                "error": "Combo 모드 — *_combinations.md 명세 파일이 선택되지 않았습니다.\n"
+                         "TC 생성 범위 위 'Combo 명세' 영역에서 파일을 선택하거나, 모드를 '정책 반영'으로 변경하세요.",
+            }), 400
+        missing = [fp for fp in combo_opts["file_paths"] if not Path(fp).expanduser().exists()]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": "Combo 명세 파일을 찾을 수 없습니다:\n" + "\n".join(missing),
+            }), 400
+
     sess = new_session()
     sess["project_name"] = project_name
     sess["focus_area"] = focus_area
-    sess["generation_mode"] = "structured_spec"
+    sess["generation_mode"] = generation_mode or "structured_spec"
+    if combo_opts:
+        sess["combo_opts"] = combo_opts
 
     sources_to_save = [{"type": "spec_folder", "content": str(folder)}]
     if prev_folder:
         sources_to_save.append({"type": "spec_folder_prev", "content": str(Path(prev_folder).expanduser())})
-    save_project(project_name, last_sources=sources_to_save, last_focus_area=focus_area)
+    # generation_mode + combo_opts 도 저장 — 다음에 같은 프로젝트 선택 시 모드 복원
+    save_project(project_name, last_sources=sources_to_save, last_focus_area=focus_area,
+                 last_generation_mode=(generation_mode or "summary"),
+                 last_combo_opts=(combo_opts or None))
 
     t = threading.Thread(
         target=run_pipeline_structured,
@@ -6221,6 +7060,552 @@ def recent_spec_folders():
     # 실제 존재하는 폴더만 필터
     folders = [f for f in candidates if Path(f).expanduser().is_dir()]
     return jsonify({"ok": True, "folders": folders[:10]})
+
+
+# ── Combo TC 엔드포인트 (메인 화면 통합 — 정책+Combo 모드에서 사용) ─────
+# 단독 /combo 페이지는 메인 통합 후 제거됨. 아래 list-files / preview / generate /
+# download 는 메인 화면 JS 와 향후 단독 사용 가능성 모두를 위해 유지.
+
+@app.route("/combo/list-files", methods=["GET"])
+def combo_list_files():
+    """프로젝트 + (선택) spec 폴더의 *_combinations.md 파일 목록 반환.
+    spec_folder 가 주어지면 그 폴더에도 검색.
+    Returns: {ok, files: [{name, path, combos_count, scenarios_count, source}]}
+    """
+    project_name = (request.args.get("project_name") or "supercycl").strip()
+    spec_folder = (request.args.get("spec_folder") or "").strip()
+    pname_lower = project_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+
+    candidates: list[tuple[Path, str]] = []  # (folder, source label)
+
+    # 1) spec 폴더 (있으면 우선)
+    if spec_folder:
+        sp = Path(spec_folder).expanduser()
+        if sp.exists() and sp.is_dir():
+            candidates.append((sp, "spec"))
+
+    # 2) projects/{name}/ 폴더
+    if PROJECTS_RULES_DIR.exists():
+        for folder in PROJECTS_RULES_DIR.iterdir():
+            if not folder.is_dir():
+                continue
+            fname_lower = folder.name.lower().replace(" ", "").replace("-", "").replace("_", "")
+            if fname_lower in pname_lower or pname_lower in fname_lower:
+                candidates.append((folder, "project"))
+                break
+
+    if not candidates:
+        return jsonify({"ok": False,
+                        "error": f"검색 위치 없음 — spec 폴더 또는 projects/{project_name}/ 가 존재해야 합니다."}), 404
+
+    files = []
+    seen_names: set[str] = set()
+    for folder, source in candidates:
+        for md_file in sorted(folder.glob("*_combinations.md")):
+            if md_file.name in seen_names:
+                continue
+            seen_names.add(md_file.name)
+            data = _parse_combo_md_lite(md_file)
+            files.append({
+                "name": md_file.name,
+                "path": str(md_file),
+                "source": source,
+                "combos_count": data["combos_count"],
+                "scenarios_count": data["scenarios_count"],
+                "steps_count": data["steps_count"],
+                "domain": data["domain"],
+                "scenarios": data.get("scenarios", []),  # [{id, title, step_count, is_target}]
+            })
+    return jsonify({"ok": True, "files": files})
+
+
+def _derive_combo_suite_code(filename: str) -> str:
+    """Combo 명세 파일명 → 짧은 SuiteCode (TC ID prefix 충돌 방지).
+    예: order_combinations.md → ORDR
+        trade_lite__combinations.md → LITE
+        exchange_combinations.md → EXCH
+        portfolio_combinations.md → PORT
+        markets_combinations.md → MKTS
+        custom_xyz_combinations.md → XYZ (앞 토큰)
+    """
+    stem = filename.replace("_combinations.md", "").rstrip("_")
+    # 알려진 도메인 매핑 (의미 명확)
+    known = {
+        "order": "ORDR", "trade": "TRD", "trade_lite": "LITE",
+        "exchange": "EXCH", "portfolio": "PORT", "market": "MKTS",
+        "markets": "MKTS",
+    }
+    if stem.lower() in known:
+        return known[stem.lower()]
+    # 폴백 — 첫 단어의 4자 uppercase
+    first = stem.split("_")[0]
+    code = re.sub(r"[^A-Za-z0-9]", "", first)[:4].upper()
+    return code or "COMBO"
+
+
+def _parse_combo_md_lite(md_path: Path) -> dict:
+    """Combo md 파일에서 통계 + 시나리오 메타 추출 (가볍게).
+    UI 의 시나리오 체크박스 표시용으로 시나리오 ID/title/step 수 포함.
+    """
+    try:
+        text = md_path.read_text(encoding="utf-8")
+    except Exception:
+        return {"combos_count": 0, "scenarios_count": 0, "steps_count": 0,
+                "domain": "", "scenarios": []}
+    combos = len(re.findall(r"^\|\s*OC-\d+\s*\|", text, re.MULTILINE))
+
+    # 시나리오 ID + title 추출 + 각 시나리오의 step 수
+    scenarios_meta = []
+    scenario_blocks = re.split(r"(?=^###\s+(?:⭐\s*)?S\d+:)", text, flags=re.MULTILINE)
+    for block in scenario_blocks:
+        m = re.match(r"^###\s+(⭐\s*)?(S\d+):\s*(.+)", block.strip())
+        if not m:
+            continue
+        scenario_id = m.group(2)
+        is_target = bool(m.group(1))
+        # title — 첫 줄에서 'S1: 제목' 형태
+        title = m.group(3).strip()
+        # step 수
+        step_count = len(re.findall(rf"^\|\s*{scenario_id}-\d+[a-z]?\s*\|", block, re.MULTILINE))
+        scenarios_meta.append({
+            "id": scenario_id,
+            "title": title,
+            "step_count": step_count,
+            "is_target": is_target,
+        })
+
+    steps = sum(s["step_count"] for s in scenarios_meta)
+    # 도메인 추정 (파일명 prefix)
+    stem = md_path.stem.replace("_combinations", "")
+    domain_map = {"order": "Trade(Combo)", "exchange": "Exchange(Combo)",
+                  "portfolio": "Portfolio(Combo)", "market": "Markets(Combo)"}
+    domain = domain_map.get(stem.lower(), f"{stem.title()}(Combo)")
+    return {"combos_count": combos, "scenarios_count": len(scenarios_meta),
+            "steps_count": steps, "domain": domain,
+            "scenarios": scenarios_meta}
+
+
+@app.route("/combo/preview", methods=["POST"])
+def combo_preview():
+    """선택된 파일의 OC/시나리오 상세 미리보기.
+    Body: {file_paths: [...], oc_filter: '', scn_filter: ''}
+    Returns: 각 파일별 trim 후 갯수.
+    """
+    body = request.get_json(force=True) or {}
+    file_paths = body.get("file_paths") or []
+    oc_filter = (body.get("oc_filter") or "").strip()
+    scn_filter = (body.get("scn_filter") or "").strip()
+
+    summary = []
+    for fp in file_paths:
+        p = Path(fp)
+        if not p.exists():
+            summary.append({"file": fp, "error": "파일 없음"})
+            continue
+        # 파일 단독 파싱 (project_name 우회)
+        data = _parse_combo_file_direct(p)
+        if not data:
+            summary.append({"file": p.name, "error": "파싱 실패"})
+            continue
+        # 필터 적용 (정책: 한쪽만 지정되면 다른 쪽은 0)
+        combos = data["combos"]
+        scenarios = data["scenarios"]
+        is_filter = bool(oc_filter or scn_filter)
+        if oc_filter:
+            ids = [s.strip().upper() for s in oc_filter.split(",")]
+            def _match(c_id):
+                for pat in ids:
+                    if pat.endswith("*"):
+                        if c_id.startswith(pat[:-1]):
+                            return True
+                    elif c_id == pat:
+                        return True
+                return False
+            combos = [c for c in combos if _match(c["id"])]
+        elif is_filter:
+            combos = []
+        if scn_filter:
+            ids = [s.strip().upper() for s in scn_filter.split(",")]
+            scenarios = [s for s in scenarios if s["id"].upper() in ids]
+        elif is_filter:
+            scenarios = []
+
+        steps = sum(len(s["steps"]) for s in scenarios)
+        summary.append({
+            "file": p.name,
+            "domain": _parse_combo_md_lite(p)["domain"],
+            "combos_count": len(combos),
+            "scenarios_count": len(scenarios),
+            "steps_count": steps,
+            "total_tc": len(combos) + steps,
+        })
+    return jsonify({"ok": True, "summary": summary})
+
+
+def _parse_combo_file_direct(md_path: Path) -> dict | None:
+    """파일 경로 직접 받아 OC/시나리오 파싱.
+    parse_order_combinations 의 프로젝트 폴더 검색을 건너뛰기 위한 헬퍼.
+    """
+    if not md_path.exists():
+        return None
+    text = md_path.read_text(encoding="utf-8")
+    result = {"raw_md": text, "combos": [], "scenarios": []}
+    current_category = None
+    current_table_headers: list[str] = []
+    in_section3 = False
+    in_section4 = False
+    current_scenario = None
+    current_step_table_headers: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## 3.") or stripped.startswith("## 3 "):
+            in_section3 = True; in_section4 = False
+        elif stripped.startswith("## 4.") or stripped.startswith("## 4 "):
+            in_section3 = False; in_section4 = True
+        elif stripped.startswith("## 5.") or stripped.startswith("## 5 "):
+            in_section3 = False; in_section4 = False
+        if in_section3 and stripped.startswith("### 3."):
+            current_category = re.sub(r"^###\s+3\.\d+\s+", "", stripped)
+            current_table_headers = []
+        if in_section4 and re.match(r"^###\s+(?:⭐\s*)?S\d+", stripped):
+            m = re.match(r"^###\s+(?:⭐\s*)?(S\d+):\s*(.+)$", stripped)
+            if m:
+                current_scenario = {"id": m.group(1), "title": m.group(2).strip(),
+                                    "persona": "", "traits": "", "steps": []}
+                result["scenarios"].append(current_scenario)
+                current_step_table_headers = []
+        if current_scenario and stripped.startswith("**페르소나:**"):
+            current_scenario["persona"] = stripped.replace("**페르소나:**", "").strip()
+        elif current_scenario and stripped.startswith("**특성:**"):
+            current_scenario["traits"] = stripped.replace("**특성:**", "").strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if not cells or set(cells[0]) <= set("-"):
+                continue
+            first = cells[0]
+            if in_section3:
+                if first.upper().startswith("OC-ID") or first.upper() == "OC-ID":
+                    current_table_headers = cells
+                elif re.match(r"^OC-\d+$", first, re.IGNORECASE) and current_table_headers:
+                    result["combos"].append({"id": first.upper(),
+                                             "category": current_category or "(unknown)",
+                                             "headers": current_table_headers,
+                                             "cells": cells})
+            if in_section4 and current_scenario is not None:
+                if first.lower() == "step":
+                    current_step_table_headers = cells
+                elif re.match(r"^S\d+-\d+[a-z]?$", first, re.IGNORECASE) and current_step_table_headers:
+                    current_scenario["steps"].append({
+                        "step_id": first, "action": cells[1] if len(cells) > 1 else "",
+                        "oc_ref": cells[2] if len(cells) > 2 else "",
+                        "verify": cells[3] if len(cells) > 3 else ""})
+    return result
+
+
+@app.route("/combo/generate", methods=["POST"])
+def combo_generate():
+    """LLM 호출 → TC md + Excel 빌드.
+    Body: {file_paths, oc_filter, scn_filter, project_name, project_code}
+    Returns: {ok, tc_md_path, excel_path, total_tc, smoke_count}
+    """
+    body = request.get_json(force=True) or {}
+    file_paths = body.get("file_paths") or []
+    oc_filter = (body.get("oc_filter") or "").strip()
+    scn_filter = (body.get("scn_filter") or "").strip()
+    project_name = (body.get("project_name") or "supercycl").strip()
+    project_code = (body.get("project_code") or "SM").strip().upper()
+
+    if not file_paths:
+        return jsonify({"ok": False, "error": "파일을 선택하세요"}), 400
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+
+    # 작업 폴더
+    import uuid
+    workspace = Path(__file__).parent.parent / "workspace" / f"combo_{uuid.uuid4().hex[:8]}"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    all_tc_md_parts = []
+    all_results = []
+    try:
+        for fp in file_paths:
+            p = Path(fp)
+            if not p.exists():
+                continue
+            data = _parse_combo_file_direct(p)
+            if not data:
+                continue
+            # 필터 적용 + raw_md trim
+            combos_orig = data["combos"]
+            scenarios_orig = data["scenarios"]
+            combos = combos_orig
+            scenarios = scenarios_orig
+            if oc_filter:
+                ids = [s.strip().upper() for s in oc_filter.split(",")]
+                def _match(c_id):
+                    for pat in ids:
+                        if pat.endswith("*"):
+                            if c_id.startswith(pat[:-1]):
+                                return True
+                        elif c_id == pat:
+                            return True
+                    return False
+                combos = [c for c in combos if _match(c["id"])]
+            elif scn_filter:
+                # scn 만 지정되면 OC 0
+                combos = []
+            if scn_filter:
+                ids = [s.strip().upper() for s in scn_filter.split(",")]
+                scenarios = [s for s in scenarios if s["id"].upper() in ids]
+            elif oc_filter:
+                scenarios = []
+
+            # raw_md trim — Combo 전용 도메인 적용
+            domain = _parse_combo_md_lite(p)["domain"]
+            is_filter = bool(oc_filter or scn_filter)
+            if is_filter:
+                new_raw = _rebuild_raw_md_for_combo(data["raw_md"],
+                                                    [c["id"] for c in combos],
+                                                    [s["id"] for s in scenarios])
+            else:
+                new_raw = data["raw_md"]
+
+            trimmed = {
+                "raw_md": new_raw, "combos": combos, "scenarios": scenarios,
+                "_sample_mode": is_filter, "_domain_override": domain,
+            }
+            # LLM 호출
+            tc_md, count = step_write_combo_tc(None, project_name, trimmed,
+                                               project_code=project_code)
+            # 대분류 일괄 치환 (프롬프트 결과가 'Trade(Combo)' 로 나오는데 도메인이 다르면 교체)
+            if domain != "Trade(Combo)":
+                tc_md = tc_md.replace("| 대분류 | Trade(Combo) |",
+                                       f"| 대분류 | {domain} |")
+            all_tc_md_parts.append(tc_md)
+            all_results.append({"file": p.name, "domain": domain, "tc_count": count})
+
+        if not all_tc_md_parts:
+            return jsonify({"ok": False, "error": "생성된 TC 없음"}), 500
+
+        # 합본 md
+        merged_md = "\n\n---\n\n".join(all_tc_md_parts)
+        tc_md_path = workspace / "tc_final.md"
+        tc_md_path.write_text(merged_md, encoding="utf-8")
+
+        # Excel 빌드
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "build_excel",
+            Path(__file__).parent.parent.parent / "tc-agent" / "scripts" / "build_excel.py"
+        )
+        build_excel_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build_excel_mod)
+        excel_dir = workspace
+        build_excel_mod.run_build("Combo", tc_md_path, excel_dir, verbose=False)
+        excel_files = list(excel_dir.glob("*.xlsx"))
+        excel_path = excel_files[0] if excel_files else None
+
+        # 결과 통계
+        total_tc = sum(r["tc_count"] for r in all_results)
+        smoke_count = len(re.findall(r"^###\s+\*\*[A-Z]{2}-", merged_md, re.MULTILINE))
+
+        return jsonify({
+            "ok": True,
+            "workspace": str(workspace),
+            "tc_md_path": str(tc_md_path),
+            "excel_path": str(excel_path) if excel_path else None,
+            "excel_filename": excel_path.name if excel_path else None,
+            "total_tc": total_tc,
+            "smoke_count": smoke_count,
+            "results": all_results,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()[-2000:]}), 500
+
+
+def _rebuild_raw_md_for_combo(raw_md: str, kept_oc_ids: list[str],
+                              kept_scn_ids: list[str]) -> str:
+    """raw_md 를 재구성 — 필터된 OC 행과 시나리오 블록만 남김."""
+    kept_oc_set = set(kept_oc_ids)
+    kept_scn_set = set(kept_scn_ids)
+    out_lines = []
+    lines = raw_md.splitlines()
+    in_section4 = False
+    current_scn_keep = True
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("## 4.") or stripped.startswith("## 4 "):
+            in_section4 = True
+            out_lines.append(line); i += 1; continue
+        if stripped.startswith("## 5.") or stripped.startswith("## 5 "):
+            in_section4 = False
+            current_scn_keep = True
+        if in_section4:
+            m_scn = re.match(r"^###\s+(?:⭐\s*)?(S\d+):", stripped)
+            if m_scn:
+                current_scn_keep = m_scn.group(1) in kept_scn_set
+            elif stripped.startswith("### "):
+                current_scn_keep = True
+            if not current_scn_keep:
+                i += 1; continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if cells:
+                first = cells[0].upper()
+                if re.match(r"^OC-\d+$", first):
+                    if first not in kept_oc_set:
+                        i += 1; continue
+        out_lines.append(line); i += 1
+    return "\n".join(out_lines)
+
+
+@app.route("/combo/draft-spec", methods=["POST"])
+def combo_draft_spec():
+    """AI 가 spec 폴더를 분석해 Combo 명세 초안 작성.
+    Body: {spec_folder, domain, target_scrs?, existing_md?}
+    Returns: {ok, draft_md}
+    """
+    body = request.get_json(force=True) or {}
+    spec_folder = (body.get("spec_folder") or "").strip()
+    domain = (body.get("domain") or "Trade").strip()
+    target_scrs = body.get("target_scrs") or None
+    existing_md = body.get("existing_md") or ""
+
+    if not spec_folder:
+        return jsonify({"ok": False, "error": "spec_folder 가 필요합니다."}), 400
+    if not Path(spec_folder).expanduser().exists():
+        return jsonify({"ok": False, "error": f"spec 폴더 없음: {spec_folder}"}), 400
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+    try:
+        draft, meta = step_draft_combo_spec(spec_folder, domain, target_scrs, existing_md)
+        return jsonify({"ok": True, "draft_md": draft, "domain": domain, "meta": meta})
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()[-1500:]}), 500
+
+
+@app.route("/combo/save-spec", methods=["POST"])
+def combo_save_spec():
+    """사용자가 검토/수정한 명세를 파일로 저장.
+    Body: {save_path, content}
+    save_path 는 안전상 spec 폴더 또는 projects/{name}/ 안만 허용.
+    Returns: {ok, saved_path}
+    """
+    body = request.get_json(force=True) or {}
+    save_path = (body.get("save_path") or "").strip()
+    content = body.get("content") or ""
+
+    if not save_path or not content:
+        return jsonify({"ok": False, "error": "save_path 와 content 필요"}), 400
+    p = Path(save_path).expanduser().resolve()
+
+    # 보안 — 허용 위치 검증
+    allowed_roots = []
+    if PROJECTS_RULES_DIR.exists():
+        allowed_roots.append(PROJECTS_RULES_DIR.resolve())
+    # spec 폴더 — projects.json 의 last_sources 에서 spec_folder 추출
+    try:
+        for proj in load_projects():
+            for src in (proj.get("last_sources") or []):
+                if src.get("type") in ("spec_folder", "spec_folder_prev"):
+                    sp = Path(src["content"]).expanduser().resolve()
+                    if sp.exists():
+                        allowed_roots.append(sp)
+    except Exception:
+        pass
+    if not any(str(p).startswith(str(r)) for r in allowed_roots):
+        return jsonify({"ok": False,
+                        "error": "저장 위치는 spec 폴더 또는 projects/ 안만 허용됩니다.",
+                        "allowed": [str(r) for r in allowed_roots]}), 403
+
+    # 파일명 검증
+    if not p.name.endswith("_combinations.md"):
+        return jsonify({"ok": False, "error": "파일명은 *_combinations.md 형식이어야 합니다."}), 400
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return jsonify({"ok": True, "saved_path": str(p), "size": len(content)})
+
+
+@app.route("/combo/read-spec", methods=["GET"])
+def combo_read_spec():
+    """기존 명세 파일 내용 읽기 (편집 모드 시작용).
+    Query: path
+    Returns: {ok, content}
+    """
+    fp = (request.args.get("path") or "").strip()
+    if not fp:
+        return jsonify({"ok": False, "error": "path 필요"}), 400
+    p = Path(fp).expanduser()
+    if not p.exists() or not p.is_file():
+        return jsonify({"ok": False, "error": f"파일 없음: {fp}"}), 404
+    return jsonify({"ok": True, "content": p.read_text(encoding="utf-8")})
+
+
+@app.route("/combo/delete-spec", methods=["POST"])
+def combo_delete_spec():
+    """Combo 명세 파일 삭제. 보안 — spec 폴더 또는 projects/ 안만 허용.
+    Body: {path}
+    Returns: {ok, deleted_path}
+    """
+    body = request.get_json(force=True) or {}
+    target_path = (body.get("path") or "").strip()
+    if not target_path:
+        return jsonify({"ok": False, "error": "path 필요"}), 400
+    p = Path(target_path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        return jsonify({"ok": False, "error": f"파일 없음: {target_path}"}), 404
+    if not p.name.endswith("_combinations.md"):
+        return jsonify({"ok": False, "error": "*_combinations.md 파일만 삭제 가능합니다."}), 400
+
+    # 허용 위치 검증 (save-spec 과 동일 로직)
+    allowed_roots = []
+    if PROJECTS_RULES_DIR.exists():
+        allowed_roots.append(PROJECTS_RULES_DIR.resolve())
+    try:
+        for proj in load_projects():
+            for src in (proj.get("last_sources") or []):
+                if src.get("type") in ("spec_folder", "spec_folder_prev"):
+                    sp = Path(src["content"]).expanduser().resolve()
+                    if sp.exists():
+                        allowed_roots.append(sp)
+    except Exception:
+        pass
+    if not any(str(p).startswith(str(r)) for r in allowed_roots):
+        return jsonify({"ok": False,
+                        "error": "삭제 위치는 spec 폴더 또는 projects/ 안만 허용됩니다."}), 403
+
+    # 안전 — 휴지통 효과: 같은 위치에 .deleted_<timestamp> 백업 후 삭제
+    import time
+    backup = p.with_suffix(p.suffix + f".deleted_{int(time.time())}")
+    try:
+        p.rename(backup)
+        return jsonify({"ok": True, "deleted_path": str(p), "backup": str(backup),
+                        "message": "파일이 백업되어 삭제되었습니다 (." + backup.name.split('.', 1)[-1] + ")."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"삭제 실패: {e}"}), 500
+
+
+@app.route("/combo/download/<workspace_id>/<filename>", methods=["GET"])
+def combo_download(workspace_id, filename):
+    """생성된 Excel/TC md 다운로드."""
+    # 보안 — workspace_id 검증 (alphanum + dash + underscore + combo_ prefix)
+    if not re.match(r"^combo_[a-f0-9]+$", workspace_id):
+        return jsonify({"ok": False, "error": "잘못된 workspace id"}), 400
+    if not re.match(r"^[A-Za-z0-9_\-\.]+$", filename):
+        return jsonify({"ok": False, "error": "잘못된 파일명"}), 400
+    file_path = Path(__file__).parent.parent / "workspace" / workspace_id / filename
+    if not file_path.exists() or not file_path.is_file():
+        return jsonify({"ok": False, "error": "파일 없음"}), 404
+    return send_file(str(file_path), as_attachment=True)
+
+
 
 
 @app.route("/preview-spec-folder", methods=["POST"])
@@ -6409,6 +7794,8 @@ def get_project_sources(name):
         return jsonify({"ok": True, "has_sources": False})
     last_sources = proj.get("last_sources")
     last_focus = proj.get("last_focus_area", "")
+    last_generation_mode = proj.get("last_generation_mode", "")
+    last_combo_opts = proj.get("last_combo_opts") or None
     # last_sources가 없으면 pipeline_state에서 가져옴
     if not last_sources:
         state = load_pipeline_state(name)
@@ -6422,6 +7809,8 @@ def get_project_sources(name):
         "has_sources": True,
         "sources": last_sources,
         "focus_area": last_focus,
+        "generation_mode": last_generation_mode,
+        "combo_opts": last_combo_opts,
     })
 
 
@@ -9178,8 +10567,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span>TC 생성 범위</span>
           <span style="font-size:11px;color:var(--muted);font-weight:400">선택 — 비우면 전체 TC 생성</span>
         </label>
-        <textarea id="focusArea" class="form-input" rows="5"
-          style="resize:vertical; min-height:110px; font-size:13px; line-height:1.5;"
+        <textarea id="focusArea" class="form-input" rows="9"
+          style="resize:vertical; min-height:200px; font-size:13px; line-height:1.5;"
           oninput="onInputsChanged()"
           placeholder="특정 기능에 대해서만 TC를 만들려면 여기에 입력하세요.&#10;예) import 기능 / 로그인 및 회원가입 / 결제 모듈의 환불 처리&#10;💡 구조화 spec 모드 (관대한 인식):&#10;   • SCR-104 또는 SCR-102, SCR-104, SCR-106 (개별)&#10;   • SCR-102, 104, 106, 116 (일괄 — SCR 한 번만 적어도 OK)&#10;   • SCR-102~116 (범위)"></textarea>
         <div style="font-size:11px; color:var(--muted); margin-top:3px;">
@@ -9200,6 +10589,58 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- ▼ Combo 카드 (생성 모드 = 정책+Combo 일 때만 표시) ▼ -->
+      <div class="form-group" id="comboGroup" style="display:none; padding:12px 14px; background:#FEF3C7; border:1px solid #FCD34D; border-radius:8px;">
+        <label class="form-label" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+          <span>🧩 Combo 명세 (옵션 조합 TC)</span>
+          <span style="font-size:11px;color:var(--muted);font-weight:400;">spec 폴더 또는 프로젝트의 *_combinations.md</span>
+        </label>
+        <div id="comboFileList" style="font-size:12px; color:#6B7280; padding:8px; background:#FFFFFF; border-radius:4px;">
+          <em>프로젝트 또는 spec 폴더가 설정되면 파일 목록이 표시됩니다.</em>
+        </div>
+        <!-- 시나리오 체크박스 (선택) — 명세에서 동적 로드 -->
+        <div id="comboScenarioArea" style="display:none; margin-top:10px;">
+          <div style="font-size:12px; font-weight:600; color:#374151; margin-bottom:6px;">생성할 시나리오 선택</div>
+          <div id="comboScenarioList" style="background:#FFFFFF; padding:8px 10px; border-radius:4px; max-height:460px; overflow:auto;">
+            <em style="color:#6B7280; font-size:12px;">파일 선택 시 자동 로드됩니다.</em>
+          </div>
+          <div style="font-size:11px;color:#6B7280; margin-top:4px;">
+            전체 체크 시 → OC 매트릭스 전부 + 선택된 시나리오들이 생성됩니다 (체크 안 한 시나리오는 skip).
+          </div>
+        </div>
+
+        <!-- + 새 명세 작성 / 갱신 버튼 -->
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <button type="button" onclick="openComboSpecModal('new')"
+                  style="padding:6px 14px;background:#10B981;color:white;border:0;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;">
+            ➕ 새 명세 작성
+          </button>
+          <button type="button" id="btnEditComboSpec" onclick="openComboSpecModal('edit')"
+                  style="padding:6px 14px;background:#F59E0B;color:white;border:0;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;">
+            ✏️ 기존 명세 갱신
+          </button>
+          <span style="font-size:11px;color:#6B7280;margin-left:4px;">
+            AI 가 spec 폴더를 분석해 *_combinations.md 초안을 작성합니다 (사용자 검토 후 저장)
+          </span>
+        </div>
+
+        <div id="comboValidationMsg" style="margin-top:8px;font-size:12px;display:none;"></div>
+
+        <!-- 고급 옵션: OC 필터 (펼침, 숨겨진 상태) -->
+        <details style="margin-top:10px;background:#FFFFFF;border:1px dashed #D1D5DB;border-radius:6px;padding:6px 10px;">
+          <summary style="cursor:pointer;font-size:11px;color:#6B7280;">⚙️ 고급 — OC 필터 (특정 조합만 생성)</summary>
+          <div style="margin-top:8px;font-size:11px;color:#4B5563;">
+            <label>OC ID 필터 (예: <code>OC-001,OC-070</code> 또는 <code>OC-07*</code> — 와일드카드)</label>
+            <input type="text" id="comboOcFilter" class="form-input" style="font-size:12px;padding:6px 10px;margin-top:4px;"
+                   placeholder="비우면 OC 매트릭스 전체 (시나리오 체크박스와 별개)">
+            <div style="margin-top:4px;font-size:11px;color:#6B7280;">
+              💡 OC ID 는 명세를 열어보면 확인 가능. 입력 시 시나리오 체크박스는 무시되고 OC 만 생성.
+            </div>
+          </div>
+        </details>
+      </div>
+      <!-- ▲ /Combo 카드 ▲ -->
+
       <div class="form-group" id="generationModeGroup" style="padding:12px 14px;background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;">
         <label class="form-label" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
           <span>⚙️ 생성 모드</span>
@@ -9218,6 +10659,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div style="flex:1;">
               <div style="font-size:13px;font-weight:600;color:#111827;">Quick 모드 <span style="font-size:11px;color:#6B7280;font-weight:400;">(원문 직접)</span></div>
               <div style="font-size:12px;color:#4B5563;margin-top:2px;">요약 단계 없이 원문을 직접 분류합니다. 누락 최소화 · 200KB 이하 권장.</div>
+            </div>
+          </label>
+          <label style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid #D1D5DB;border-radius:6px;background:#FFFFFF;cursor:pointer;" id="modeComboLabel">
+            <input type="radio" name="genMode" value="combo_only" onchange="onGenModeChanged()" style="margin-top:3px;">
+            <div style="flex:1;">
+              <div style="font-size:13px;font-weight:600;color:#111827;">Combo 모드 <span style="font-size:11px;color:#6B7280;font-weight:400;">(옵션 조합 TC 만 — SCR 기반 TC 생략)</span></div>
+              <div style="font-size:12px;color:#4B5563;margin-top:2px;"><code>*_combinations.md</code> 명세 파일로 <strong>Combo TC 만</strong> 생성합니다. SCR 기반 TC 가 이미 만들어져 있을 때 추가 작업용. 비용 절감.</div>
             </div>
           </label>
         </div>
@@ -9832,9 +11280,24 @@ async function onProjectDropdownChange() {
       }
 
       if (d2.focus_area) prevFocus = d2.focus_area;  // state의 값과 sources의 값 중 존재하는 것
+
+      // 생성 모드 복원 — Combo 였으면 Combo 라디오 선택 + 카드 자동 펼침
+      if (d2.generation_mode) {
+        const modeRadio = document.querySelector('input[name="genMode"][value="' + d2.generation_mode + '"]');
+        if (modeRadio) {
+          modeRadio.checked = true;
+          if (typeof onGenModeChanged === 'function') onGenModeChanged();
+          // Combo 옵션도 복원 (잠시 후 파일 목록 로드된 다음 적용)
+          if (d2.generation_mode === 'combo_only' && d2.combo_opts) {
+            setTimeout(function() { restoreComboOpts(d2.combo_opts); }, 800);
+          }
+        }
+      }
+
       var loadedCount = sources.length + (specFolderEntry ? 1 : 0) + (specFolderPrevEntry ? 1 : 0);
       var msg = '이전 소스 ' + loadedCount + '개를 불러왔습니다.';
       if (specFolderEntry) msg += ' (📁 구조화 spec 폴더 모드)';
+      if (d2.generation_mode === 'combo_only') msg += ' · 🧩 Combo 모드 복원';
       showToast(msg);
     }
   } catch(e) {}
@@ -10857,6 +12320,227 @@ function onGenModeChanged() {
       box.style.background = '#FFFFFF';
     }
   });
+
+  // Combo 카드 토글 — 'combo_only' 모드일 때만 표시
+  const isCombo = getSelectedGenerationMode() === 'combo_only';
+  const comboGroup = document.getElementById('comboGroup');
+  if (comboGroup) {
+    comboGroup.style.display = isCombo ? 'block' : 'none';
+    if (isCombo) loadComboFiles();
+  }
+}
+
+// Combo 명세 파일 목록 로드
+async function loadComboFiles() {
+  const listEl = document.getElementById('comboFileList');
+  if (!listEl) return;
+  const projectName = (document.getElementById('projectSelect')?.value || 'supercycl').trim();
+  const specPath = document.getElementById('specFolderPath')?.value?.trim() || '';
+
+  listEl.innerHTML = '<em style="color:#6B7280;">파일 목록 조회 중...</em>';
+  try {
+    const url = '/combo/list-files?project_name=' + encodeURIComponent(projectName) +
+                (specPath ? '&spec_folder=' + encodeURIComponent(specPath) : '');
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!data.ok) {
+      listEl.innerHTML = '<span style="color:#DC2626;">⚠ ' + (data.error || '오류') + '</span>';
+      return;
+    }
+    if (!data.files || !data.files.length) {
+      listEl.innerHTML = '<span style="color:#DC2626;">⚠ <strong>*_combinations.md</strong> 파일이 없습니다.' +
+        '<br>projects/' + projectName + '/ 또는 spec 폴더에 추가하세요.</span>';
+      return;
+    }
+    // 중복 도메인 감지 (같은 domain 라벨이 2개 이상) — 행에 강조 표시용
+    const domainCounts = {};
+    data.files.forEach(function(f) { domainCounts[f.domain] = (domainCounts[f.domain] || 0) + 1; });
+
+    listEl.innerHTML = data.files.map(function(f, i) {
+      const isDup = domainCounts[f.domain] > 1;
+      const rowStyle = isDup
+        ? 'background:#FEF3C7;border-left:3px solid #F59E0B;padding-left:6px;'
+        : '';
+      const dupTag = isDup
+        ? '<span style="font-size:10px;color:#92400E;background:#FCD34D;padding:1px 5px;border-radius:3px;margin-left:4px;">중복</span>'
+        : '';
+      return '<div style="display:flex;align-items:center;gap:10px;padding:6px 4px;border-radius:3px;' + rowStyle + '">' +
+        '<label style="display:flex;align-items:center;gap:10px;cursor:pointer;flex:1;">' +
+          '<input type="checkbox" class="combo-file-cb" value="' + f.path + '" data-scenarios="' + encodeURIComponent(JSON.stringify(f.scenarios || [])) + '" data-domain="' + f.domain + '" checked onchange="renderComboScenarios()">' +
+          '<span><strong>' + f.name + '</strong> → <code style="background:#F3F4F6;padding:1px 6px;border-radius:3px;">' + f.domain + '</code>' + dupTag + '</span>' +
+        '</label>' +
+        '<span style="color:#6B7280;font-size:11px;">OC ' + f.combos_count + ' · 시나리오 ' + f.scenarios_count + ' (' + f.steps_count + 'step)</span>' +
+        '<button type="button" class="combo-file-delete-btn" data-path="' + f.path + '" data-name="' + f.name + '" ' +
+                'style="background:transparent;border:1px solid #DC2626;color:#DC2626;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;" ' +
+                'title="이 명세 파일 삭제 (백업됨)">🗑️</button>' +
+      '</div>';
+    }).join('');
+    // 시나리오 체크박스도 같이 렌더
+    renderComboScenarios();
+    // 삭제 버튼 이벤트 위임
+    listEl.querySelectorAll('.combo-file-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        deleteComboSpecFile(btn.dataset.path, btn.dataset.name);
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = '<span style="color:#DC2626;">⚠ 네트워크 오류: ' + e.message + '</span>';
+  }
+}
+
+// Combo 명세 파일 삭제 (백업 후 — .deleted_<timestamp> 로 이동)
+async function deleteComboSpecFile(filePath, fileName) {
+  if (!confirm('이 명세 파일을 삭제하시겠습니까?\\n\\n' + fileName + '\\n\\n파일은 같은 위치에 .deleted_<timestamp> 로 백업됩니다 (필요하면 수동 복원 가능).')) {
+    return;
+  }
+  try {
+    const resp = await fetch('/combo/delete-spec', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      alert('❌ 삭제 실패: ' + (data.error || ''));
+      return;
+    }
+    if (typeof showToast === 'function') {
+      showToast('🗑️ 삭제됨: ' + fileName, 'success');
+    }
+    // 목록 새로고침
+    await loadComboFiles();
+  } catch (e) {
+    alert('네트워크 오류: ' + e.message);
+  }
+}
+
+// 선택된 파일들의 시나리오를 모아 체크박스로 렌더
+function renderComboScenarios() {
+  const area = document.getElementById('comboScenarioArea');
+  const listEl = document.getElementById('comboScenarioList');
+  if (!area || !listEl) return;
+
+  // 체크된 파일들의 scenarios 만 모음 — 파일별로 그룹핑
+  const checked = document.querySelectorAll('.combo-file-cb:checked');
+  const fileGroups = [];  // [{ fileName, filePath, domain, scenarios: [...] }]
+  let totalScenarios = 0;
+  checked.forEach(function(cb) {
+    try {
+      const scns = JSON.parse(decodeURIComponent(cb.dataset.scenarios || '[]'));
+      const filePath = cb.value;
+      const fileName = filePath.split('/').pop();
+      // 같은 파일 안에 있는 시나리오 묶음
+      fileGroups.push({
+        fileName: fileName,
+        filePath: filePath,
+        domain: cb.dataset.domain || fileName.replace('_combinations.md', ''),
+        scenarios: scns,
+      });
+      totalScenarios += scns.length;
+    } catch (e) {}
+  });
+
+  if (!totalScenarios) {
+    area.style.display = 'none';
+    return;
+  }
+  area.style.display = 'block';
+
+  // "전체 선택" + 파일별 그룹 헤더 + 시나리오 체크박스
+  let html =
+    '<label style="display:flex;align-items:center;gap:8px;padding:4px;border-bottom:1px solid #E5E7EB;cursor:pointer;font-weight:600;font-size:12px;">' +
+    '  <input type="checkbox" id="comboScnAll" checked onchange="toggleAllScenarios(this.checked)">' +
+    '  <span>전체 시나리오 (' + totalScenarios + '개, ' + fileGroups.length + ' 파일)</span>' +
+    '</label>';
+
+  fileGroups.forEach(function(group) {
+    // 파일 그룹 헤더 — 다중 파일일 때만 표시 (단일이면 불필요)
+    if (fileGroups.length > 1) {
+      html += '<div style="margin:8px 0 4px 16px;padding:4px 8px;background:#F9FAFB;border-left:3px solid #FCD34D;font-size:11px;color:#374151;font-weight:600;">' +
+        '📄 ' + group.fileName +
+        '</div>';
+    }
+    group.scenarios.forEach(function(s) {
+      const target = s.is_target ? '<span style="color:#F59E0B;margin-right:4px;">⭐</span>' : '';
+      // 파일 출처 라벨 (다중 파일이면 시나리오 ID 옆에)
+      const fileLabel = fileGroups.length > 1
+        ? '<code style="background:#FEF3C7;color:#92400E;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:4px;">' + group.fileName.replace('_combinations.md', '') + '</code>'
+        : '';
+      html += '<label style="display:flex;align-items:center;gap:8px;padding:4px 4px 4px ' + (fileGroups.length > 1 ? '32' : '16') + 'px;cursor:pointer;font-size:12px;">' +
+        '<input type="checkbox" class="combo-scn-cb" value="' + s.id + '" data-file="' + group.filePath + '" checked>' +
+        target + fileLabel +
+        '<code style="background:#F3F4F6;padding:1px 5px;border-radius:3px;font-size:11px;">' + s.id + '</code>' +
+        '<span>' + s.title + '</span>' +
+        '<span style="margin-left:auto;color:#6B7280;font-size:11px;">' + s.step_count + ' step</span>' +
+        '</label>';
+    });
+  });
+
+  listEl.innerHTML = html;
+}
+
+function toggleAllScenarios(checked) {
+  document.querySelectorAll('.combo-scn-cb').forEach(function(c) { c.checked = checked; });
+}
+
+// 사용자가 선택한 Combo 파일 경로 (체크된 것)
+function getSelectedComboFiles() {
+  return Array.from(document.querySelectorAll('.combo-file-cb:checked')).map(function(c) { return c.value; });
+}
+
+// 사용자가 선택한 시나리오 ID 들 (콤마 구분 문자열로 반환 — 백엔드 scn_filter 형식)
+function getSelectedComboScenarios() {
+  // 전체 체크되어 있으면 "" (필터 없음 = 전체) 반환
+  const allCb = document.getElementById('comboScnAll');
+  if (allCb && allCb.checked) {
+    // 그 안의 모든 시나리오가 다 체크되어 있는지 한 번 더 확인
+    const all = document.querySelectorAll('.combo-scn-cb');
+    const checked = document.querySelectorAll('.combo-scn-cb:checked');
+    if (all.length === checked.length) return '';  // 전체 = 필터 없음
+  }
+  const checked = Array.from(document.querySelectorAll('.combo-scn-cb:checked'));
+  return checked.map(function(c) { return c.value; }).join(',');
+}
+
+// 이전 작업의 Combo 옵션 복원 (프로젝트 선택 후 자동 호출)
+function restoreComboOpts(opts) {
+  if (!opts) return;
+  // 파일 경로 — 이미 loadComboFiles 가 체크박스 렌더했으니, 일치하는 것만 체크 유지
+  if (opts.file_paths && opts.file_paths.length) {
+    const checkboxes = document.querySelectorAll('.combo-file-cb');
+    checkboxes.forEach(function(cb) {
+      cb.checked = opts.file_paths.indexOf(cb.value) !== -1;
+    });
+    // 파일 체크 변경에 따라 시나리오 영역 다시 렌더
+    if (typeof renderComboScenarios === 'function') renderComboScenarios();
+  }
+  // OC 필터
+  if (opts.oc_filter) {
+    const ocEl = document.getElementById('comboOcFilter');
+    if (ocEl) ocEl.value = opts.oc_filter;
+  }
+  // 시나리오 필터 — 체크박스에 반영
+  if (opts.scn_filter) {
+    setTimeout(function() {  // 시나리오 체크박스 렌더 끝난 후 적용
+      const wantedIds = opts.scn_filter.split(',').map(function(s) { return s.trim(); });
+      const allCb = document.getElementById('comboScnAll');
+      if (allCb) allCb.checked = false;  // 전체 해제 후 일부만 체크
+      document.querySelectorAll('.combo-scn-cb').forEach(function(cb) {
+        cb.checked = wantedIds.indexOf(cb.value) !== -1;
+      });
+    }, 300);
+  }
+}
+
+// Combo 모드 시작 전 검증
+function validateComboBeforeStart() {
+  if (getSelectedGenerationMode() !== 'combo_only') return { ok: true };
+  const files = getSelectedComboFiles();
+  if (!files.length) {
+    return { ok: false,
+             msg: 'Combo 명세 파일이 선택되지 않았습니다. Combo 모드는 *_combinations.md 파일이 필요합니다.\\n대안: 모드를 "정책 반영" 으로 변경하거나, projects/{프로젝트}/ 에 *_combinations.md 추가.' };
+  }
+  return { ok: true };
 }
 
 // 초기 선택 강조 + What's New 배너 체크
@@ -11125,6 +12809,13 @@ async function startPipeline() {
   const projectName = document.getElementById('projectName').value.trim() || '프로젝트';
   const focusArea = document.getElementById('focusArea').value.trim();
 
+  // Combo 모드 검증 (모드가 combo_only 인데 파일 없으면 차단)
+  const comboCheck = validateComboBeforeStart();
+  if (!comboCheck.ok) {
+    alert('⚠️ Combo 모드 검증 실패\\n\\n' + comboCheck.msg);
+    return;
+  }
+
   // 구조화 spec 폴더 모드 분기 — v0.10.x: spec 폴더 경로가 비어있지 않으면 spec 모드 우선
   const specPathEl = document.getElementById('specFolderPath');
   const specFolderActive = specPathEl && specPathEl.value.trim();
@@ -11189,6 +12880,13 @@ async function startPipelineSpecFolder(projectName, focusArea, folderPath) {
   const includeUnchanged = document.getElementById('includeUnchanged') ? document.getElementById('includeUnchanged').checked : false;
 
   try {
+    const isComboMode = getSelectedGenerationMode() === 'combo_only';
+    const comboPayload = isComboMode ? {
+      file_paths: getSelectedComboFiles(),
+      oc_filter: (document.getElementById('comboOcFilter')?.value || '').trim(),
+      scn_filter: getSelectedComboScenarios(),  // 체크박스 기반 — 전체면 빈 문자열
+    } : null;
+
     const resp = await fetch('/start-spec-folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -11198,6 +12896,8 @@ async function startPipelineSpecFolder(projectName, focusArea, folderPath) {
         folder_path: folderPath,
         prev_folder_path: diffActive ? prevPath : '',
         include_unchanged: includeUnchanged,
+        generation_mode: getSelectedGenerationMode(),
+        combo: comboPayload,
       })
     });
     const data = await resp.json();
@@ -13683,7 +15383,236 @@ async function pollServerAlive() {
   // 초기 1회
   setTimeout(updateVisibility, 100);
 })();
+
+// ──────────────────────────────────────────────────────────
+// Combo 명세 작성/갱신 모달
+// ──────────────────────────────────────────────────────────
+let _comboSpecMode = 'new';  // 'new' or 'edit'
+let _comboSpecEditPath = '';
+
+async function openComboSpecModal(mode) {
+  _comboSpecMode = mode;
+  const modal = document.getElementById('comboSpecModal');
+  const title = document.getElementById('comboSpecModalTitle');
+  const editSelect = document.getElementById('comboSpecEditSelect');
+  const editArea = document.getElementById('comboSpecEditArea');
+  const draftBtn = document.getElementById('comboSpecDraftBtn');
+  const previewArea = document.getElementById('comboSpecPreview');
+  const status = document.getElementById('comboSpecStatus');
+
+  // spec 폴더 사전 검증
+  const specPath = (document.getElementById('specFolderPath')?.value || '').trim();
+  if (!specPath) {
+    alert('먼저 위쪽 "구조화 spec 폴더 경로" 를 입력해주세요.\\nspec 폴더 분석이 필요합니다.');
+    return;
+  }
+
+  title.textContent = mode === 'new' ? '➕ Combo 명세 새로 작성' : '✏️ Combo 명세 갱신';
+  previewArea.value = '';
+  status.textContent = '';
+  status.style.color = '#6B7280';
+
+  if (mode === 'edit') {
+    editArea.style.display = 'block';
+    // 기존 파일 목록 로드
+    const projectName = (document.getElementById('projectName')?.value || 'supercycl').trim();
+    const url = '/combo/list-files?project_name=' + encodeURIComponent(projectName) +
+                (specPath ? '&spec_folder=' + encodeURIComponent(specPath) : '');
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!data.ok || !data.files || !data.files.length) {
+      alert('편집할 명세가 없습니다. "새 명세 작성" 모드를 사용하세요.');
+      return;
+    }
+    editSelect.innerHTML = data.files.map(f =>
+      '<option value="' + f.path + '">' + f.name + ' (' + f.domain + ')</option>'
+    ).join('');
+  } else {
+    editArea.style.display = 'none';
+  }
+
+  modal.style.display = 'flex';
+}
+
+function closeComboSpecModal() {
+  document.getElementById('comboSpecModal').style.display = 'none';
+}
+
+async function draftComboSpec() {
+  const status = document.getElementById('comboSpecStatus');
+  const previewArea = document.getElementById('comboSpecPreview');
+  const draftBtn = document.getElementById('comboSpecDraftBtn');
+  const domain = document.getElementById('comboSpecDomain').value.trim() || 'Trade';
+  const targetScrsRaw = document.getElementById('comboSpecTargetScrs').value.trim();
+  const specPath = (document.getElementById('specFolderPath')?.value || '').trim();
+
+  let existingMd = '';
+  let editPath = '';
+  if (_comboSpecMode === 'edit') {
+    editPath = document.getElementById('comboSpecEditSelect').value;
+    if (editPath) {
+      // 기존 명세 로드
+      const r = await fetch('/combo/read-spec?path=' + encodeURIComponent(editPath));
+      const d = await r.json();
+      if (d.ok) existingMd = d.content;
+    }
+  }
+  _comboSpecEditPath = editPath;
+
+  const targetScrs = targetScrsRaw
+    ? targetScrsRaw.split(/[,\\s]+/).map(s => s.trim()).filter(s => s).map(s => s.toUpperCase())
+    : null;
+
+  draftBtn.disabled = true;
+  status.style.color = '#1976D2';
+  status.textContent = '⏳ AI 가 spec 분석 + 명세 초안 작성 중... (1~2분 소요)';
+  previewArea.value = '';
+
+  try {
+    const resp = await fetch('/combo/draft-spec', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        spec_folder: specPath,
+        domain: domain,
+        target_scrs: targetScrs,
+        existing_md: existingMd,
+      })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      status.style.color = '#DC2626';
+      status.textContent = '❌ ' + (data.error || '오류');
+      previewArea.value = data.trace || '';
+      return;
+    }
+    previewArea.value = data.draft_md;
+    status.style.color = '#10B981';
+    let statusMsg = '✅ 초안 작성 완료. 검토 후 "저장" 버튼을 누르세요. ('
+      + data.draft_md.length + '자)';
+    if (data.meta) {
+      const m = data.meta;
+      if (m.reference_source) {
+        statusMsg += ' · 📋 참조: ' + m.reference_source;
+      }
+      if (m.screens_count) {
+        statusMsg += ' · 화면 ' + m.screens_count + '개 분석';
+      }
+    }
+    status.textContent = statusMsg;
+  } catch (e) {
+    status.style.color = '#DC2626';
+    status.textContent = '❌ 네트워크 오류: ' + e.message;
+  } finally {
+    draftBtn.disabled = false;
+  }
+}
+
+async function saveComboSpec() {
+  const content = document.getElementById('comboSpecPreview').value.trim();
+  const status = document.getElementById('comboSpecStatus');
+  if (!content) {
+    alert('저장할 내용이 없습니다. "초안 생성" 을 먼저 실행하세요.');
+    return;
+  }
+
+  let savePath = '';
+  if (_comboSpecMode === 'edit' && _comboSpecEditPath) {
+    savePath = _comboSpecEditPath;  // 덮어쓰기
+  } else {
+    // 새 파일 — 도메인 기반 파일명 + spec 폴더에 저장
+    const domain = document.getElementById('comboSpecDomain').value.trim() || 'Trade';
+    const specPath = (document.getElementById('specFolderPath')?.value || '').trim();
+    const filename = domain.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_combinations.md';
+    savePath = specPath + '/' + filename;
+  }
+
+  if (!confirm('다음 위치에 저장합니다:\\n' + savePath + '\\n\\n진행할까요?')) return;
+
+  status.style.color = '#1976D2';
+  status.textContent = '💾 저장 중...';
+
+  try {
+    const resp = await fetch('/combo/save-spec', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ save_path: savePath, content: content })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      status.style.color = '#DC2626';
+      status.textContent = '❌ ' + (data.error || '저장 실패');
+      if (data.allowed) {
+        status.textContent += ' (허용: ' + data.allowed.join(', ') + ')';
+      }
+      return;
+    }
+    status.style.color = '#10B981';
+    status.textContent = '✅ 저장 완료: ' + data.saved_path;
+    // 파일 목록 새로고침
+    setTimeout(function() {
+      closeComboSpecModal();
+      loadComboFiles();
+    }, 1500);
+  } catch (e) {
+    status.style.color = '#DC2626';
+    status.textContent = '❌ 네트워크 오류: ' + e.message;
+  }
+}
 </script>
+
+<!-- Combo 명세 작성/갱신 모달 -->
+<div id="comboSpecModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:white;width:90%;max-width:900px;max-height:90vh;border-radius:10px;display:flex;flex-direction:column;overflow:hidden;">
+    <div style="padding:16px 20px;background:#1976D2;color:white;display:flex;justify-content:space-between;align-items:center;">
+      <h3 id="comboSpecModalTitle" style="margin:0;font-size:16px;">Combo 명세 작성</h3>
+      <button onclick="closeComboSpecModal()" style="background:transparent;color:white;border:0;font-size:24px;cursor:pointer;line-height:1;">×</button>
+    </div>
+    <div style="padding:16px 20px;border-bottom:1px solid #E5E7EB;background:#F9FAFB;">
+      <div id="comboSpecEditArea" style="display:none;margin-bottom:12px;">
+        <label style="font-size:12px;font-weight:600;color:#374151;">갱신할 명세 파일</label>
+        <select id="comboSpecEditSelect" style="width:100%;padding:6px 10px;border:1px solid #D1D5DB;border-radius:4px;font-size:13px;margin-top:4px;"></select>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:180px;">
+          <label style="font-size:12px;font-weight:600;color:#374151;">도메인</label>
+          <input type="text" id="comboSpecDomain" value="Trade"
+                 placeholder="예: Trade, Exchange, Portfolio"
+                 style="width:100%;padding:6px 10px;border:1px solid #D1D5DB;border-radius:4px;font-size:13px;margin-top:4px;">
+          <div style="font-size:11px;color:#6B7280;margin-top:2px;">→ 파일명 <code>{domain}_combinations.md</code> + 시트 <code>{domain}(Combo)</code></div>
+        </div>
+        <div style="flex:1;min-width:180px;">
+          <label style="font-size:12px;font-weight:600;color:#374151;">분석 대상 SCR (선택)</label>
+          <input type="text" id="comboSpecTargetScrs" placeholder="예: SCR-102,SCR-104,SCR-106 (비우면 자동)"
+                 style="width:100%;padding:6px 10px;border:1px solid #D1D5DB;border-radius:4px;font-size:13px;margin-top:4px;">
+          <div style="font-size:11px;color:#6B7280;margin-top:2px;">비우면 도메인 키워드로 자동 선택 (최대 10개)</div>
+        </div>
+      </div>
+      <button id="comboSpecDraftBtn" onclick="draftComboSpec()"
+              style="margin-top:12px;padding:8px 16px;background:#10B981;color:white;border:0;border-radius:6px;cursor:pointer;font-weight:600;">
+        🤖 AI 초안 생성
+      </button>
+      <span id="comboSpecStatus" style="margin-left:10px;font-size:12px;"></span>
+    </div>
+    <div style="flex:1;padding:16px 20px;overflow:auto;">
+      <label style="font-size:12px;font-weight:600;color:#374151;display:block;margin-bottom:6px;">
+        명세 미리보기 / 편집 (markdown — 직접 수정 가능)
+      </label>
+      <textarea id="comboSpecPreview"
+                style="width:100%;height:50vh;padding:12px;border:1px solid #D1D5DB;border-radius:6px;font-family:'Monaco','Menlo',monospace;font-size:12px;line-height:1.5;resize:vertical;"
+                placeholder="AI 초안 생성 후 여기에 명세가 표시됩니다. 직접 수정 가능합니다."></textarea>
+    </div>
+    <div style="padding:12px 20px;background:#F9FAFB;border-top:1px solid #E5E7EB;display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closeComboSpecModal()"
+              style="padding:8px 16px;background:#9CA3AF;color:white;border:0;border-radius:6px;cursor:pointer;">취소</button>
+      <button onclick="saveComboSpec()"
+              style="padding:8px 16px;background:#1976D2;color:white;border:0;border-radius:6px;cursor:pointer;font-weight:600;">
+        💾 저장
+      </button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
 """

@@ -9,6 +9,105 @@
 
 ---
 
+## v0.11.0 — 2026-05-11 (Combo 모드 — 옵션 조합 + 사용자 시나리오 그레이박스 TC)
+
+> **요약 (마이너)**: 화면(SCR) 중심 TC 외에 **옵션 조합 + 사용자 시나리오 기반 그레이박스 TC** 를 자동 생성하는 **Combo 모드** 추가. 거래 옵션 조합(Decision Table) + 페르소나별 사용 흐름 명세를 사람이 정의하고, AI 가 TC 로 변환. 명세 작성 자체도 AI 가 spec 폴더 분석해 초안 제공.
+
+### 🧩 Combo 모드 신규 — 옵션 조합 TC
+
+**배경**: 화면 단위 TC 는 "위젯이 잘 보이고 잘 눌리는가" 까지만 검증. 실제 자금 영향이 큰 거래 도메인은 **옵션 조합 (Side × Type × Leverage × Auto-protect × 잔고 ...) 이 정확히 동작하는가** 가 더 중요.
+
+**해결**: 명세 파일 (`*_combinations.md`) 에 옵션 조합 매트릭스 + 페르소나 시나리오를 사람이 정의 → AI 가 TC 로 변환.
+
+**명세 파일 구조** (`order_combinations.md` 예시):
+- §1 거래 옵션 차원 (Side/Type/Mode/Leverage/Auto-protect/심볼/...)
+- §2 도메인 룰 (계산식, 검증 룰, 위험 등급, 코인별 특성)
+- §3 옵션 조합 매트릭스 (Decision Table — OC-001 ~ OC-NNN, 6 카테고리)
+- §4 사용자 시나리오 (S1~S7 페르소나별 흐름)
+- §5 운영 가이드
+
+**TC 출력**:
+- COMBO TC: 옵션 조합 1개 = TC 1개 (`SM-ORDR-COMBO-001`)
+- FLOW TC: 시나리오 step 1개 = TC 1개 (`SM-ORDR-FLOW-001`)
+- 그레이박스 정책 — 기대 결과는 자연어, 기술 힌트(DOM/state)는 사전 조건 마지막 줄
+
+### 🤖 AI 가 spec 분석해 명세 초안 작성
+
+**기능**: spec 폴더 + 도메인 선택 → AI 가 옵션 차원/매트릭스/시나리오/위험등급 초안 작성 → 사용자 검토·수정 후 저장.
+
+- **참조 명세 자동 탐색**: 같은 spec 폴더 또는 projects/ 안의 다른 `*_combinations.md` 를 형식 참조용으로 자동 첨부 → 구조 일관성
+- **갱신 모드**: 기존 명세를 참고하여 spec 변경 사항만 반영 (OC/시나리오 ID 가능한 유지)
+- **분석 대상 SCR 선택** 또는 도메인 키워드로 자동 추출 (최대 10개)
+
+### 📋 단순화된 UI — 시나리오 체크박스 선택
+
+**Before**: OC/시나리오 ID 외워서 텍스트 입력 (예: `OC-070,OC-07*`, `S5,S7`)
+**After**: 명세 선택 시 시나리오 체크박스 자동 로드 — `⭐ S5 Limit Order 추적 시나리오 (6 step)` 형태로 설명 포함
+
+**다중 파일 지원**:
+- 시나리오 목록을 파일별 그룹 헤더 + 출처 라벨 (`[order]`, `[trade_lite]`) 로 구분
+- 중복 도메인 행 노란색 + "중복" 태그 강조
+- 각 파일 옆 🗑️ Soft delete 버튼 (`*.deleted_<timestamp>` 백업)
+
+**고급 옵션** (펼침): OC 필터 입력란 — 특정 OC 만 만들 때 활용
+
+### 🆔 도메인별 SuiteCode 자동 분리 — TC ID 충돌 방지
+
+명세 파일이 여러 개일 때 같은 ID 범위 (`SM-COMBO-001~`) 충돌 방지:
+- `order_combinations.md` → `SM-ORDR-COMBO-NNN` / `SM-ORDR-FLOW-NNN`
+- `trade_lite__combinations.md` → `SM-LITE-COMBO-NNN` / `SM-LITE-FLOW-NNN`
+- `exchange_combinations.md` → `SM-EXCH-COMBO-NNN` 등
+
+### ⚡ Combo only 단축 파이프라인
+
+**Before**: spec 폴더 입력 시 분류표 생성 → Human Gate → SCR TC → Review → Combo TC 모두 진행
+**After**: Combo 모드일 때 **SCR 관련 단계 모두 skip** 하고 바로 Combo TC 만 생성. 약 5~10배 빠름.
+
+- Stage 1: Combo TC 생성 시작 (LLM 호출)
+- Stage 2: Excel 빌드
+- Stage 3: 완료
+
+### 🔄 Combo 모드 자동 복원
+
+프로젝트 재선택 시 이전 Combo 작업의 상태를 자동 복원:
+- 생성 모드 라디오 → "Combo 모드" 자동 선택
+- 명세 파일 체크박스 → 이전 선택 유지
+- 시나리오 체크박스 → 이전 선택만 체크 (전체 아니면)
+- OC 필터 → 이전 값 채움
+
+### ⚠️ 테스트 실행 위험 안내 (사전 조건 통합)
+
+각 TC 의 사전 조건 마지막 줄에 위험 등급 안내 자동 추가 (자금 영향 있는 케이스만):
+- 🔴 고위험 (100x, 잔고 80%+) — 테스트 계정 권장
+- 🟡 중위험 (10~25x, Hedge 양방향)
+- 🟢 저위험 (5x 이하, 작은 Margin)
+- ⚪ 위험 없음 (입력 검증 실패, UI 표시) — 줄 생략
+
+### 🛡 소분류 정규화 강화
+
+이전 화면별 TC 에서 발견된 패턴들을 정규화 함수에 흡수:
+- **State 라벨 prefix 제거**: `Error.mark-price-stale 상태 배너 표시` → `상태 배너 표시`
+- **Trigger label cutoff 보호**: `화면 진입 시: OAuth Connect ...` → `OAuth Connect ...` (부연 보존)
+- **카테고리 헤딩 3줄 처리**: `에러 처리 / 연결 해제 실패 / Toast 3초 ...` → 부연 라인만
+- **URL 일반화**: `URL 바는 "https://..." 표시` → `URL 바 정보 확인`
+- **'계산 정확성' 일관성**: `계산 정확성 / PnL` 와 `계산 정확성 / X / 부연` 모두 한 줄로 통일
+- **SCR 식별자 제거**: `"Retry" 탭 — SCR-104 → SCR-602 → Retry 성공` → `Retry 성공 E2E 흐름 확인`
+
+### 📐 기타 개선
+
+- **시트 1행만 고정** — 이전 2행 → 1행으로 통일 (classification_check 시트 예외)
+- **TC 검토 단계에 규칙 기반 품질 검출 통합** — 키워드 중복, 메타마커 잔존, DOM 식별자 단독 등 7 패턴 자동 검출
+- **카테고리 5 "연결 시나리오" 추가** (5~10%) — 시작점/종착지 화면에 E2E happy path
+- **누락 방지 가이드 프롬프트** — 유사 계산 공식, 성능 임계값, 플랫폼별 분기 3패턴 분리 명시
+- **의무 TC 패턴 검출 시트** — `obligatory_tc_patterns.md` 기반 누락 자동 검출 (`obligatory_tc_check` 시트)
+
+### 📁 신규 파일
+
+- `tc-agent/projects/supercycl/order_combinations.md` — Combo 명세 (42 OC + 7 시나리오 / 39 step)
+- `tc-ui/scripts/run_combo_tc.py` — CLI 진입점 (UI 없이 Combo TC 생성)
+
+---
+
 ## v0.10.1 — 2026-05-07 (TC ID 화면 단위 리셋 + 계산·표시 정확성 패턴 보강)
 
 > **요약 (패치)**: v0.10.0 의 구조화 spec 모드 운영 중 발견한 버그·누락·요구사항 6건을 일괄 정정. TC ID 가 화면별 001~로 정확히 리셋되고, 코인 선물 거래소의 핵심 계산·표시 정확성 항목(ROE/PnL/Funding rate/정렬/색상 분기 등) 36 패턴이 자동 검출된다.
