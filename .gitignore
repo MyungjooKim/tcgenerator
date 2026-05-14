@@ -43,3 +43,6 @@ tc-ui/pipeline_states/
 *.before_cleanup_*
 *.deleted_*
 tc-ui/workspace/
+
+# ── TC Update 로컬 캐시 (SCR 본문/매핑 — 사본별로 다르고 재생성 가능) ──────
+tc-ui/.update_cache/

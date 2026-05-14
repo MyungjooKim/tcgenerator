@@ -162,6 +162,90 @@ def save_project(project_name: str, tc_file: str = "", excel_file: str = "", **e
     PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ── TC Update 작업 이력 (프로젝트별 최근 N개) ──────────────────────────────
+UPDATE_HISTORY_MAX = 5
+
+
+def _derive_update_label(prev_folder: str, new_folder: str) -> str:
+    """폴더명에서 버전 추출해 'v0.52.0 → v0.54.0' 같은 짧은 라벨 생성."""
+    import re as _re
+    def _ver(p: str) -> str:
+        m = _re.search(r"v\d+\.\d+\.\d+", p or "")
+        return m.group(0) if m else (Path(p).name[:20] if p else "?")
+    return f"{_ver(prev_folder)} → {_ver(new_folder)}"
+
+
+def save_update_history(project_name: str, prev_folder: str, new_folder: str,
+                          existing_tc_url: str) -> None:
+    """프로젝트의 update 작업 이력에 한 건 추가. 같은 (prev,new,url) 조합은 최상위로 이동.
+
+    유효성 — 세 필드 모두 있어야 저장. 빈 프로젝트명도 skip.
+    """
+    project_name = (project_name or "").strip()
+    if not project_name:
+        return
+    if not (prev_folder and new_folder and existing_tc_url):
+        return
+    projects = load_projects()
+    proj = next((p for p in projects if p["name"] == project_name), None)
+    if not proj:
+        return
+
+    history = list(proj.get("update_history") or [])
+    # 같은 조합이 있으면 제거 (맨 위로 올림)
+    history = [h for h in history if not (
+        h.get("prev_folder") == prev_folder
+        and h.get("new_folder") == new_folder
+        and h.get("existing_tc_url") == existing_tc_url
+    )]
+    entry = {
+        "prev_folder": prev_folder,
+        "new_folder": new_folder,
+        "existing_tc_url": existing_tc_url,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "label": _derive_update_label(prev_folder, new_folder),
+    }
+    history.insert(0, entry)
+    proj["update_history"] = history[:UPDATE_HISTORY_MAX]
+    PROJECTS_FILE.write_text(
+        json.dumps(projects, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_update_history(project_name: str) -> list:
+    """프로젝트의 update 작업 이력 반환 (최신 순). 없으면 []."""
+    project_name = (project_name or "").strip()
+    if not project_name:
+        return []
+    projects = load_projects()
+    proj = next((p for p in projects if p["name"] == project_name), None)
+    return list((proj or {}).get("update_history") or [])
+
+
+def delete_update_history(project_name: str, index: int) -> bool:
+    """프로젝트의 update_history 에서 index 번째 항목 삭제.
+    Returns: True 면 삭제 성공, False 면 실패 (프로젝트 없음 / index 범위 초과).
+    """
+    project_name = (project_name or "").strip()
+    if not project_name:
+        return False
+    projects = load_projects()
+    proj = next((p for p in projects if p["name"] == project_name), None)
+    if not proj:
+        return False
+    history = list(proj.get("update_history") or [])
+    if index < 0 or index >= len(history):
+        return False
+    history.pop(index)
+    proj["update_history"] = history
+    PROJECTS_FILE.write_text(
+        json.dumps(projects, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return True
+
+
 # ── 프로젝트별 파이프라인 상태 저장 (이어서 작업용) ─────────────────────────────
 PIPELINE_STATES_DIR = BASE_DIR / "pipeline_states"
 PIPELINE_STATES_DIR.mkdir(exist_ok=True)
@@ -1584,6 +1668,1284 @@ def diff_spec_folders(prev_folder: Path, new_folder: Path) -> dict:
         "unchanged": unchanged,
         "common_changed": common_changed,
     }
+
+
+# ── TC Update 분석 — SCR 그룹화 + 영속 캐시 ─────────────────────────────────
+
+# 그룹 묶음 크기 (5개씩)
+DIFF_GROUP_SIZE = 5
+
+# 캐시 디렉토리 (tc-ui 프로젝트 루트 기준)
+_DIFF_CACHE_DIR = BASE_DIR / ".update_cache"
+_DIFF_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _group_scr_changes(diff: dict) -> list:
+    """SCR diff 를 종류별 + 5개 단위 그룹으로 묶음.
+
+    Args:
+      diff: {added, modified, removed, unchanged, ...}
+
+    Returns: [{type, scrs, index, label}, ...] — index 0..N
+      type: 'added' | 'modified' | 'removed'
+      scrs: ['SCR-222', ...] (최대 5개)
+      label: 사람이 읽을 한 줄 설명
+    """
+    groups = []
+    idx = 0
+
+    def _chunked(items: list, n: int):
+        for i in range(0, len(items), n):
+            yield items[i:i + n]
+
+    # 신규 먼저
+    for chunk in _chunked(list(diff.get("added", []) or []), DIFF_GROUP_SIZE):
+        groups.append({
+            "index": idx,
+            "type": "added",
+            "scrs": chunk,
+            "label": f"신규 SCR {len(chunk)}개",
+        })
+        idx += 1
+
+    # 그 다음 수정
+    for chunk in _chunked(list(diff.get("modified", []) or []), DIFF_GROUP_SIZE):
+        groups.append({
+            "index": idx,
+            "type": "modified",
+            "scrs": chunk,
+            "label": f"수정 SCR {len(chunk)}개",
+        })
+        idx += 1
+
+    # 마지막 삭제
+    for chunk in _chunked(list(diff.get("removed", []) or []), DIFF_GROUP_SIZE):
+        groups.append({
+            "index": idx,
+            "type": "removed",
+            "scrs": chunk,
+            "label": f"삭제 SCR {len(chunk)}개",
+        })
+        idx += 1
+
+    return groups
+
+
+def _diff_cache_key(prev_folder: str, new_folder: str, group_index: int) -> str:
+    """캐시 키 = SHA256(prev|new|group_index) 의 hex 12자리."""
+    import hashlib
+    raw = f"{prev_folder}|{new_folder}|{group_index}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _diff_cache_path(prev_folder: str, new_folder: str, group_index: int) -> Path:
+    key = _diff_cache_key(prev_folder, new_folder, group_index)
+    return _DIFF_CACHE_DIR / f"{key}.json"
+
+
+def _load_diff_cache(prev_folder: str, new_folder: str, group_index: int) -> dict | None:
+    """캐시 hit 면 dict 반환, miss 면 None."""
+    p = _diff_cache_path(prev_folder, new_folder, group_index)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_diff_cache(prev_folder: str, new_folder: str, group_index: int,
+                       data: dict) -> None:
+    """캐시 저장 — 실패해도 조용히 무시."""
+    p = _diff_cache_path(prev_folder, new_folder, group_index)
+    try:
+        from datetime import datetime
+        payload = {
+            **data,
+            "_cached_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "_prev_folder": prev_folder,
+            "_new_folder": new_folder,
+            "_group_index": group_index,
+        }
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _read_scr_pair(prev_folder: str, new_folder: str, scr_id: str) -> tuple:
+    """주어진 SCR 의 (prev_text, new_text) 반환. 없으면 빈 문자열."""
+    try:
+        prev_cls = classify_spec_files(Path(prev_folder).expanduser())
+        new_cls = classify_spec_files(Path(new_folder).expanduser())
+    except Exception:
+        return "", ""
+    prev_map = {p.stem.split(".")[0]: p for p in prev_cls.get("screens", [])}
+    new_map = {p.stem.split(".")[0]: p for p in new_cls.get("screens", [])}
+    prev_p = prev_map.get(scr_id)
+    new_p = new_map.get(scr_id)
+    prev_text = prev_p.read_text(encoding="utf-8") if prev_p and prev_p.exists() else ""
+    new_text = new_p.read_text(encoding="utf-8") if new_p and new_p.exists() else ""
+    return prev_text, new_text
+
+
+# ── SCR 단위 캐시 (그룹 캐시와 별개) ─────────────────────────────────────
+
+def _scr_cache_path(prev_folder: str, new_folder: str, scr_id: str) -> Path:
+    import hashlib
+    raw = f"scr|{prev_folder}|{new_folder}|{scr_id}"
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return _DIFF_CACHE_DIR / f"scr_{key}.json"
+
+
+def _load_scr_cache(prev_folder: str, new_folder: str, scr_id: str) -> dict | None:
+    p = _scr_cache_path(prev_folder, new_folder, scr_id)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_scr_cache(prev_folder: str, new_folder: str, scr_id: str, data: dict) -> None:
+    p = _scr_cache_path(prev_folder, new_folder, scr_id)
+    try:
+        from datetime import datetime
+        payload = {
+            **data,
+            "_cached_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "_scr_id": scr_id,
+        }
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+    except Exception:
+        pass
+
+
+def step_analyze_scr_one(prev_folder: str, new_folder: str, scr_id: str,
+                            change_type: str) -> dict:
+    """1개 SCR 에 대한 AI 분석.
+
+    change_type: 'added' | 'modified' | 'removed'
+    Returns: {ok, summary, scr_id, change_type, from_cache}
+    """
+    prev_text, new_text = _read_scr_pair(prev_folder, new_folder, scr_id)
+
+    if change_type == "added":
+        body = f"### {scr_id} (신규)\n\n```\n{new_text[:3500]}\n```"
+    elif change_type == "removed":
+        body = f"### {scr_id} (삭제)\n\n```\n{prev_text[:2500]}\n```"
+    else:  # modified
+        body = (
+            f"### {scr_id} (수정)\n\n"
+            f"#### 이전\n```\n{prev_text[:1800]}\n```\n\n"
+            f"#### 신규\n```\n{new_text[:1800]}\n```"
+        )
+
+    type_label = {
+        "added": "신규 SCR",
+        "modified": "수정 SCR",
+        "removed": "삭제 SCR",
+    }.get(change_type, change_type)
+
+    system_prompt = f"""당신은 QA 도메인 전문가입니다. {type_label} 1개의 변경 사항을
+간결한 한국어 보고서로 정리합니다.
+
+## 출력 형식 (마크다운)
+```
+### {scr_id}
+- **변경 핵심**: 한 줄
+- **TC 영향**: 어떤 종류의 TC 가 영향받는지 (수정/신규/삭제)
+- **권장 액션**: 1-2 문장
+```
+
+원칙:
+- 본문에서만 추출. 추측 금지.
+- TC ID 자체는 모름 — "영향 종류" 만 추정.
+- 디자인/문구만 변경된 경우 명시.
+- 간결하게."""
+
+    user_prompt = f"## {type_label} 본문\n\n{body}"
+
+    try:
+        summary = call_claude(system_prompt, user_prompt, max_tokens=1500)
+    except Exception as e:
+        return {"ok": False, "error": f"AI 호출 실패: {e}",
+                  "scr_id": scr_id, "change_type": change_type}
+
+    return {
+        "ok": True,
+        "summary": summary,
+        "scr_id": scr_id,
+        "change_type": change_type,
+    }
+
+
+def step_analyze_group(prev_folder: str, new_folder: str, group: dict) -> dict:
+    """1개 그룹 (최대 5개 SCR) 에 대한 AI 요약 분석.
+
+    Args:
+      group: {index, type, scrs, label}
+
+    Returns: {ok, summary, scr_details: [{scr_id, status, ...}], group}
+    """
+    gtype = group.get("type", "")
+    scrs = group.get("scrs", [])
+
+    # 각 SCR 의 본문 발췌
+    blocks = []
+    for scr_id in scrs:
+        prev_text, new_text = _read_scr_pair(prev_folder, new_folder, scr_id)
+        if gtype == "added":
+            blocks.append(f"### {scr_id} (신규)\n\n```\n{new_text[:3500]}\n```")
+        elif gtype == "removed":
+            blocks.append(f"### {scr_id} (삭제)\n\n```\n{prev_text[:2500]}\n```")
+        else:  # modified
+            blocks.append(
+                f"### {scr_id} (수정)\n\n"
+                f"#### 이전\n```\n{prev_text[:1800]}\n```\n\n"
+                f"#### 신규\n```\n{new_text[:1800]}\n```"
+            )
+
+    type_label = {
+        "added": "신규 SCR",
+        "modified": "수정 SCR",
+        "removed": "삭제 SCR",
+    }.get(gtype, gtype)
+
+    system_prompt = f"""당신은 QA 도메인 전문가입니다. 다음 {type_label} 그룹의 변경 사항을
+간결한 한국어 보고서로 정리합니다.
+
+## 출력 형식 (마크다운)
+```
+## {type_label} ({len(scrs)}개)
+
+### SCR-XXX
+- **변경 핵심**: 한 줄
+- **TC 영향**: 어떤 종류의 TC 가 영향받는지 (수정/신규/삭제)
+- **권장 액션**: 1-2 문장
+
+(각 SCR 마다 반복)
+```
+
+원칙:
+- 본문에서만 추출. 추측 금지.
+- TC ID 자체는 모름 — "영향 종류" 만 추정.
+- 보수적 — 디자인/문구만 변경되었으면 그렇게 명시.
+- 간결하게."""
+
+    user_prompt = f"## {type_label} 본문 ({len(scrs)}개)\n\n" + "\n\n---\n\n".join(blocks)
+
+    try:
+        summary = call_claude(system_prompt, user_prompt, max_tokens=4000)
+    except Exception as e:
+        return {"ok": False, "error": f"AI 호출 실패: {e}", "group": group}
+
+    return {
+        "ok": True,
+        "summary": summary,
+        "group": group,
+    }
+
+
+def step_analyze_spec_diff(prev_folder: str, new_folder: str,
+                            existing_tc_url: str = "") -> dict:
+    """1단계 — spec 폴더 diff 분석 + AI 요약 보고서 생성.
+
+    Args:
+        prev_folder: 이전 기획서 spec 폴더 경로
+        new_folder: 새 기획서 spec 폴더 경로
+        existing_tc_url: 기존 TC Google Sheets URL (참고용 — 1단계는 아직 안 읽음)
+    Returns:
+        {
+          "diff": {added, modified, removed, unchanged, common_changed},
+          "summary": str (AI 가 요약한 변경 사항 마크다운),
+          "scr_changes": [{scr_id, status, change_summary, impact_estimate}],
+          "common_doc_changes": [...],  # 정책/디자인 변경 요약
+          "meta": {prev_folder, new_folder, analyzed_at, ...},
+        }
+    """
+    prev_p = Path(prev_folder).expanduser()
+    new_p = Path(new_folder).expanduser()
+    if not prev_p.exists() or not prev_p.is_dir():
+        raise RuntimeError(f"이전 폴더 없음: {prev_folder}")
+    if not new_p.exists() or not new_p.is_dir():
+        raise RuntimeError(f"새 폴더 없음: {new_folder}")
+
+    # 1) 파일 단위 diff (재사용)
+    diff = diff_spec_folders(prev_p, new_p)
+
+    # 2) 각 SCR 의 변경 내용 — modified 항목들의 본문 비교
+    prev_cls = classify_spec_files(prev_p)
+    new_cls = classify_spec_files(new_p)
+    prev_scr_map = {p.stem.split(".")[0]: p for p in prev_cls["screens"]}
+    new_scr_map = {p.stem.split(".")[0]: p for p in new_cls["screens"]}
+
+    # 3) 각 변경 항목별 본문 발췌 (AI 요약용)
+    scr_changes_raw = []  # AI 호출 전 raw 데이터
+    for scr_id in diff["added"]:
+        scr_path = new_scr_map.get(scr_id)
+        if scr_path and scr_path.exists():
+            scr_changes_raw.append({
+                "scr_id": scr_id, "status": "added",
+                "new_content": scr_path.read_text(encoding="utf-8")[:5000],
+                "prev_content": "",
+            })
+    for scr_id in diff["modified"]:
+        prev_path = prev_scr_map.get(scr_id)
+        new_path = new_scr_map.get(scr_id)
+        if prev_path and new_path:
+            scr_changes_raw.append({
+                "scr_id": scr_id, "status": "modified",
+                "prev_content": prev_path.read_text(encoding="utf-8")[:5000],
+                "new_content": new_path.read_text(encoding="utf-8")[:5000],
+            })
+    for scr_id in diff["removed"]:
+        prev_path = prev_scr_map.get(scr_id)
+        if prev_path and prev_path.exists():
+            scr_changes_raw.append({
+                "scr_id": scr_id, "status": "removed",
+                "prev_content": prev_path.read_text(encoding="utf-8")[:3000],
+                "new_content": "",
+            })
+
+    # 4) 공통 문서 변경 (정책/디자인/overview)
+    common_doc_changes = []
+    if diff["common_changed"]:
+        # overview 비교
+        if prev_cls.get("overview") and new_cls.get("overview"):
+            if prev_cls["overview"].read_bytes() != new_cls["overview"].read_bytes():
+                common_doc_changes.append({
+                    "doc_type": "overview",
+                    "file_name": new_cls["overview"].name,
+                    "prev_size": prev_cls["overview"].stat().st_size,
+                    "new_size": new_cls["overview"].stat().st_size,
+                })
+        # policy 변경
+        prev_policy_set = {p.name for p in prev_cls["policy"]}
+        new_policy_set = {p.name for p in new_cls["policy"]}
+        for name in (new_policy_set - prev_policy_set):
+            common_doc_changes.append({"doc_type": "policy", "file_name": name, "status": "added"})
+        for name in (prev_policy_set - new_policy_set):
+            common_doc_changes.append({"doc_type": "policy", "file_name": name, "status": "removed"})
+        # design 변경
+        prev_design_set = {p.name for p in prev_cls["design"]}
+        new_design_set = {p.name for p in new_cls["design"]}
+        for name in (new_design_set - prev_design_set):
+            common_doc_changes.append({"doc_type": "design", "file_name": name, "status": "added"})
+        for name in (prev_design_set - new_design_set):
+            common_doc_changes.append({"doc_type": "design", "file_name": name, "status": "removed"})
+
+    # 5) AI 요약 호출 — 변경 사항이 의미하는 바를 자연어로
+    ai_summary = ""
+    scr_changes = []  # AI 요약 포함
+    if scr_changes_raw or common_doc_changes:
+        # AI 프롬프트 — 각 SCR 변경의 핵심 의미와 TC 영향 추정 요청
+        change_blocks = []
+        for sc in scr_changes_raw[:15]:  # 토큰 제한 — 첫 15개만 자세히
+            block = f"### {sc['scr_id']} ({sc['status']})\n"
+            if sc["status"] == "added":
+                block += f"신규 화면:\n```\n{sc['new_content'][:3000]}\n```"
+            elif sc["status"] == "modified":
+                block += f"이전 (요약):\n```\n{sc['prev_content'][:1500]}\n```\n\n신규 (요약):\n```\n{sc['new_content'][:1500]}\n```"
+            elif sc["status"] == "removed":
+                block += f"삭제 (이전 본문):\n```\n{sc['prev_content'][:2000]}\n```"
+            change_blocks.append(block)
+
+        common_block = ""
+        if common_doc_changes:
+            common_block = "\n## 공통 문서 변경\n" + "\n".join(
+                f"- [{c['doc_type']}] {c['file_name']}: {c.get('status', 'modified')}"
+                for c in common_doc_changes
+            )
+
+        system_prompt = """당신은 QA 도메인 전문가입니다. 기획서 spec 폴더의 변경 사항을 분석하여
+변경의 의미와 TC 영향 범위를 한국어로 요약합니다.
+
+## 출력 형식
+
+```markdown
+# 변경 분석 보고서
+
+## 변경 요약 (개요)
+(전체 변경의 한 문단 요약 — 어떤 기능이 어떻게 바뀌었는가)
+
+## 화면별 변경 상세
+
+### SCR-XXX (status)
+- **변경 핵심**: 한 줄 요약
+- **TC 영향 추정**: 어떤 종류의 TC 가 영향 받을 가능성 (수정/신규/삭제)
+- **권장 액션**: 1-2 문장
+
+(각 SCR 마다 반복)
+
+## 공통 문서 변경 영향
+(정책/디자인 변경이 TC 전반에 미치는 영향)
+
+## 종합 권장사항
+- 우선 검토할 SCR / TC 종류
+- 주의 사항
+```
+
+원칙:
+- spec 본문에서 추출. 임의 추측 금지.
+- TC ID 자체는 모름 (아직 매핑 안 됨) — "영향 종류" 만 추정.
+- 간결하게."""
+
+        user_prompt = f"""다음은 기획서 두 버전의 변경 분석입니다.
+
+## 변경 통계
+- 신규 화면: {len(diff['added'])}개 — {', '.join(diff['added'][:10])}
+- 수정 화면: {len(diff['modified'])}개 — {', '.join(diff['modified'][:10])}
+- 삭제 화면: {len(diff['removed'])}개 — {', '.join(diff['removed'][:10])}
+- 동일 화면: {len(diff['unchanged'])}개
+- 공통 문서 변경: {diff['common_changed']}
+
+## 변경 상세 (상위 15개)
+
+{"\n\n---\n\n".join(change_blocks)}
+{common_block}
+
+위 변경 사항을 분석해 보고서를 작성하세요.
+"""
+        try:
+            ai_summary = call_claude(system_prompt, user_prompt, max_tokens=8000)
+        except Exception as e:
+            ai_summary = f"# 변경 분석 보고서\n\nAI 분석 실패: {e}\n\n## 변경 통계\n- 신규: {len(diff['added'])}개\n- 수정: {len(diff['modified'])}개\n- 삭제: {len(diff['removed'])}개"
+
+    # 6) 결과 구조 정리
+    for sc in scr_changes_raw:
+        scr_changes.append({
+            "scr_id": sc["scr_id"],
+            "status": sc["status"],
+            "prev_size": len(sc.get("prev_content", "")),
+            "new_size": len(sc.get("new_content", "")),
+        })
+
+    from datetime import datetime
+    return {
+        "diff": diff,
+        "summary": ai_summary,
+        "scr_changes": scr_changes,
+        "common_doc_changes": common_doc_changes,
+        "meta": {
+            "prev_folder": str(prev_p),
+            "new_folder": str(new_p),
+            "existing_tc_url": existing_tc_url,
+            "analyzed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+
+# ── TC Update 2단계 — Sheets 읽기 + 사본 + 판정 로직 ─────────────────────────
+
+def _extract_sheets_id(url: str) -> str:
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url or "")
+    if not m:
+        raise RuntimeError("Google Sheets URL 형식이 아닙니다.")
+    return m.group(1)
+
+
+# TC update 작업으로 생성되는 사본/백업의 보관 폴더 (Drive)
+# 사용자별 설정 — ~/.tc-update-config.json 에 저장
+# 각 사용자가 본인의 Drive 폴더를 지정 (개인/공유 드라이브 모두 가능)
+TC_UPDATE_CONFIG_FILE = Path.home() / ".tc-update-config.json"
+
+
+def _extract_folder_id(url_or_id: str) -> str:
+    """폴더 URL 또는 ID 에서 폴더 ID 추출.
+    예: 'https://drive.google.com/drive/folders/1oLsHJ...' → '1oLsHJ...'
+        '1oLsHJ...' (이미 ID) → 그대로
+    """
+    s = (url_or_id or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    # 그냥 ID 형태로 간주 (영숫자/대시/언더스코어만)
+    if re.match(r"^[a-zA-Z0-9_-]+$", s):
+        return s
+    return ""
+
+
+def load_tc_update_config() -> dict:
+    """사용자 설정 로드. 없으면 빈 dict."""
+    if not TC_UPDATE_CONFIG_FILE.exists():
+        return {}
+    try:
+        return json.loads(TC_UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_tc_update_config(data: dict) -> None:
+    """사용자 설정 저장."""
+    TC_UPDATE_CONFIG_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_tc_update_folder_id() -> str:
+    """현재 설정된 Drive 폴더 ID 반환. 없으면 빈 문자열 (= 폴더 지정 안 함, orphan)."""
+    cfg = load_tc_update_config()
+    return cfg.get("drive_folder_id", "") or ""
+
+
+def copy_sheets_for_update(source_url: str, new_title: str = "") -> dict:
+    """원본 Sheets 를 복사해 사본 ID/URL 반환. Drive API copy 사용.
+
+    사본은 설정된 Drive 폴더 (load_tc_update_config) 아래에 자동 정리.
+    폴더 미설정 또는 접근 불가 시 graceful fallback (원래대로 orphan).
+
+    Returns: {ok, copy_id, copy_url, copy_title}
+    """
+    drive = get_drive_service()
+    src_id = _extract_sheets_id(source_url)
+    src_meta = drive.files().get(fileId=src_id, fields="id,name,mimeType").execute()
+    if not new_title:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_title = f"{src_meta.get('name', 'TC')} (update-test {ts})"
+    body = {"name": new_title}
+    folder_id = get_tc_update_folder_id()
+    if folder_id:
+        body["parents"] = [folder_id]
+    try:
+        copied = drive.files().copy(fileId=src_id, body=body, fields="id,name,webViewLink,parents").execute()
+    except Exception as e:
+        # 폴더 접근 권한 없을 가능성 — 폴더 없이 재시도
+        body.pop("parents", None)
+        copied = drive.files().copy(fileId=src_id, body=body, fields="id,name,webViewLink").execute()
+    return {
+        "ok": True,
+        "copy_id": copied["id"],
+        "copy_url": copied.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{copied['id']}/edit",
+        "copy_title": copied.get("name"),
+        "source_id": src_id,
+        "source_title": src_meta.get("name"),
+    }
+
+
+def backup_original_sheets(source_url: str) -> dict:
+    """원본 Sheets 를 'backup before update YYYY-MM-DD HH:MM' 이름으로 복사 → 백업.
+
+    원본을 그대로 두고 별도 사본으로 보관. 롤백 시 이 사본의 셀 값을 원본으로 복원.
+    백업도 설정된 Drive 폴더 (load_tc_update_config) 아래에 자동 정리.
+
+    Returns: {ok, backup_id, backup_url, backup_title, source_id, source_title}
+    """
+    drive = get_drive_service()
+    src_id = _extract_sheets_id(source_url)
+    src_meta = drive.files().get(fileId=src_id, fields="id,name").execute()
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    backup_title = f"{src_meta.get('name', 'TC')} (backup before update {ts})"
+    body = {"name": backup_title}
+    folder_id = get_tc_update_folder_id()
+    if folder_id:
+        body["parents"] = [folder_id]
+    try:
+        copied = drive.files().copy(
+            fileId=src_id, body=body, fields="id,name,webViewLink,parents",
+        ).execute()
+    except Exception:
+        body.pop("parents", None)
+        copied = drive.files().copy(
+            fileId=src_id, body=body, fields="id,name,webViewLink",
+        ).execute()
+    return {
+        "ok": True,
+        "backup_id": copied["id"],
+        "backup_url": copied.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{copied['id']}/edit",
+        "backup_title": copied.get("name"),
+        "source_id": src_id,
+        "source_title": src_meta.get("name"),
+        "backed_up_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _col_index_to_letter(idx: int) -> str:
+    """0 → 'A', 25 → 'Z', 26 → 'AA' 변환."""
+    s = ""
+    n = idx
+    while True:
+        s = chr(ord("A") + (n % 26)) + s
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return s
+
+
+def read_tc_edit_log(target_sheets_id: str) -> dict:
+    """사본의 'TC Edit Log' 시트를 읽어 적용 대상 셀 목록 반환.
+
+    Returns: {
+      ok, log_exists, entries: [{tc_id, sheet_title, row_index, field, new_value, ts, rationale}],
+      count, sheets_seen: [list of sheet titles affected]
+    }
+
+    헤더 형식 (TC Edit Log 시트):
+      ['시각', 'TC ID', '시트', '행', '필드', '이전 값(요약)', '새 값(요약)', '수정 사유']
+
+    주의: '새 값(요약)' 은 200 자 잘림 — 실제 적용 시에는 사본의 해당 셀을 직접 읽어 사용.
+    """
+    svc = get_sheets_service()
+    # 'TC Edit Log' 시트 존재 여부 확인
+    meta = svc.spreadsheets().get(
+        spreadsheetId=target_sheets_id,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if "TC Edit Log" not in titles:
+        return {"ok": True, "log_exists": False, "entries": [], "count": 0, "sheets_seen": []}
+
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=target_sheets_id,
+        range="'TC Edit Log'!A1:Z2000",
+    ).execute()
+    values = resp.get("values", [])
+    if not values or len(values) < 2:
+        return {"ok": True, "log_exists": True, "entries": [], "count": 0, "sheets_seen": []}
+
+    header = values[0]
+    def col_idx(name):
+        return header.index(name) if name in header else -1
+
+    ci_ts = col_idx("시각")
+    ci_tc = col_idx("TC ID")
+    ci_sheet = col_idx("시트")
+    ci_row = col_idx("행")
+    ci_field = col_idx("필드")
+    ci_old = col_idx("이전 값(요약)")
+    ci_new = col_idx("새 값(요약)")
+    ci_rationale = col_idx("rationale")
+
+    entries = []
+    sheets_seen = set()
+    for r in values[1:]:
+        if not any(str(c).strip() for c in r):
+            continue
+        def cell(ci):
+            if ci < 0 or ci >= len(r):
+                return ""
+            return str(r[ci] or "").strip()
+        tc_id = cell(ci_tc)
+        sheet_title = cell(ci_sheet)
+        row_str = cell(ci_row)
+        field = cell(ci_field)
+        if not (tc_id and sheet_title and row_str and field):
+            continue
+        try:
+            row_idx = int(row_str)
+        except Exception:
+            continue
+        entries.append({
+            "tc_id": tc_id,
+            "sheet_title": sheet_title,
+            "row_index": row_idx,
+            "field": field,
+            "old_value": cell(ci_old),
+            "new_value": cell(ci_new),
+            "ts": cell(ci_ts),
+            "rationale": cell(ci_rationale),
+        })
+        sheets_seen.add(sheet_title)
+
+    return {
+        "ok": True,
+        "log_exists": True,
+        "entries": entries,
+        "count": len(entries),
+        "sheets_seen": sorted(sheets_seen),
+    }
+
+
+# 헤더 캐시 — (sheets_id, sheet_title) → header list
+# Sheets API quota 절약 (분당 60회 한도)
+_HEADER_CACHE = {}
+
+
+def _get_sheet_header(sheets_id: str, sheet_title: str) -> list:
+    """시트의 헤더 행을 캐시 우선 반환. 캐시 miss 시 API 1회 호출."""
+    key = (sheets_id, sheet_title)
+    if key in _HEADER_CACHE:
+        return _HEADER_CACHE[key]
+    svc = get_sheets_service()
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheets_id,
+        range=f"'{sheet_title}'!A1:Z3",
+    ).execute()
+    values = resp.get("values", [])
+    header = []
+    for row in values[:3]:
+        if any(c in ("TC ID", "TC_ID") for c in row):
+            header = row
+            break
+    if not header and values:
+        header = values[0]
+    _HEADER_CACHE[key] = header
+    return header
+
+
+def resolve_field_column(sheets_id: str, sheet_title: str, field: str) -> int:
+    """주어진 시트에서 필드명(예: '테스트 스텝')에 해당하는 컬럼 인덱스 반환.
+
+    헤더 별칭 매핑 (read_sheets_tcs 와 동일):
+      precondition → '사전조건' / '사전 조건' / 'Precondition'
+      steps → '테스트 스텝' / '테스트 단계' / 'Steps'
+      expected → '기대결과' / '기대 결과' / '예상 결과' / 'Expected'
+
+    헤더는 캐시됨 (분당 quota 절약 — 같은 시트 반복 조회 시 1회 API).
+
+    Returns: 컬럼 0-based index, 못 찾으면 -1.
+    """
+    header = _get_sheet_header(sheets_id, sheet_title)
+
+    # 필드 → 가능한 헤더 이름들
+    field_aliases = {
+        "precondition": ["사전조건", "사전 조건", "Precondition"],
+        "사전조건":      ["사전조건", "사전 조건", "Precondition"],
+        "steps":         ["테스트 스텝", "테스트 단계", "Steps"],
+        "테스트 스텝":   ["테스트 스텝", "테스트 단계", "Steps"],
+        "expected":      ["기대결과", "기대 결과", "예상 결과", "Expected"],
+        "기대결과":      ["기대결과", "기대 결과", "예상 결과", "Expected"],
+    }
+    aliases = field_aliases.get(field, [field])
+    for alias in aliases:
+        if alias in header:
+            return header.index(alias)
+    return -1
+
+
+# 메타/카탈로그 탭은 TC 시트가 아니므로 제외 — 제목으로 휴리스틱 매칭
+TC_META_TAB_PATTERNS = [
+    "화면 목록", "화면목록", "Screen List", "screens",
+    "Update Log", "변경 이력", "Change Log",
+    "변경 분석", "Diff", "diff",
+]
+
+# TC ID 패턴 — Generator 가 만드는 표준 형식 (예: SM-EML-001, SC-EXCH-002, SM-LITE-COMBO-005)
+TC_ID_RE = re.compile(r"^[A-Z]{2,}-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{2,}$")
+
+
+def _is_tc_meta_tab(title: str) -> bool:
+    t = title.strip().lower()
+    for pat in TC_META_TAB_PATTERNS:
+        if pat.lower() in t:
+            return True
+    return False
+
+
+def _parse_scr_field(value: str) -> list:
+    """'SCR-104' / 'SCR-104, SCR-106' / 'SCR-104 / SCR-106' 등 모두 처리.
+    빈 문자열, None 안전.
+    """
+    if not value:
+        return []
+    return re.findall(r"SCR-\d+[A-Z]?", str(value))
+
+
+def read_sheets_tcs(sheets_id: str) -> dict:
+    """Sheets API 로 모든 탭의 TC 행 읽어 TC ID ↔ SCR 매핑 + 메타 추출.
+
+    헤더 별칭 매핑 (사용자 시트 형식 + Generator 표준 형식 모두 지원):
+      TC ID:    "TC ID", "TC_ID", "ID"
+      제목:     "소분류", "제목", "Title"     (사용자 시트는 소분류가 제목 역할)
+      대분류:   "대분류"
+      중분류:   "중분류"
+      Steps:    "테스트 스텝", "테스트 단계", "Steps"
+      Pre:      "사전조건", "사전 조건", "Precondition"
+      Expected: "기대결과", "기대 결과", "예상 결과", "Expected"
+      SCR:      "화면 코드", "화면코드", "SCR", "SCR ID", "관련 SCR", "화면 ID"
+      Smoke:    "Smoke", "최소TC", "최소 TC"
+      Priority: "중요도", "우선순위", "Priority"
+      Type:     "분류", "Type"
+
+    화면 목록 / Update Log 같은 메타 탭은 제외.
+    TC ID 패턴 검증으로 빈 행/노이즈 제거.
+
+    Returns: {
+      "tabs": [{title, header, rows, skipped: bool, skip_reason}],
+      "tcs": [{tc_id, scr_ids, title, type, sheet_title, row_index, category, sub_category}],
+      "tc_by_scr": {scr_id: [tc_id, ...]},
+    }
+    """
+    svc = get_sheets_service()
+    meta = svc.spreadsheets().get(spreadsheetId=sheets_id,
+                                     fields="sheets(properties(sheetId,title,index))").execute()
+    sheet_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+
+    tabs = []
+    tcs = []
+    tc_by_scr: dict = {}
+
+    if not sheet_titles:
+        return {"tabs": [], "tcs": [], "tc_by_scr": {}}
+
+    ranges = [f"'{t}'!A1:Z2000" for t in sheet_titles]
+    batch = svc.spreadsheets().values().batchGet(spreadsheetId=sheets_id, ranges=ranges).execute()
+    value_ranges = batch.get("valueRanges", [])
+
+    for title, vr in zip(sheet_titles, value_ranges):
+        values = vr.get("values", [])
+        if not values:
+            tabs.append({"title": title, "header": [], "rows": [], "skipped": True, "skip_reason": "빈 시트"})
+            continue
+
+        # 메타 탭 제외
+        if _is_tc_meta_tab(title):
+            tabs.append({"title": title, "header": values[0] if values else [],
+                         "rows": [], "skipped": True, "skip_reason": "메타/카탈로그 탭"})
+            continue
+
+        # 헤더 행 탐색 — TC ID 컬럼 포함하는 첫 행 (상위 10행 안에서)
+        header = []
+        header_idx = -1
+        for i, row in enumerate(values[:10]):
+            cells = [str(c).strip() for c in row]
+            if any(c in ("TC ID", "TC_ID") for c in cells):
+                header = row
+                header_idx = i
+                break
+        if header_idx < 0:
+            # TC ID 컬럼이 없으면 TC 시트 아님
+            tabs.append({"title": title, "header": values[0] if values else [],
+                         "rows": [], "skipped": True, "skip_reason": "TC ID 헤더 없음"})
+            continue
+
+        def col(name_candidates):
+            for nm in name_candidates:
+                if nm in header:
+                    return header.index(nm)
+            return -1
+
+        col_id = col(["TC ID", "TC_ID", "ID"])
+        col_subc = col(["소분류"])  # 사용자 시트 — 소분류가 제목 역할
+        col_title = col(["제목", "Title"])
+        col_cat = col(["대분류"])
+        col_mid = col(["중분류"])
+        col_type = col(["분류", "Type"])
+        col_scr = col(["화면 코드", "화면코드", "SCR", "SCR ID", "관련 SCR", "화면 ID"])
+        col_steps = col(["테스트 스텝", "테스트 단계", "Steps"])
+        col_pre = col(["사전조건", "사전 조건", "Precondition"])
+        col_exp = col(["기대결과", "기대 결과", "예상 결과", "Expected"])
+        col_smoke = col(["Smoke", "최소TC", "최소 TC"])
+        col_prio = col(["중요도", "우선순위", "Priority"])
+
+        def cell(row, ci):
+            if ci < 0 or ci >= len(row):
+                return ""
+            return str(row[ci] or "").strip()
+
+        rows_out = []
+        for ri, row in enumerate(values[header_idx + 1:], start=header_idx + 2):
+            if not any(str(c).strip() for c in row):
+                continue
+            tc_id = cell(row, col_id).replace("*", "").strip()
+            # TC ID 패턴 검증 — Generator 표준 형식만 채택 (노이즈 차단)
+            if not tc_id or not TC_ID_RE.match(tc_id):
+                continue
+
+            tc_title = cell(row, col_subc) or cell(row, col_title)
+            tc_type = cell(row, col_type)
+            steps_text = cell(row, col_steps)
+            pre_text = cell(row, col_pre)
+            exp_text = cell(row, col_exp)
+            scr_field = cell(row, col_scr)
+            cat_text = cell(row, col_cat)
+            mid_text = cell(row, col_mid)
+            smoke_text = cell(row, col_smoke)
+            prio_text = cell(row, col_prio)
+
+            # SCR ID 우선순위:
+            # 1) 전용 컬럼 (화면 코드) — 가장 신뢰도 높음
+            # 2) 없으면 본문 (steps/pre/exp/title) 에서 SCR-NNN 패턴 추출
+            scr_ids = _parse_scr_field(scr_field)
+            if not scr_ids:
+                for blob in (tc_title, mid_text, steps_text, pre_text, exp_text):
+                    scr_ids.extend(_parse_scr_field(blob))
+            # 중복 제거 + 정렬 (숫자 부분 기준)
+            scr_set = list(dict.fromkeys(scr_ids))
+
+            def _scr_key(s):
+                m = re.match(r"SCR-(\d+)", s)
+                return int(m.group(1)) if m else 0
+            scr_set.sort(key=_scr_key)
+
+            tc_record = {
+                "tc_id": tc_id,
+                "scr_ids": scr_set,
+                "title": tc_title,
+                "type": tc_type,
+                "category": cat_text,
+                "sub_category": mid_text,
+                "smoke": smoke_text,
+                "priority": prio_text,
+                "sheet_title": title,
+                "row_index": ri,
+            }
+            tcs.append(tc_record)
+            rows_out.append(tc_record)
+            for s in scr_set:
+                tc_by_scr.setdefault(s, []).append(tc_id)
+
+        tabs.append({"title": title, "header": header, "rows": rows_out, "skipped": False})
+
+    return {"tabs": tabs, "tcs": tcs, "tc_by_scr": tc_by_scr}
+
+
+def classify_scr_change_kind(prev_text: str, new_text: str) -> str:
+    """수정된 SCR 의 변경 종류를 휴리스틱으로 분류.
+
+    Returns: 'policy_flow' | 'design_only' | 'mixed'
+    """
+    if not prev_text or not new_text:
+        return "policy_flow"
+
+    # 정책/플로우 키워드 — 이 단어들 주변이 바뀌면 policy_flow
+    policy_keys = [
+        "정책", "검증", "validation", "조건", "최소", "최대", "초과", "미만",
+        "에러", "오류", "실패", "경고", "분기", "허용", "차단", "거부", "리다이렉트",
+        "API", "endpoint", "status", "401", "403", "404", "500",
+    ]
+    design_keys = [
+        "디자인", "색", "배경", "폰트", "여백", "위치", "정렬", "아이콘", "이미지",
+        "텍스트", "문구", "라벨", "label", "placeholder", "글자",
+    ]
+
+    def diff_lines(a: str, b: str):
+        import difflib
+        a_lines = a.splitlines()
+        b_lines = b.splitlines()
+        d = list(difflib.unified_diff(a_lines, b_lines, lineterm=""))
+        added = [ln[1:] for ln in d if ln.startswith("+") and not ln.startswith("+++")]
+        removed = [ln[1:] for ln in d if ln.startswith("-") and not ln.startswith("---")]
+        return added + removed
+
+    changed = "\n".join(diff_lines(prev_text, new_text))
+    if not changed.strip():
+        return "design_only"
+
+    has_policy = any(k.lower() in changed.lower() for k in policy_keys)
+    has_design = any(k.lower() in changed.lower() for k in design_keys)
+    if has_policy and has_design:
+        return "mixed"
+    if has_policy:
+        return "policy_flow"
+    if has_design:
+        return "design_only"
+    # 기본값: 모호한 변경은 정책으로 간주 (보수적)
+    return "policy_flow"
+
+
+def build_update_candidates(diff_result: dict, tc_data: dict,
+                              prev_folder: str, new_folder: str,
+                              scr_filter: list | None = None) -> list:
+    """판정 로직 — SCR diff + TC↔SCR 매핑 → 4-way 후보 리스트.
+
+    Args:
+      scr_filter: 선택된 SCR ID 리스트 (None 이면 전체).
+                    이 리스트에 있는 SCR 만 처리하고 나머지는 무시.
+
+    Returns: list of {
+      action: 'add'|'modify'|'delete'|'skip',
+      default_checked: bool,
+      scr_id, tc_id (optional), reason, sheet_title (optional),
+      change_kind (optional), preview (optional),
+    }
+    """
+    diff = diff_result.get("diff", {})
+    tc_by_scr = tc_data.get("tc_by_scr", {})
+    tcs_by_id = {t["tc_id"]: t for t in tc_data.get("tcs", [])}
+
+    # SCR 필터링 — 선택된 SCR 만 남기기
+    if scr_filter:
+        filter_set = set(scr_filter)
+        diff = {
+            "added": [s for s in (diff.get("added") or []) if s in filter_set],
+            "modified": [s for s in (diff.get("modified") or []) if s in filter_set],
+            "removed": [s for s in (diff.get("removed") or []) if s in filter_set],
+            "unchanged": diff.get("unchanged", []),
+            "common_changed": diff.get("common_changed", False),
+        }
+
+    # SCR 본문 캐시 (수정 분류용)
+    prev_p = Path(prev_folder).expanduser()
+    new_p = Path(new_folder).expanduser()
+    prev_cls = classify_spec_files(prev_p)
+    new_cls = classify_spec_files(new_p)
+    prev_map = {p.stem.split(".")[0]: p for p in prev_cls.get("screens", [])}
+    new_map = {p.stem.split(".")[0]: p for p in new_cls.get("screens", [])}
+
+    candidates = []
+
+    # 1) 삭제된 SCR → 해당 TC 삭제 후보
+    for scr_id in diff.get("removed", []):
+        for tc_id in tc_by_scr.get(scr_id, []):
+            tc = tcs_by_id.get(tc_id, {})
+            candidates.append({
+                "action": "delete",
+                "default_checked": True,
+                "scr_id": scr_id,
+                "tc_id": tc_id,
+                "tc_title": tc.get("title", ""),
+                "sheet_title": tc.get("sheet_title", ""),
+                "reason": f"SCR-{scr_id.split('-')[-1]} 삭제됨 — 검증 대상 없어짐",
+            })
+
+    # 2) 신규 SCR → 신규 TC 제안
+    for scr_id in diff.get("added", []):
+        candidates.append({
+            "action": "add",
+            "default_checked": True,
+            "scr_id": scr_id,
+            "tc_id": None,
+            "reason": f"{scr_id} 신규 추가 — 해당 화면 TC 가 없음",
+        })
+
+    # 3) 수정된 SCR → 변경 종류 판정 + TC 매핑
+    for scr_id in diff.get("modified", []):
+        prev_path = prev_map.get(scr_id)
+        new_path = new_map.get(scr_id)
+        prev_text = prev_path.read_text(encoding="utf-8") if prev_path and prev_path.exists() else ""
+        new_text = new_path.read_text(encoding="utf-8") if new_path and new_path.exists() else ""
+        kind = classify_scr_change_kind(prev_text, new_text)
+
+        mapped_tcs = tc_by_scr.get(scr_id, [])
+
+        if not mapped_tcs:
+            # 매핑된 TC 없음 → 신규 TC 제안 (수정인데 TC 가 없으니 새로 만들어야 할 수도)
+            candidates.append({
+                "action": "add",
+                "default_checked": False,
+                "scr_id": scr_id,
+                "tc_id": None,
+                "change_kind": kind,
+                "reason": f"{scr_id} 수정됨 ({kind}) — 매핑된 TC 없음. 신규 TC 검토 필요",
+            })
+            continue
+
+        for tc_id in mapped_tcs:
+            tc = tcs_by_id.get(tc_id, {})
+            # 디자인만 변경 → 기본 보류, 정책/플로우 → 기본 체크
+            if kind == "design_only":
+                default = False
+                reason = f"{scr_id} 디자인/문구 변경 — TC step 표현 검토 (기본 보류)"
+            elif kind == "policy_flow":
+                default = True
+                reason = f"{scr_id} 정책/플로우 변경 — step/expected 갱신 필요"
+            else:  # mixed
+                default = True
+                reason = f"{scr_id} 정책 + 디자인 혼합 변경 — 검토 필요"
+            candidates.append({
+                "action": "modify",
+                "default_checked": default,
+                "scr_id": scr_id,
+                "tc_id": tc_id,
+                "tc_title": tc.get("title", ""),
+                "sheet_title": tc.get("sheet_title", ""),
+                "change_kind": kind,
+                "reason": reason,
+            })
+
+    # 4) unchanged → 후보에 절대 포함 안 함 (하드 가드레일)
+
+    return candidates
+
+
+def step_propose_tc_update(scr_id: str, prev_scr_text: str, new_scr_text: str,
+                              current_tc: dict) -> dict:
+    """1건의 TC 에 대해 AI 수정안 제안.
+
+    Args:
+      scr_id: 'SCR-102' 등
+      prev_scr_text: 이전 SCR 본문
+      new_scr_text: 새 SCR 본문
+      current_tc: {tc_id, title, steps, expected, precondition, ...} — 사본에서 읽은 현재 값
+
+    Returns: {
+      "ok": True,
+      "proposal": {
+        "steps": str | None,        # None = 변경 안 함
+        "expected": str | None,
+        "precondition": str | None,
+        "rationale": str,            # 한 줄 이유 (왜 이렇게 바꾸는지)
+        "no_change": bool,           # True 이면 변경 불필요
+      }
+    }
+
+    원칙:
+    - 보수적: SCR 변경이 명백하게 영향 주는 부분만 수정 제안
+    - 디자인/문구 변경은 무시 (사용자 합의: design_only 는 기본 보류)
+    - 확신 없으면 'no_change: true' 반환
+    - JSON 으로 응답 강제 (파싱 안정성)
+    """
+    if not new_scr_text and not prev_scr_text:
+        return {"ok": False, "error": "SCR 본문이 없습니다."}
+
+    system_prompt = """당신은 QA 도메인 전문가입니다. 기획서(SCR) 변경에 따라
+테스트 케이스를 어떻게 수정해야 할지 균형있게 제안합니다.
+
+## 원칙 (반드시 지킬 것)
+
+1. **TC 의 검증 범위 인식 — 가장 중요**:
+   - **TC 제목이 "UI 확인", "화면 확인", "상태 표시", "Layout", "초기 화면" 등 광범위한 UI 검증** 이면,
+     SCR 의 새 UI 요소 (배너, CTA, 안내 영역, 새 컨디셔널 블록) 도 **반드시 기대결과에 추가**.
+   - **TC 가 특정 동작 1개만 검증** (예: 버튼 탭, 필터 전환, 특정 기능) 이면,
+     그 동작과 무관한 새 요소는 무시.
+   - 판단 기준: "이 TC 를 실행하면 새 UI 요소가 화면에 보일 텐데, TC 가 그걸 검증해야 하나?"
+
+2. **새 컨디셔널/분기 추가 = 신규 검증 항목**:
+   - SCR 에 `conditional [...]` 또는 새 상태 (permission, state) 분기가 추가되면 → **검증 누락**.
+   - "디자인 변경" 으로 간주하지 말 것. 이건 새 **기능 분기**.
+
+3. **정책/플로우 변경**: 검증 조건, 분기, API 응답 처리, 임계치 변경 등은 step/expected 갱신.
+
+4. **디자인/문구 변경 — TC 본문이 인용했나로 판단**:
+
+   핵심 기준: **"TC 의 step 이나 expected 가 그 변경된 요소를 인용·명시하고 있는가?"**
+
+   인용 안 함 → ✅ 무시 OK:
+   - 색상, 폰트, 폰트 크기, 여백, 그림자, 둥근 모서리 (시각 속성)
+   - 애니메이션, 전환 효과 (fade-in → slide-up 등)
+   - 의미 동등한 아이콘 교체 (TC 가 아이콘 명시 안 함)
+   - 라벨 wording 변경 (TC 가 그 라벨 직접 안 씀)
+
+   인용·명시함 → ❌ 갱신 필요:
+   - TC step/expected 가 **정확한 라벨 인용**: '"Save" 버튼 탭' 인데 라벨이 "저장" 으로 바뀜
+   - TC 가 **위치/정렬 검증**: "우측 상단의 X 버튼" 인데 위치 이동
+   - TC 가 **아이콘 명시**: "🔔 아이콘 표시" 인데 다른 아이콘으로 교체
+   - TC 가 **명시적 시각 검증**: "빨간색 배경 표시" 같은 색 검증
+   - TC 가 **레이아웃 구조 검증**: "카드 리스트로 표시" → 구조 변경
+
+   ### 예시 1 — 무시 OK
+   ```
+   SCR 변경: Submit 버튼 색 #1E40AF → #2563EB
+   TC step: "저장하기를 시도한다"
+   TC expected: "데이터가 저장된다"
+   → 색 변경을 TC 가 인용 안 함 → no_change OK
+   ```
+
+   ### 예시 2 — 갱신 필요
+   ```
+   SCR 변경: "Save" 버튼 라벨 → "저장" 으로 변경
+   TC step: '"Save" 버튼을 탭한다'
+   TC expected: '"Saved successfully" 토스트 표시'
+   → step 이 "Save" 직접 인용 → "저장" 으로 갱신
+   ```
+
+   ### 예시 3 — 신규 UI 요소 추가 (가장 중요)
+   ```
+   SCR 변경: 화면 상단에 새 CTA 배너 conditional 추가
+   TC 제목: "UI 확인" / 기대결과: "상단 nav-bar, 필터 탭, 리스트 표시"
+   → TC 가 "무엇이 표시되는지" 검증 → 새 CTA 배너 검증 항목 추가 필수
+   (이건 디자인이 아니라 새 검증 항목 — 원칙 2 참조)
+   ```
+
+5. **부분 수정 가능**: 3개 필드 중 일부만 수정 필요하면 그것만. 변경 없는 필드는 `null`.
+
+6. **애매하면 수정 제안 우선** (no_change 보수적):
+   - 위 1-5 검토 후 **명확하게** 영향 없을 때만 `no_change: true`.
+   - 50/50 애매한 경우 → 수정안 제시 (사람이 거부 가능).
+   - 누락 위험이 잘못 제안 위험보다 큼 — 검증 공백을 만들지 말 것.
+
+## 출력 형식 (JSON 만, 다른 텍스트 금지)
+```json
+{
+  "no_change": false,
+  "steps": "수정된 테스트 스텝 전문 또는 null (변경 없으면)",
+  "expected": "수정된 기대결과 전문 또는 null",
+  "precondition": "수정된 사전조건 전문 또는 null",
+  "rationale": "한 줄로 — 왜 이렇게 수정하는가 (SCR 변경의 어느 부분이 어떻게 반영됐는지)"
+}
+```
+
+변경 필요 없으면:
+```json
+{
+  "no_change": true,
+  "steps": null,
+  "expected": null,
+  "precondition": null,
+  "rationale": "이 TC 는 SCR 변경의 영향을 받지 않음 (이유 한 줄)"
+}
+```
+"""
+
+    user_prompt = f"""## 대상 TC
+
+- TC ID: {current_tc.get('tc_id', '')}
+- 제목: {current_tc.get('title', '')}
+- 매핑 SCR: {scr_id}
+
+### 현재 사전조건
+```
+{current_tc.get('precondition', '') or '(없음)'}
+```
+
+### 현재 테스트 스텝
+```
+{current_tc.get('steps', '') or '(없음)'}
+```
+
+### 현재 기대결과
+```
+{current_tc.get('expected', '') or '(없음)'}
+```
+
+## {scr_id} 본문 (이전 버전)
+```
+{(prev_scr_text or '(없음)')[:4000]}
+```
+
+## {scr_id} 본문 (새 버전)
+```
+{(new_scr_text or '(없음)')[:4000]}
+```
+
+위 변경을 검토해 현재 TC 의 사전조건/테스트 스텝/기대결과를 수정해야 하는지
+판단하고 JSON 으로만 응답하세요. 보수적으로 — 확신 없으면 no_change=true.
+"""
+
+    try:
+        raw = call_claude(system_prompt, user_prompt, max_tokens=3000)
+    except Exception as e:
+        return {"ok": False, "error": f"AI 호출 실패: {e}"}
+
+    # JSON 파싱 — 코드블록 포함 응답도 처리
+    import json as _json
+    text = raw.strip()
+    # ```json ... ``` 코드블록 벗기기
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        text = m.group(1)
+    else:
+        # 그냥 JSON 객체만 추출
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            text = m.group(0)
+
+    try:
+        data = _json.loads(text)
+    except Exception as e:
+        return {"ok": False, "error": f"JSON 파싱 실패: {e}", "raw": raw[:500]}
+
+    # 필드 정규화
+    proposal = {
+        "no_change": bool(data.get("no_change", False)),
+        "steps": data.get("steps"),
+        "expected": data.get("expected"),
+        "precondition": data.get("precondition"),
+        "rationale": str(data.get("rationale", "")).strip() or "(이유 없음)",
+    }
+    # no_change 일관성 — 셋 다 None 이면 자동으로 no_change=True
+    if not any([proposal["steps"], proposal["expected"], proposal["precondition"]]):
+        proposal["no_change"] = True
+
+    return {"ok": True, "proposal": proposal}
 
 
 def step_parse_structured_spec_with_diff(sess: dict, new_folder_path: str,
@@ -6374,11 +7736,82 @@ TC 형식 규칙:
 
 # ── Flask 라우트 ───────────────────────────────────────────────────────────────
 
+# ── JS 자가 검증 (계층 2) ──────────────────────────────────────────────────
+# 매 / 요청마다 매우 가벼운 정규식 + node --check (있을 때) 로 검증.
+# 결과를 페이지에 주입하면 계층 1 의 안전망이 받아서 사용자에게 배너로 노출.
+_JS_CHECK_CACHE = {"html_id": None, "result": None}
+
+
+def _quick_validate_served_html(html: str) -> dict:
+    """서빙되는 HTML 안의 큰 <script> 블록을 추출해 node --check 로 검증.
+    node 가 없거나 검증 실패 시 graceful — 응답에 문제 정보만 담는다.
+    """
+    import subprocess
+    import re as _re
+    import shutil as _shutil
+    import tempfile as _tmp
+
+    # 캐시 — 같은 HTML 본문이면 재검증 안 함 (id() 는 같은 문자열이면 같음 보장 안 됨,
+    # 길이 + hash 로 키)
+    key = (len(html), hash(html) & 0xFFFFFFFF)
+    if _JS_CHECK_CACHE["html_id"] == key:
+        return _JS_CHECK_CACHE["result"] or {"ok": True}
+
+    result = {"ok": True}
+    node_bin = _shutil.which("node")
+    if not node_bin:
+        result = {"ok": True, "skipped": "node not found in PATH"}
+        _JS_CHECK_CACHE.update(html_id=key, result=result)
+        return result
+
+    scripts = _re.findall(r"<script[^>]*>(.*?)</script>", html, _re.DOTALL)
+    if not scripts:
+        result = {"ok": True, "skipped": "no script blocks"}
+        _JS_CHECK_CACHE.update(html_id=key, result=result)
+        return result
+
+    # 가장 큰 스크립트 (보통 메인 inline script) 만 검증 — 안전망 inline script 는 작아서 무시
+    main_script = max(scripts, key=len)
+    try:
+        with _tmp.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(main_script)
+            tmp_path = f.name
+        proc = subprocess.run([node_bin, "--check", tmp_path],
+                                capture_output=True, text=True, timeout=10)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        if proc.returncode != 0:
+            err_lines = (proc.stderr or "").splitlines()
+            # 너무 길면 잘라서 — 핵심 라인만
+            first_err = next((ln for ln in err_lines if "Error" in ln or "SyntaxError" in ln), err_lines[0] if err_lines else "unknown")
+            line_info = next((ln for ln in err_lines if _re.search(r":\d+", ln)), "")
+            result = {
+                "ok": False,
+                "error": f"{first_err.strip()} | {line_info.strip()[:200]}",
+                "full": "\n".join(err_lines[:20]),
+            }
+            # 서버 콘솔에도 출력 (개발자 알림)
+            print(f"\n⚠️ [JS Self-Check 실패] {result['error']}", flush=True)
+            print(result["full"][:2000], flush=True)
+        else:
+            result = {"ok": True}
+    except subprocess.TimeoutExpired:
+        result = {"ok": True, "skipped": "node check timeout"}
+    except Exception as e:
+        result = {"ok": True, "skipped": f"check error: {e}"}
+
+    _JS_CHECK_CACHE.update(html_id=key, result=result)
+    return result
+
+
 @app.route("/")
 def index():
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     api_warning = not api_key or api_key == "sk-ant-..."
-    return render_template_string(
+    html = render_template_string(
         HTML_TEMPLATE,
         api_warning=api_warning,
         app_version=APP_VERSION,
@@ -6386,6 +7819,17 @@ def index():
         app_version_tagline=APP_VERSION_TAGLINE,
         app_version_highlights=APP_VERSION_HIGHLIGHTS,
     )
+    # 계층 2: JS 자가 검증 결과를 페이지에 주입 — 계층 1 안전망이 받음
+    check = _quick_validate_served_html(html)
+    if not check.get("ok"):
+        import json as _json
+        injection = (
+            "<script>window.__SERVER_JS_CHECK = "
+            + _json.dumps(check, ensure_ascii=False)
+            + ";</script>\n</body>"
+        )
+        html = html.replace("</body>", injection, 1)
+    return html
 
 
 # ── 관리자 엔드포인트 ─────────────────────────────────────────────────────────
@@ -7590,6 +9034,1613 @@ def combo_delete_spec():
                         "message": "파일이 백업되어 삭제되었습니다 (." + backup.name.split('.', 1)[-1] + ")."})
     except Exception as e:
         return jsonify({"ok": False, "error": f"삭제 실패: {e}"}), 500
+
+
+# ── 기존 TC 업데이트 endpoint (v0.11.x — 1단계: spec diff 분석만) ─────────
+@app.route("/update/config", methods=["GET"])
+def update_config_get():
+    """현재 사용자의 TC update 설정 조회 (Drive 폴더 ID 등).
+    Returns: {ok, drive_folder_id, drive_folder_url, drive_folder_name?}
+    """
+    cfg = load_tc_update_config()
+    folder_id = cfg.get("drive_folder_id", "")
+    folder_url = cfg.get("drive_folder_url", "")
+    folder_name = ""
+    # 폴더 이름도 같이 조회 (UI 에 표시용) — 권한 있으면
+    if folder_id:
+        try:
+            drive = get_drive_service()
+            meta = drive.files().get(fileId=folder_id, fields="id,name").execute()
+            folder_name = meta.get("name", "")
+        except Exception:
+            folder_name = "(접근 권한 없음 또는 폴더 없음)"
+    return jsonify({
+        "ok": True,
+        "drive_folder_id": folder_id,
+        "drive_folder_url": folder_url,
+        "drive_folder_name": folder_name,
+    })
+
+
+@app.route("/update/config", methods=["POST"])
+def update_config_set():
+    """TC update 설정 저장.
+    Body: {drive_folder_url}  (URL 또는 폴더 ID — 자동 추출)
+    Returns: {ok, drive_folder_id, drive_folder_url, drive_folder_name?, ...}
+    """
+    body = request.get_json(force=True) or {}
+    raw = (body.get("drive_folder_url") or "").strip()
+    if not raw:
+        # 빈 값 = 설정 제거 (orphan 으로 돌아감)
+        save_tc_update_config({})
+        return jsonify({"ok": True, "cleared": True})
+
+    folder_id = _extract_folder_id(raw)
+    if not folder_id:
+        return jsonify({"ok": False,
+                          "error": "Drive 폴더 URL 형식이 아닙니다. 예: https://drive.google.com/drive/folders/..."}), 400
+
+    # 폴더 권한 점검
+    folder_name = ""
+    try:
+        drive = get_drive_service()
+        meta = drive.files().get(fileId=folder_id, fields="id,name,mimeType").execute()
+        folder_name = meta.get("name", "")
+        if meta.get("mimeType") != "application/vnd.google-apps.folder":
+            return jsonify({"ok": False,
+                              "error": "지정한 ID 가 폴더가 아닙니다."}), 400
+    except Exception as e:
+        return jsonify({"ok": False,
+                          "error": f"폴더 접근 실패 — 권한 확인 필요: {e}"}), 400
+
+    cfg = {
+        "drive_folder_id": folder_id,
+        "drive_folder_url": raw,
+        "drive_folder_name": folder_name,
+    }
+    save_tc_update_config(cfg)
+    return jsonify({"ok": True, **cfg})
+
+
+@app.route("/update/history", methods=["GET"])
+def update_history_list():
+    """프로젝트의 TC update 작업 이력 조회.
+    Query: ?project=<name>
+    """
+    project_name = (request.args.get("project") or "").strip()
+    if not project_name:
+        return jsonify({"ok": True, "history": []})
+    return jsonify({"ok": True, "history": get_update_history(project_name)})
+
+
+@app.route("/update/history/delete", methods=["POST"])
+def update_history_delete():
+    """프로젝트의 update_history 에서 특정 항목 삭제.
+    Body: {project, index}
+    """
+    body = request.get_json(force=True) or {}
+    project_name = (body.get("project") or "").strip()
+    index = body.get("index")
+    if not project_name:
+        return jsonify({"ok": False, "error": "project 필요"}), 400
+    if not isinstance(index, int):
+        return jsonify({"ok": False, "error": "index (정수) 필요"}), 400
+    ok = delete_update_history(project_name, index)
+    if not ok:
+        return jsonify({"ok": False, "error": "프로젝트 없음 또는 index 범위 초과"}), 404
+    return jsonify({"ok": True, "history": get_update_history(project_name)})
+
+
+@app.route("/update/analyze", methods=["POST"])
+def update_analyze():
+    """기획서 두 버전을 비교해 변경 분석 보고서 생성.
+    Body: {prev_folder, new_folder, existing_tc_url?, project_name?}
+    Returns: {ok, diff, summary, scr_changes, common_doc_changes, meta}
+    """
+    body = request.get_json(force=True) or {}
+    prev_folder = (body.get("prev_folder") or "").strip()
+    new_folder = (body.get("new_folder") or "").strip()
+    existing_tc_url = (body.get("existing_tc_url") or "").strip()
+    project_name = (body.get("project_name") or "").strip()
+
+    if not prev_folder or not new_folder:
+        return jsonify({"ok": False,
+                        "error": "이전 폴더와 새 폴더 경로 모두 필요합니다."}), 400
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+
+    try:
+        result = step_analyze_spec_diff(prev_folder, new_folder, existing_tc_url)
+        # 분석이 성공했으면 history 저장 (Sheets URL 까지 있어야 함)
+        if project_name and existing_tc_url:
+            try:
+                save_update_history(project_name, prev_folder, new_folder, existing_tc_url)
+            except Exception:
+                pass  # history 저장 실패는 분석 결과 반환을 막지 않음
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "ok": False, "error": str(e),
+            "trace": traceback.format_exc()[-2000:],
+        }), 500
+
+
+@app.route("/update/scr-tcs", methods=["POST"])
+def update_scr_tcs():
+    """진단용 — 특정 Sheets 의 특정 SCR 에 매핑된 모든 TC 본문 반환.
+    Body: {sheets_url, scr_id, sheet_title? (선택)}
+    """
+    body = request.get_json(force=True) or {}
+    url = (body.get("sheets_url") or "").strip()
+    scr_id = (body.get("scr_id") or "").strip()
+    filter_sheet = (body.get("sheet_title") or "").strip()
+    if not url or not scr_id:
+        return jsonify({"ok": False, "error": "sheets_url 과 scr_id 필요"}), 400
+    try:
+        sid = _extract_sheets_id(url)
+        data = read_sheets_tcs(sid)
+        matched = []
+        for t in data.get("tcs", []):
+            if scr_id not in t.get("scr_ids", []):
+                continue
+            if filter_sheet and t.get("sheet_title") != filter_sheet:
+                continue
+            # 본문 읽기
+            try:
+                body_row = _read_tc_row_from_sheets(sid, t["sheet_title"], t["row_index"])
+                matched.append({
+                    "tc_id": t["tc_id"],
+                    "title": t["title"],
+                    "sheet_title": t["sheet_title"],
+                    "row_index": t["row_index"],
+                    "scr_ids": t["scr_ids"],
+                    "precondition": body_row.get("precondition", ""),
+                    "steps": body_row.get("steps", ""),
+                    "expected": body_row.get("expected", ""),
+                })
+            except Exception:
+                pass
+        return jsonify({"ok": True, "scr_id": scr_id, "count": len(matched), "tcs": matched})
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-1500:]}), 500
+
+
+@app.route("/update/analyze-plan", methods=["POST"])
+def update_analyze_plan():
+    """사전 견적 — AI 호출 없이 diff + 그룹화 + 캐시 hit 상태 반환.
+
+    Body: {prev_folder, new_folder}
+    Returns: {
+      ok, scr_diff_stats, groups, total_groups, cached_indices,
+      estimated_minutes_min, estimated_minutes_max
+    }
+    """
+    body = request.get_json(force=True) or {}
+    prev_folder = (body.get("prev_folder") or "").strip()
+    new_folder = (body.get("new_folder") or "").strip()
+    if not prev_folder or not new_folder:
+        return jsonify({"ok": False,
+                          "error": "이전 폴더와 새 폴더 경로 모두 필요합니다."}), 400
+
+    try:
+        prev_p = Path(prev_folder).expanduser()
+        new_p = Path(new_folder).expanduser()
+        if not prev_p.exists() or not new_p.exists():
+            return jsonify({"ok": False, "error": "폴더 경로가 존재하지 않습니다."}), 400
+
+        # diff 만 (AI 호출 없음 — 빠름)
+        diff = diff_spec_folders(prev_p, new_p)
+        groups = _group_scr_changes(diff)
+
+        # 캐시 hit 상태 점검
+        cached_indices = []
+        for g in groups:
+            cached = _load_diff_cache(prev_folder, new_folder, g["index"])
+            if cached:
+                cached_indices.append(g["index"])
+
+        # SCR 평면 리스트 — UI 가 체크리스트로 활용 (각 SCR 캐시 상태 포함)
+        scrs_flat = []
+        for s in (diff.get("added") or []):
+            cached = _load_scr_cache(prev_folder, new_folder, s)
+            scrs_flat.append({
+                "scr_id": s, "type": "added",
+                "from_cache": bool(cached),
+            })
+        for s in (diff.get("modified") or []):
+            cached = _load_scr_cache(prev_folder, new_folder, s)
+            scrs_flat.append({
+                "scr_id": s, "type": "modified",
+                "from_cache": bool(cached),
+            })
+        for s in (diff.get("removed") or []):
+            cached = _load_scr_cache(prev_folder, new_folder, s)
+            scrs_flat.append({
+                "scr_id": s, "type": "removed",
+                "from_cache": bool(cached),
+            })
+
+        total = len(groups)
+        new_count = total - len(cached_indices)
+        return jsonify({
+            "ok": True,
+            "scr_diff_stats": {
+                "added": len(diff.get("added", []) or []),
+                "modified": len(diff.get("modified", []) or []),
+                "removed": len(diff.get("removed", []) or []),
+                "unchanged": len(diff.get("unchanged", []) or []),
+                "common_changed": diff.get("common_changed", False),
+            },
+            "groups": groups,
+            "total_groups": total,
+            "cached_indices": cached_indices,
+            "new_count": new_count,
+            "estimated_minutes_min": max(1, new_count),       # 그룹당 약 60초
+            "estimated_minutes_max": max(1, new_count * 2),    # 그룹당 약 120초
+            # SCR 단위 체크리스트용
+            "scrs": scrs_flat,
+            "total_scrs": len(scrs_flat),
+            "cached_scrs": [s["scr_id"] for s in scrs_flat if s["from_cache"]],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2000:]}), 500
+
+
+@app.route("/update/analyze-scr", methods=["POST"])
+def update_analyze_scr():
+    """1개 SCR 의 AI 분석. SCR 단위 캐시 사용.
+
+    Body: {prev_folder, new_folder, scr_id, force_refresh?}
+    Returns: {ok, scr_id, change_type, summary, from_cache, cached_at?}
+    """
+    body = request.get_json(force=True) or {}
+    prev_folder = (body.get("prev_folder") or "").strip()
+    new_folder = (body.get("new_folder") or "").strip()
+    scr_id = (body.get("scr_id") or "").strip()
+    force_refresh = bool(body.get("force_refresh", False))
+
+    if not prev_folder or not new_folder or not scr_id:
+        return jsonify({"ok": False,
+                          "error": "prev_folder, new_folder, scr_id 모두 필요"}), 400
+
+    try:
+        # SCR 의 change_type 판별 — diff 기준
+        diff = diff_spec_folders(Path(prev_folder).expanduser(),
+                                    Path(new_folder).expanduser())
+        if scr_id in (diff.get("added") or []):
+            change_type = "added"
+        elif scr_id in (diff.get("modified") or []):
+            change_type = "modified"
+        elif scr_id in (diff.get("removed") or []):
+            change_type = "removed"
+        else:
+            return jsonify({"ok": False,
+                              "error": f"{scr_id} 가 변경 SCR 목록에 없음 (unchanged 또는 존재하지 않음)"}), 400
+
+        # 캐시 확인
+        if not force_refresh:
+            cached = _load_scr_cache(prev_folder, new_folder, scr_id)
+            if cached and cached.get("summary"):
+                return jsonify({
+                    "ok": True,
+                    "scr_id": scr_id,
+                    "change_type": change_type,
+                    "summary": cached["summary"],
+                    "from_cache": True,
+                    "cached_at": cached.get("_cached_at", ""),
+                })
+
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+
+        result = step_analyze_scr_one(prev_folder, new_folder, scr_id, change_type)
+        if not result.get("ok"):
+            return jsonify(result), 500
+
+        _save_scr_cache(prev_folder, new_folder, scr_id, {
+            "summary": result["summary"],
+            "change_type": change_type,
+        })
+
+        return jsonify({
+            "ok": True,
+            "scr_id": scr_id,
+            "change_type": change_type,
+            "summary": result["summary"],
+            "from_cache": False,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2000:]}), 500
+
+
+@app.route("/update/analyze-group", methods=["POST"])
+def update_analyze_group():
+    """1개 그룹 AI 분석. 캐시 hit 면 즉시 반환.
+
+    Body: {prev_folder, new_folder, group_index, force_refresh?}
+    Returns: {ok, group, summary, from_cache, next_group_index, total_groups, is_last}
+    """
+    body = request.get_json(force=True) or {}
+    prev_folder = (body.get("prev_folder") or "").strip()
+    new_folder = (body.get("new_folder") or "").strip()
+    group_index = body.get("group_index")
+    force_refresh = bool(body.get("force_refresh", False))
+
+    if not prev_folder or not new_folder:
+        return jsonify({"ok": False,
+                          "error": "이전 폴더와 새 폴더 경로 모두 필요합니다."}), 400
+    if group_index is None:
+        return jsonify({"ok": False, "error": "group_index 필요"}), 400
+
+    try:
+        prev_p = Path(prev_folder).expanduser()
+        new_p = Path(new_folder).expanduser()
+        diff = diff_spec_folders(prev_p, new_p)
+        groups = _group_scr_changes(diff)
+        if group_index < 0 or group_index >= len(groups):
+            return jsonify({"ok": False,
+                              "error": f"group_index 범위 초과 (0~{len(groups)-1})"}), 400
+
+        target = groups[group_index]
+
+        # 캐시 점검
+        from_cache = False
+        if not force_refresh:
+            cached = _load_diff_cache(prev_folder, new_folder, group_index)
+            if cached and cached.get("summary"):
+                from_cache = True
+                return jsonify({
+                    "ok": True,
+                    "group": target,
+                    "summary": cached["summary"],
+                    "from_cache": True,
+                    "cached_at": cached.get("_cached_at", ""),
+                    "next_group_index": group_index + 1 if group_index + 1 < len(groups) else None,
+                    "total_groups": len(groups),
+                    "is_last": (group_index + 1) >= len(groups),
+                })
+
+        # AI 호출 (캐시 miss 또는 force_refresh)
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 미설정"}), 500
+
+        result = step_analyze_group(prev_folder, new_folder, target)
+        if not result.get("ok"):
+            return jsonify(result), 500
+
+        # 캐시 저장
+        _save_diff_cache(prev_folder, new_folder, group_index, {
+            "summary": result["summary"],
+            "group": target,
+        })
+
+        return jsonify({
+            "ok": True,
+            "group": target,
+            "summary": result["summary"],
+            "from_cache": False,
+            "next_group_index": group_index + 1 if group_index + 1 < len(groups) else None,
+            "total_groups": len(groups),
+            "is_last": (group_index + 1) >= len(groups),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2000:]}), 500
+
+
+# 세션 캐시 — plan 결과를 apply 에서 재사용
+_UPDATE_SESSIONS = {}
+
+
+@app.route("/update/inspect", methods=["POST"])
+def update_inspect():
+    """사용자가 가져온 Sheets 의 실제 구조를 진단.
+    Body: {existing_tc_url}
+    Returns: {ok, file_meta, tabs:[{title, header, sample_rows, detected_tc_count, ...}], parser_result}
+    """
+    body = request.get_json(force=True) or {}
+    url = (body.get("existing_tc_url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "existing_tc_url 필요"}), 400
+
+    try:
+        sheets_id = _extract_sheets_id(url)
+        drive = get_drive_service()
+        meta = drive.files().get(fileId=sheets_id,
+                                   fields="id,name,mimeType,modifiedTime,owners(displayName,emailAddress)").execute()
+
+        svc = get_sheets_service()
+        ss = svc.spreadsheets().get(spreadsheetId=sheets_id,
+                                       fields="sheets(properties(sheetId,title,index,gridProperties))").execute()
+        tab_titles = [s["properties"]["title"] for s in ss.get("sheets", [])]
+
+        ranges = [f"'{t}'!A1:Z2000" for t in tab_titles]
+        batch = svc.spreadsheets().values().batchGet(spreadsheetId=sheets_id, ranges=ranges).execute()
+        value_ranges = batch.get("valueRanges", [])
+
+        tabs_report = []
+        for title, vr in zip(tab_titles, value_ranges):
+            values = vr.get("values", [])
+            # 헤더 후보 탐색 (TC ID 또는 ID 컬럼 포함하는 첫 행)
+            header_idx = -1
+            header = []
+            for i, row in enumerate(values[:10]):
+                joined = " ".join(str(c) for c in row)
+                if "TC ID" in joined or "TC_ID" in joined or "ID" in joined:
+                    header = row
+                    header_idx = i
+                    break
+            if header_idx < 0 and values:
+                header = values[0]
+                header_idx = 0
+
+            sample_rows = values[header_idx + 1:header_idx + 6] if header_idx >= 0 else []
+
+            # 본문에서 SCR 패턴 탐지
+            all_text = "\n".join(" ".join(str(c) for c in row) for row in values[header_idx + 1:] if any(str(c).strip() for c in row))
+            scrs = sorted(set(re.findall(r"SCR-\d+", all_text)), key=lambda s: int(s.split("-")[1]))
+            tc_ids = sorted(set(re.findall(r"\b[A-Z]{2,}-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{2,}\b", all_text)))
+
+            # 데이터 행 수 (헤더 이후 비어있지 않은 행)
+            data_rows = [r for r in values[header_idx + 1:] if any(str(c).strip() for c in r)]
+
+            tabs_report.append({
+                "title": title,
+                "header_row_index": header_idx,
+                "header": header,
+                "header_count": len(header),
+                "sample_rows": sample_rows,
+                "data_row_count": len(data_rows),
+                "detected_scr_ids": scrs[:30],
+                "detected_scr_count": len(scrs),
+                "detected_tc_ids_sample": tc_ids[:10],
+                "detected_tc_count": len(tc_ids),
+            })
+
+        # 현재 read_sheets_tcs 가 어떻게 파싱하는지 — 실제 호출 결과
+        try:
+            parsed = read_sheets_tcs(sheets_id)
+            parser_result = {
+                "tcs_total": len(parsed.get("tcs", [])),
+                "scr_keys_total": len(parsed.get("tc_by_scr", {})),
+                "tabs_with_tcs": [{"title": t["title"], "tc_count": len(t.get("rows", []))} for t in parsed.get("tabs", [])],
+                "sample_tcs": parsed.get("tcs", [])[:5],
+                "sample_tc_by_scr": dict(list(parsed.get("tc_by_scr", {}).items())[:5]),
+            }
+        except Exception as ex:
+            parser_result = {"error": str(ex)}
+
+        return jsonify({
+            "ok": True,
+            "file_meta": meta,
+            "tabs": tabs_report,
+            "parser_result": parser_result,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2500:]}), 500
+
+
+@app.route("/update/plan", methods=["POST"])
+def update_plan():
+    """2단계 — 원본 Sheets 사본 생성 + TC↔SCR 매핑 + 4-way 후보 리스트.
+    Body: {prev_folder, new_folder, existing_tc_url, make_copy?(default True), project_name?}
+    Returns: {ok, session_id, copy_url, copy_id, candidates, stats, diff}
+    """
+    body = request.get_json(force=True) or {}
+    prev_folder = (body.get("prev_folder") or "").strip()
+    new_folder = (body.get("new_folder") or "").strip()
+    existing_tc_url = (body.get("existing_tc_url") or "").strip()
+    make_copy = bool(body.get("make_copy", True))
+    project_name = (body.get("project_name") or "").strip()
+    # 선택된 SCR 만 후보로 (None 이면 전체)
+    scr_filter = body.get("scr_filter")
+    if scr_filter is not None and not isinstance(scr_filter, list):
+        scr_filter = None
+    if scr_filter:
+        scr_filter = [str(s).strip() for s in scr_filter if str(s).strip()]
+        if not scr_filter:
+            scr_filter = None
+    # 제외할 action 들 — 'add' 등. 신규 SCR 은 신규 TC 생성 모드에서 처리하므로 기본 제외 권장
+    exclude_actions = body.get("exclude_actions") or []
+    if not isinstance(exclude_actions, list):
+        exclude_actions = []
+    exclude_actions = set(str(a).strip() for a in exclude_actions if str(a).strip())
+
+    if not prev_folder or not new_folder or not existing_tc_url:
+        return jsonify({"ok": False,
+                        "error": "이전 폴더, 새 폴더, 기존 TC Sheets URL 모두 필요합니다."}), 400
+
+    # 입력이 다 갖춰진 시점에 history 저장 (Plan 호출 자체가 실제 사용 의도)
+    if project_name:
+        try:
+            save_update_history(project_name, prev_folder, new_folder, existing_tc_url)
+        except Exception:
+            pass
+
+    try:
+        # 1) Spec diff (1단계 재사용 — AI 요약은 생략, diff 만 필요)
+        diff_only = step_analyze_spec_diff(prev_folder, new_folder, existing_tc_url)
+
+        # 2) 사본 생성 (실험 단계 — 원본 보호)
+        copy_info = {}
+        target_sheets_id = _extract_sheets_id(existing_tc_url)
+        if make_copy:
+            copy_info = copy_sheets_for_update(existing_tc_url)
+            target_sheets_id = copy_info["copy_id"]
+
+        # 3) TC↔SCR 매핑 추출 (사본 기준 — 같은 내용이지만 일관성)
+        tc_data = read_sheets_tcs(target_sheets_id)
+
+        # 4) 판정 로직 → 4-way 후보 (선택된 SCR 만)
+        candidates = build_update_candidates(
+            diff_only, tc_data, prev_folder, new_folder,
+            scr_filter=scr_filter,
+        )
+        # 4-1) 제외 action 적용 — 'add' 등 (신규는 신규 TC 생성 모드에서 별도 처리)
+        if exclude_actions:
+            candidates = [c for c in candidates if c.get("action") not in exclude_actions]
+
+        # 5) 세션 저장 (apply 단계에서 재사용)
+        import uuid
+        session_id = f"upd_{uuid.uuid4().hex[:12]}"
+        _UPDATE_SESSIONS[session_id] = {
+            "candidates": candidates,
+            "target_sheets_id": target_sheets_id,
+            "copy_info": copy_info,
+            "diff": diff_only.get("diff", {}),
+            "prev_folder": prev_folder,
+            "new_folder": new_folder,
+            "scr_filter": scr_filter,
+        }
+
+        # 통계
+        stats = {
+            "total": len(candidates),
+            "add": sum(1 for c in candidates if c["action"] == "add"),
+            "modify": sum(1 for c in candidates if c["action"] == "modify"),
+            "delete": sum(1 for c in candidates if c["action"] == "delete"),
+            "default_checked": sum(1 for c in candidates if c.get("default_checked")),
+            "scr_added": len(diff_only["diff"].get("added", [])),
+            "scr_modified": len(diff_only["diff"].get("modified", [])),
+            "scr_removed": len(diff_only["diff"].get("removed", [])),
+            "scr_unchanged": len(diff_only["diff"].get("unchanged", [])),
+            "tcs_total": len(tc_data.get("tcs", [])),
+            "tabs": [t["title"] for t in tc_data.get("tabs", [])],
+        }
+
+        return jsonify({
+            "ok": True,
+            "session_id": session_id,
+            "copy_url": copy_info.get("copy_url", ""),
+            "copy_title": copy_info.get("copy_title", ""),
+            "target_sheets_id": target_sheets_id,
+            "candidates": candidates,
+            "stats": stats,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "ok": False, "error": str(e),
+            "trace": traceback.format_exc()[-2500:],
+        }), 500
+
+
+@app.route("/update/preview", methods=["POST"])
+def update_preview():
+    """후보 1건의 실제 SCR 본문 + diff 반환.
+
+    Body: {session_id, idx}
+    Returns: {
+      ok, candidate, prev_text, new_text, unified_diff,
+      changed_lines: [{type:'add'|'del', text}],
+    }
+    """
+    body = request.get_json(force=True) or {}
+    session_id = (body.get("session_id") or "").strip()
+    idx = body.get("idx")
+    sess = _UPDATE_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션이 없습니다. /update/plan 을 다시 호출하세요."}), 404
+    candidates = sess.get("candidates", [])
+    if idx is None or idx < 0 or idx >= len(candidates):
+        return jsonify({"ok": False, "error": f"잘못된 idx: {idx}"}), 400
+
+    c = candidates[idx]
+    scr_id = c.get("scr_id") or ""
+
+    try:
+        prev_folder = sess.get("prev_folder", "")
+        new_folder = sess.get("new_folder", "")
+        prev_cls = classify_spec_files(Path(prev_folder).expanduser()) if prev_folder else {"screens": []}
+        new_cls = classify_spec_files(Path(new_folder).expanduser()) if new_folder else {"screens": []}
+        prev_map = {p.stem.split(".")[0]: p for p in prev_cls.get("screens", [])}
+        new_map = {p.stem.split(".")[0]: p for p in new_cls.get("screens", [])}
+        prev_path = prev_map.get(scr_id)
+        new_path = new_map.get(scr_id)
+
+        prev_text = prev_path.read_text(encoding="utf-8") if prev_path and prev_path.exists() else ""
+        new_text = new_path.read_text(encoding="utf-8") if new_path and new_path.exists() else ""
+
+        # unified diff
+        import difflib
+        prev_lines = prev_text.splitlines()
+        new_lines = new_text.splitlines()
+        unified = list(difflib.unified_diff(prev_lines, new_lines,
+                                                fromfile=f"prev/{scr_id}",
+                                                tofile=f"new/{scr_id}",
+                                                n=3, lineterm=""))
+        # 변경 라인만 따로 (휴리스틱이 본 줄들)
+        changed_lines = []
+        for ln in unified:
+            if ln.startswith("+++") or ln.startswith("---") or ln.startswith("@@"):
+                continue
+            if ln.startswith("+"):
+                changed_lines.append({"type": "add", "text": ln[1:]})
+            elif ln.startswith("-"):
+                changed_lines.append({"type": "del", "text": ln[1:]})
+
+        return jsonify({
+            "ok": True,
+            "candidate": c,
+            "scr_id": scr_id,
+            "has_prev": bool(prev_text),
+            "has_new": bool(new_text),
+            "prev_text": prev_text[:8000],
+            "new_text": new_text[:8000],
+            "unified_diff": "\n".join(unified)[:10000],
+            "changed_lines": changed_lines[:200],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2000:]}), 500
+
+
+def _read_tc_row_from_sheets(sheets_id: str, sheet_title: str, row_index: int) -> dict:
+    """사본 Sheets 에서 특정 행을 읽어 {tc_id, title, steps, expected, precondition, ...} 반환.
+
+    헤더 매핑은 read_sheets_tcs 와 동일한 별칭 규칙 사용.
+    """
+    svc = get_sheets_service()
+    # 헤더 + 해당 행만
+    header_range = f"'{sheet_title}'!A1:Z3"
+    row_range = f"'{sheet_title}'!A{row_index}:Z{row_index}"
+    batch = svc.spreadsheets().values().batchGet(
+        spreadsheetId=sheets_id, ranges=[header_range, row_range]
+    ).execute()
+    vrs = batch.get("valueRanges", [])
+    if len(vrs) < 2:
+        raise RuntimeError("시트에서 행을 읽지 못함")
+
+    header_values = vrs[0].get("values", [])
+    row_values = vrs[1].get("values", [[]])
+    row = row_values[0] if row_values else []
+
+    # 헤더 행 (TC ID 컬럼 포함) 찾기
+    header = []
+    for r in header_values[:3]:
+        if any(c in ("TC ID", "TC_ID") for c in r):
+            header = r
+            break
+    if not header and header_values:
+        header = header_values[0]
+
+    def col(names):
+        for nm in names:
+            if nm in header:
+                return header.index(nm)
+        return -1
+
+    def cell(ci):
+        if ci < 0 or ci >= len(row):
+            return ""
+        return str(row[ci] or "").strip()
+
+    return {
+        "tc_id": cell(col(["TC ID", "TC_ID", "ID"])).replace("*", "").strip(),
+        "title": cell(col(["소분류", "제목", "Title"])),
+        "category": cell(col(["대분류"])),
+        "sub_category": cell(col(["중분류"])),
+        "precondition": cell(col(["사전조건", "사전 조건", "Precondition"])),
+        "steps": cell(col(["테스트 스텝", "테스트 단계", "Steps"])),
+        "expected": cell(col(["기대결과", "기대 결과", "예상 결과", "Expected"])),
+        "scr_field": cell(col(["화면 코드", "화면코드", "SCR", "SCR ID"])),
+        "_header": header,
+        "_col_pre": col(["사전조건", "사전 조건", "Precondition"]),
+        "_col_steps": col(["테스트 스텝", "테스트 단계", "Steps"]),
+        "_col_exp": col(["기대결과", "기대 결과", "예상 결과", "Expected"]),
+    }
+
+
+@app.route("/update/propose", methods=["POST"])
+def update_propose():
+    """1건의 TC 에 대한 AI 수정안 제안.
+
+    Body: {session_id, idx}
+    Returns: {ok, current_tc, proposal, scr_id}
+    """
+    body = request.get_json(force=True) or {}
+    session_id = (body.get("session_id") or "").strip()
+    idx = body.get("idx")
+    sess = _UPDATE_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션이 없습니다. /update/plan 을 다시 호출하세요."}), 404
+    candidates = sess.get("candidates", [])
+    if idx is None or idx < 0 or idx >= len(candidates):
+        return jsonify({"ok": False, "error": f"잘못된 idx: {idx}"}), 400
+
+    c = candidates[idx]
+    if c.get("action") != "modify":
+        return jsonify({"ok": False,
+                          "error": f"수정안 제안은 modify 액션만 지원 (현재: {c.get('action')})"}), 400
+    if not c.get("tc_id"):
+        return jsonify({"ok": False, "error": "TC ID 가 없는 후보 — 수정 불가"}), 400
+    if not c.get("sheet_title"):
+        return jsonify({"ok": False, "error": "시트 정보 없음"}), 400
+
+    scr_id = c.get("scr_id") or ""
+    target_id = sess.get("target_sheets_id")
+
+    try:
+        # 1) 사본에서 현재 TC 행 읽기 (TC ID 로 row_index 찾기)
+        #    Quota 절약: 세션에 tc_data 캐시 (한 세션 내 propose 여러 번 호출되어도 1회만 읽음)
+        tc_data = sess.get("_tc_data_cache")
+        if not tc_data:
+            tc_data = read_sheets_tcs(target_id)
+            sess["_tc_data_cache"] = tc_data
+            # tc_id+sheet → row_index 빠른 조회 인덱스
+            sess["_tc_locator"] = {(t["tc_id"], t["sheet_title"]): t["row_index"]
+                                      for t in tc_data.get("tcs", [])}
+
+        locator = sess.get("_tc_locator") or {}
+        row_index = locator.get((c["tc_id"], c["sheet_title"]))
+        if row_index is None:
+            return jsonify({"ok": False,
+                              "error": f"사본에서 {c['tc_id']} 를 찾지 못함"}), 404
+
+        # 본문까지 읽기 (이건 TC 마다 한 번 — 같은 TC 반복 propose 면 캐시)
+        body_cache_key = (c["tc_id"], c["sheet_title"], row_index)
+        body_cache = sess.setdefault("_tc_body_cache", {})
+        if body_cache_key in body_cache:
+            current_tc = body_cache[body_cache_key]
+        else:
+            current_tc = _read_tc_row_from_sheets(target_id, c["sheet_title"], row_index)
+            current_tc["row_index"] = row_index
+            body_cache[body_cache_key] = current_tc
+
+        # 2) SCR 본문 (prev/new) 가져오기
+        prev_folder = sess.get("prev_folder", "")
+        new_folder = sess.get("new_folder", "")
+        prev_cls = classify_spec_files(Path(prev_folder).expanduser()) if prev_folder else {"screens": []}
+        new_cls = classify_spec_files(Path(new_folder).expanduser()) if new_folder else {"screens": []}
+        prev_map = {p.stem.split(".")[0]: p for p in prev_cls.get("screens", [])}
+        new_map = {p.stem.split(".")[0]: p for p in new_cls.get("screens", [])}
+        prev_path = prev_map.get(scr_id)
+        new_path = new_map.get(scr_id)
+        prev_text = prev_path.read_text(encoding="utf-8") if prev_path and prev_path.exists() else ""
+        new_text = new_path.read_text(encoding="utf-8") if new_path and new_path.exists() else ""
+
+        # 3) AI 호출
+        result = step_propose_tc_update(scr_id, prev_text, new_text, current_tc)
+        if not result.get("ok"):
+            return jsonify(result), 500
+
+        # 4) 응답에 현재값도 같이 (diff UI 용)
+        # _col_* 키는 내부용이라 응답에서 제거
+        clean_tc = {k: v for k, v in current_tc.items() if not k.startswith("_")}
+
+        return jsonify({
+            "ok": True,
+            "scr_id": scr_id,
+            "current_tc": clean_tc,
+            "proposal": result["proposal"],
+        })
+    except Exception as e:
+        import traceback
+        err_msg = str(e)
+        # 429 quota 초과면 명확한 한글 메시지
+        if "429" in err_msg or "Quota exceeded" in err_msg or "RATE_LIMIT" in err_msg:
+            return jsonify({
+                "ok": False,
+                "error": "Google Sheets API 한도 초과 (분당 60회) — 1-2분 기다린 후 다시 시도하세요. 일괄 적용 직후나 여러 카드를 빠르게 열면 자주 발생합니다.",
+                "rate_limited": True,
+            }), 429
+        return jsonify({"ok": False, "error": err_msg,
+                          "trace": traceback.format_exc()[-2000:]}), 500
+
+
+@app.route("/update/commit", methods=["POST"])
+def update_commit():
+    """승인된 수정안을 사본 Sheets 의 행 셀에 직접 쓰기.
+
+    Body: {session_id, idx, accepted: {steps?, expected?, precondition?}}
+    Returns: {ok, written_cells, log_entry}
+    """
+    body = request.get_json(force=True) or {}
+    session_id = (body.get("session_id") or "").strip()
+    idx = body.get("idx")
+    accepted = body.get("accepted") or {}
+    sess = _UPDATE_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션이 없습니다."}), 404
+    candidates = sess.get("candidates", [])
+    if idx is None or idx < 0 or idx >= len(candidates):
+        return jsonify({"ok": False, "error": f"잘못된 idx: {idx}"}), 400
+
+    c = candidates[idx]
+    if c.get("action") != "modify" or not c.get("tc_id"):
+        return jsonify({"ok": False, "error": "modify + tc_id 필요"}), 400
+
+    target_id = sess.get("target_sheets_id")
+    sheet_title = c.get("sheet_title")
+
+    try:
+        # 1) row_index + 컬럼 인덱스 다시 확인
+        tc_data = read_sheets_tcs(target_id)
+        target_tc = next((t for t in tc_data.get("tcs", [])
+                              if t["tc_id"] == c["tc_id"]
+                              and t["sheet_title"] == c["sheet_title"]), None)
+        if not target_tc:
+            return jsonify({"ok": False, "error": f"{c['tc_id']} 를 사본에서 못 찾음"}), 404
+
+        current_tc = _read_tc_row_from_sheets(target_id, sheet_title, target_tc["row_index"])
+
+        # 2) 적용할 필드 + 컬럼 인덱스 매핑
+        field_to_col = {
+            "precondition": current_tc["_col_pre"],
+            "steps": current_tc["_col_steps"],
+            "expected": current_tc["_col_exp"],
+        }
+
+        # 3) 각 필드별로 단일 셀 update
+        svc = get_sheets_service()
+        written = []
+        for field, new_value in accepted.items():
+            if new_value is None:
+                continue
+            ci = field_to_col.get(field, -1)
+            if ci < 0:
+                continue
+            # A1 표기 — 컬럼 letter
+            col_letter = ""
+            n = ci
+            while True:
+                col_letter = chr(ord('A') + (n % 26)) + col_letter
+                n = n // 26 - 1
+                if n < 0:
+                    break
+            cell_range = f"'{sheet_title}'!{col_letter}{target_tc['row_index']}"
+            svc.spreadsheets().values().update(
+                spreadsheetId=target_id,
+                range=cell_range,
+                valueInputOption="RAW",
+                body={"values": [[str(new_value)]]},
+            ).execute()
+            written.append({
+                "field": field,
+                "cell": cell_range,
+                "before": current_tc.get(field, ""),
+                "after": new_value,
+            })
+
+        # 4) Update Log 시트에 기록 (있으면 append, 없으면 생성)
+        from datetime import datetime
+        log_title = "TC Edit Log"
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=target_id,
+                body={"requests": [{"addSheet": {"properties": {"title": log_title}}}]}
+            ).execute()
+            # 헤더 추가
+            svc.spreadsheets().values().update(
+                spreadsheetId=target_id,
+                range=f"'{log_title}'!A1",
+                valueInputOption="RAW",
+                body={"values": [["시각", "TC ID", "시트", "행", "필드", "이전 값(요약)", "새 값(요약)", "수정 사유"]]},
+            ).execute()
+        except Exception:
+            pass  # 이미 있으면 무시
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rationale = (accepted.get("_rationale") or "").strip()
+        log_rows = []
+        for w in written:
+            log_rows.append([
+                ts, c["tc_id"], sheet_title, str(target_tc["row_index"]),
+                w["field"],
+                (w["before"] or "")[:200],
+                (w["after"] or "")[:200],
+                rationale[:300],
+            ])
+        if log_rows:
+            svc.spreadsheets().values().append(
+                spreadsheetId=target_id,
+                range=f"'{log_title}'!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": log_rows},
+            ).execute()
+
+        return jsonify({
+            "ok": True,
+            "written_cells": written,
+            "log_sheet": log_title,
+            "tc_id": c["tc_id"],
+            "sheet_title": sheet_title,
+            "row_index": target_tc["row_index"],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2000:]}), 500
+
+
+@app.route("/update/promote", methods=["POST"])
+def update_promote():
+    """사본(copy)의 TC Edit Log 에 기록된 변경을 원본(source) Sheets 에 반영.
+
+    Body: {
+      copy_url: str,         # 변경이 적용된 사본 URL
+      source_url: str,       # 갱신할 원본 URL
+      dry_run: bool          # True 면 미리보기만 (셀 좌표 + 값 반환, 쓰기 X)
+    }
+
+    Returns (dry_run=True):
+      {ok, dry_run: True, plan: [{tc_id, sheet, row, field, cell, new_value}],
+       count, sheets_seen, log_count, backup_needed: bool}
+
+    Returns (dry_run=False):
+      {ok, applied_count, backup: {backup_url, backup_title}, written_cells: [...]}
+    """
+    body = request.get_json(force=True) or {}
+    copy_url = (body.get("copy_url") or "").strip()
+    source_url = (body.get("source_url") or "").strip()
+    dry_run = bool(body.get("dry_run", True))
+
+    if not copy_url or not source_url:
+        return jsonify({"ok": False,
+                          "error": "copy_url 과 source_url 모두 필요합니다."}), 400
+
+    try:
+        copy_id = _extract_sheets_id(copy_url)
+        source_id = _extract_sheets_id(source_url)
+
+        # 1) 사본의 TC Edit Log 읽기
+        log = read_tc_edit_log(copy_id)
+        if not log["log_exists"]:
+            return jsonify({"ok": False,
+                              "error": "사본에 'TC Edit Log' 시트가 없습니다. 먼저 수정안을 적용하세요."}), 400
+        if log["count"] == 0:
+            return jsonify({"ok": False,
+                              "error": "TC Edit Log 가 비어있습니다. 적용할 변경이 없습니다."}), 400
+
+        # 2) 원본에서 같은 TC ID 의 행 위치 찾기 (사본의 행 번호는 원본과 같다는 보장 없음)
+        source_tc_data = read_sheets_tcs(source_id)
+        # tc_id + sheet_title → row_index 매핑
+        source_locator = {}
+        for t in source_tc_data.get("tcs", []):
+            key = (t["tc_id"], t["sheet_title"])
+            source_locator[key] = t["row_index"]
+
+        # 3) 각 log entry → 원본 행/컬럼 찾고 사본의 실제 셀 값 읽기
+        svc = get_sheets_service()
+        plan = []
+        missing = []  # 원본에서 못 찾은 TC
+
+        # 사본의 실제 셀 값을 batch 로 효율 읽기
+        copy_ranges = []
+        copy_range_keys = []  # plan 매칭용
+        for e in log["entries"]:
+            col_idx = resolve_field_column(copy_id, e["sheet_title"], e["field"])
+            if col_idx < 0:
+                continue
+            col_letter = _col_index_to_letter(col_idx)
+            cell_addr = f"'{e['sheet_title']}'!{col_letter}{e['row_index']}"
+            copy_ranges.append(cell_addr)
+            copy_range_keys.append((e, col_idx, col_letter))
+
+        # 사본의 실제 셀 값 batchGet
+        if copy_ranges:
+            batch = svc.spreadsheets().values().batchGet(
+                spreadsheetId=copy_id, ranges=copy_ranges,
+            ).execute()
+            value_ranges = batch.get("valueRanges", [])
+        else:
+            value_ranges = []
+
+        for (e, col_idx, col_letter), vr in zip(copy_range_keys, value_ranges):
+            # 사본 셀의 실제 값 (요약본 아닌 전체)
+            v = vr.get("values", [[""]])
+            actual_value = (v[0][0] if v and v[0] else "") or ""
+
+            # 원본에서 같은 TC 의 행 찾기
+            key = (e["tc_id"], e["sheet_title"])
+            source_row = source_locator.get(key)
+            if source_row is None:
+                missing.append({
+                    "tc_id": e["tc_id"],
+                    "sheet_title": e["sheet_title"],
+                    "reason": "원본에서 TC ID 를 찾지 못함",
+                })
+                continue
+
+            # 원본 시트의 컬럼 인덱스 (사본과 다를 수 있으니 별도 조회)
+            source_col = resolve_field_column(source_id, e["sheet_title"], e["field"])
+            if source_col < 0:
+                missing.append({
+                    "tc_id": e["tc_id"],
+                    "sheet_title": e["sheet_title"],
+                    "reason": f"원본에 '{e['field']}' 컬럼 없음",
+                })
+                continue
+            source_col_letter = _col_index_to_letter(source_col)
+            source_cell_addr = f"'{e['sheet_title']}'!{source_col_letter}{source_row}"
+
+            plan.append({
+                "tc_id": e["tc_id"],
+                "sheet_title": e["sheet_title"],
+                "field": e["field"],
+                "source_row": source_row,
+                "source_cell": source_cell_addr,
+                "new_value": actual_value,
+                "old_value_summary": e.get("old_value", ""),
+                "rationale": e.get("rationale", ""),
+            })
+
+        if dry_run:
+            return jsonify({
+                "ok": True,
+                "dry_run": True,
+                "plan": plan,
+                "count": len(plan),
+                "missing": missing,
+                "log_count": log["count"],
+                "sheets_seen": log["sheets_seen"],
+                "backup_needed": True,
+            })
+
+        # 실제 적용 흐름
+        # 4) 원본 백업 (필수)
+        backup_info = backup_original_sheets(source_url)
+
+        # 5) 원본에 batchUpdate
+        data = []
+        for p in plan:
+            data.append({
+                "range": p["source_cell"],
+                "values": [[p["new_value"]]],
+            })
+        if data:
+            svc.spreadsheets().values().batchUpdate(
+                spreadsheetId=source_id,
+                body={"valueInputOption": "RAW", "data": data},
+            ).execute()
+
+        # 6) 원본에 'Promote Log' 시트 추가 (적용 이력)
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=source_id,
+                body={"requests": [{"addSheet": {"properties": {"title": "Promote Log"}}}]},
+            ).execute()
+            svc.spreadsheets().values().update(
+                spreadsheetId=source_id,
+                range="'Promote Log'!A1",
+                valueInputOption="RAW",
+                body={"values": [[
+                    "적용 시각", "TC ID", "시트", "필드", "원본 셀",
+                    "새 값(요약)", "사본 URL", "백업 URL"
+                ]]},
+            ).execute()
+        except Exception:
+            pass  # 이미 있으면 무시
+
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_rows = []
+        for p in plan:
+            log_rows.append([
+                ts, p["tc_id"], p["sheet_title"], p["field"], p["source_cell"],
+                (p["new_value"] or "")[:200],
+                copy_url, backup_info["backup_url"],
+            ])
+        if log_rows:
+            svc.spreadsheets().values().append(
+                spreadsheetId=source_id,
+                range="'Promote Log'!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": log_rows},
+            ).execute()
+
+        return jsonify({
+            "ok": True,
+            "dry_run": False,
+            "applied_count": len(plan),
+            "missing": missing,
+            "backup": {
+                "backup_id": backup_info["backup_id"],
+                "backup_url": backup_info["backup_url"],
+                "backup_title": backup_info["backup_title"],
+                "backed_up_at": backup_info["backed_up_at"],
+            },
+            "source_url": source_url,
+            "applied_at": ts,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2500:]}), 500
+
+
+@app.route("/update/rollback", methods=["POST"])
+def update_rollback():
+    """백업 사본의 셀 값을 원본 Sheets 로 복원 (롤백).
+
+    Body: {source_url, backup_url, scope: 'promote_log' | 'all'}
+
+    scope='promote_log' (권장):
+      - 원본의 'Promote Log' 시트를 읽어 어떤 셀을 promote 로 갱신했는지 파악
+      - 그 셀들만 백업의 같은 셀 값으로 복원 (가장 안전)
+
+    scope='all':
+      - 백업의 모든 탭/셀을 원본에 통째로 덮어쓰기 (강력하지만 위험)
+      - 만약 백업 이후 원본에 다른 수동 수정이 있었다면 그것도 사라짐
+
+    Returns: {ok, scope, restored_count, message}
+    """
+    body = request.get_json(force=True) or {}
+    source_url = (body.get("source_url") or "").strip()
+    backup_url = (body.get("backup_url") or "").strip()
+    scope = (body.get("scope") or "promote_log").strip()
+
+    if not source_url or not backup_url:
+        return jsonify({"ok": False,
+                          "error": "source_url 과 backup_url 모두 필요합니다."}), 400
+
+    try:
+        source_id = _extract_sheets_id(source_url)
+        backup_id = _extract_sheets_id(backup_url)
+        svc = get_sheets_service()
+
+        if scope == "promote_log":
+            # 원본의 'Promote Log' 읽기 → 적용된 셀 좌표 목록 추출
+            meta = svc.spreadsheets().get(
+                spreadsheetId=source_id,
+                fields="sheets(properties(sheetId,title))",
+            ).execute()
+            titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+            if "Promote Log" not in titles:
+                return jsonify({"ok": False,
+                                  "error": "원본에 'Promote Log' 시트가 없습니다. 이전에 promote 한 기록이 없어 롤백 대상이 없습니다."}), 400
+
+            resp = svc.spreadsheets().values().get(
+                spreadsheetId=source_id,
+                range="'Promote Log'!A1:Z2000",
+            ).execute()
+            values = resp.get("values", [])
+            if not values or len(values) < 2:
+                return jsonify({"ok": True, "scope": "promote_log",
+                                  "restored_count": 0,
+                                  "message": "Promote Log 가 비어있습니다."})
+
+            header = values[0]
+            def col_idx(name):
+                return header.index(name) if name in header else -1
+            ci_cell = col_idx("원본 셀")
+            if ci_cell < 0:
+                return jsonify({"ok": False, "error": "'원본 셀' 컬럼을 못 찾음"}), 500
+
+            # 적용된 셀 좌표 수집 (중복 제거 — 가장 최근 백업 시점 기준으로 복원)
+            cell_addrs = []
+            for row in values[1:]:
+                if ci_cell < len(row) and row[ci_cell]:
+                    addr = str(row[ci_cell]).strip()
+                    if addr and addr not in cell_addrs:
+                        cell_addrs.append(addr)
+
+            if not cell_addrs:
+                return jsonify({"ok": True, "scope": "promote_log",
+                                  "restored_count": 0,
+                                  "message": "복원할 셀이 없습니다."})
+
+            # 백업에서 같은 셀들의 값 읽기
+            backup_batch = svc.spreadsheets().values().batchGet(
+                spreadsheetId=backup_id, ranges=cell_addrs,
+            ).execute()
+            backup_vrs = backup_batch.get("valueRanges", [])
+
+            # 원본에 batchUpdate
+            data = []
+            for addr, vr in zip(cell_addrs, backup_vrs):
+                vals = vr.get("values", [[""]])
+                v = (vals[0][0] if vals and vals[0] else "") or ""
+                data.append({"range": addr, "values": [[v]]})
+
+            if data:
+                svc.spreadsheets().values().batchUpdate(
+                    spreadsheetId=source_id,
+                    body={"valueInputOption": "RAW", "data": data},
+                ).execute()
+
+            # 'Rollback Log' 에 기록
+            try:
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=source_id,
+                    body={"requests": [{"addSheet": {"properties": {"title": "Rollback Log"}}}]},
+                ).execute()
+                svc.spreadsheets().values().update(
+                    spreadsheetId=source_id,
+                    range="'Rollback Log'!A1",
+                    valueInputOption="RAW",
+                    body={"values": [["롤백 시각", "복원 셀 수", "백업 URL", "scope"]]},
+                ).execute()
+            except Exception:
+                pass
+
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            svc.spreadsheets().values().append(
+                spreadsheetId=source_id,
+                range="'Rollback Log'!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [[ts, str(len(data)), backup_url, scope]]},
+            ).execute()
+
+            return jsonify({
+                "ok": True,
+                "scope": "promote_log",
+                "restored_count": len(data),
+                "message": f"{len(data)}개 셀을 백업 시점으로 복원했습니다.",
+                "restored_at": ts,
+            })
+
+        elif scope == "all":
+            # 모든 탭 전체 복원 — 위험하므로 일단 미지원 (필요 시 추후)
+            return jsonify({"ok": False,
+                              "error": "scope='all' 은 아직 지원하지 않습니다. scope='promote_log' 사용"}), 400
+        else:
+            return jsonify({"ok": False,
+                              "error": f"알 수 없는 scope: {scope}"}), 400
+
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                          "trace": traceback.format_exc()[-2500:]}), 500
+
+
+@app.route("/update/apply-bulk", methods=["POST"])
+def update_apply_bulk():
+    """선택된 후보들에 대해 AI 수정안 제안 + 사본 셀 갱신 + TC Edit Log 기록을 순차 실행.
+
+    Body: {session_id, selections: [{idx, accept: bool}], skip_existing?: bool}
+
+    동작:
+      체크된 modify 후보들에 대해:
+        1. propose 호출 (AI) — no_change 면 skip
+        2. 사본 셀 갱신 (3개 필드: precondition, steps, expected)
+        3. TC Edit Log 시트에 기록
+
+    skip_existing=True (default): 이미 TC Edit Log 에 있는 TC 는 skip (중복 호출 방지)
+
+    Returns: {
+      ok, processed, applied, no_change, errors,
+      details: [{tc_id, status, fields_changed?, error?}],
+      log_sheet: 'TC Edit Log', copy_url
+    }
+    """
+    body = request.get_json(force=True) or {}
+    session_id = (body.get("session_id") or "").strip()
+    selections = body.get("selections") or []
+    skip_existing = bool(body.get("skip_existing", True))
+
+    sess = _UPDATE_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션이 없습니다. /update/plan 을 다시 호출하세요."}), 404
+
+    try:
+        target_id = sess["target_sheets_id"]
+        candidates = sess["candidates"]
+        prev_folder = sess.get("prev_folder", "")
+        new_folder = sess.get("new_folder", "")
+
+        # 수정 대상 수집 (modify + tc_id 있는 것만)
+        targets = []
+        for sel in selections:
+            idx = sel.get("idx")
+            if idx is None or idx < 0 or idx >= len(candidates):
+                continue
+            if not sel.get("accept"):
+                continue
+            c = candidates[idx]
+            if c.get("action") != "modify" or not c.get("tc_id"):
+                continue
+            targets.append({**c, "idx": idx})
+
+        if not targets:
+            return jsonify({"ok": True, "processed": 0,
+                            "message": "체크된 수정 후보가 없습니다.",
+                            "details": []})
+
+        svc = get_sheets_service()
+
+        # TC Edit Log 시트 확인/생성 + 헤더 + 기존 (TC ID, sheet, field) 조합 수집 (중복 방지)
+        existing_keys = set()  # (tc_id, sheet_title, field)
+        log_title = "TC Edit Log"
+        log_header = ["시각", "TC ID", "시트", "행", "필드", "이전 값(요약)", "새 값(요약)", "수정 사유"]
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=target_id,
+                body={"requests": [{"addSheet": {"properties": {"title": log_title}}}]},
+            ).execute()
+            svc.spreadsheets().values().update(
+                spreadsheetId=target_id,
+                range=f"'{log_title}'!A1",
+                valueInputOption="RAW",
+                body={"values": [log_header]},
+            ).execute()
+        except Exception:
+            # 이미 있으면 기존 (tc_id, sheet, field) 조합 읽기
+            try:
+                resp = svc.spreadsheets().values().get(
+                    spreadsheetId=target_id,
+                    range=f"'{log_title}'!A1:Z2000",
+                ).execute()
+                vals = resp.get("values", [])
+                if vals:
+                    h = vals[0]
+                    ci_tc = h.index("TC ID") if "TC ID" in h else -1
+                    ci_sh = h.index("시트") if "시트" in h else -1
+                    ci_fd = h.index("필드") if "필드" in h else -1
+                    for r in vals[1:]:
+                        def c(i):
+                            return str(r[i]).strip() if i >= 0 and i < len(r) else ""
+                        k = (c(ci_tc), c(ci_sh), c(ci_fd))
+                        if all(k):
+                            existing_keys.add(k)
+            except Exception:
+                pass
+
+        # SCR 별 본문 캐시 (같은 SCR 여러번 안 읽도록)
+        scr_text_cache = {}
+        def get_scr_pair(scr_id):
+            if scr_id not in scr_text_cache:
+                scr_text_cache[scr_id] = _read_scr_pair(prev_folder, new_folder, scr_id)
+            return scr_text_cache[scr_id]
+
+        # 사본의 TC 매핑 (한 번만 읽기)
+        tc_data = read_sheets_tcs(target_id)
+        tc_index = {(t["tc_id"], t["sheet_title"]): t for t in tc_data.get("tcs", [])}
+
+        # 처리 시작
+        details = []
+        applied_count = 0
+        no_change_count = 0
+        error_count = 0
+        skipped_count = 0
+        new_log_rows = []
+        from datetime import datetime
+
+        for tgt in targets:
+            tc_id = tgt["tc_id"]
+            sheet_title = tgt.get("sheet_title", "")
+            scr_id = tgt.get("scr_id", "")
+
+            # 사본에서 행 찾기
+            target_tc = tc_index.get((tc_id, sheet_title))
+            if not target_tc:
+                error_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "error",
+                                  "error": f"사본에서 {tc_id} 행을 찾지 못함"})
+                continue
+            row_index = target_tc["row_index"]
+
+            # 현재 TC 행 본문 읽기
+            try:
+                current_tc = _read_tc_row_from_sheets(target_id, sheet_title, row_index)
+            except Exception as e:
+                error_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "error",
+                                  "error": f"행 읽기 실패: {e}"})
+                continue
+
+            # AI 호출
+            prev_text, new_text = get_scr_pair(scr_id)
+            try:
+                result = step_propose_tc_update(scr_id, prev_text, new_text, current_tc)
+            except Exception as e:
+                error_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "error",
+                                  "error": f"AI 호출 실패: {e}"})
+                continue
+
+            if not result.get("ok"):
+                error_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "error",
+                                  "error": result.get("error", "AI 응답 실패")})
+                continue
+
+            proposal = result["proposal"]
+            if proposal.get("no_change"):
+                no_change_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "no_change",
+                                  "rationale": proposal.get("rationale", "")})
+                continue
+
+            # 필드별 갱신 (사본 셀)
+            field_to_col = {
+                "precondition": current_tc["_col_pre"],
+                "steps": current_tc["_col_steps"],
+                "expected": current_tc["_col_exp"],
+            }
+            fields_changed = []
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for field, new_value in [
+                ("precondition", proposal.get("precondition")),
+                ("steps", proposal.get("steps")),
+                ("expected", proposal.get("expected")),
+            ]:
+                if new_value is None:
+                    continue
+                # skip_existing 체크
+                if skip_existing and (tc_id, sheet_title, field) in existing_keys:
+                    continue
+                ci = field_to_col.get(field, -1)
+                if ci < 0:
+                    continue
+                col_letter = _col_index_to_letter(ci)
+                cell_range = f"'{sheet_title}'!{col_letter}{row_index}"
+                try:
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=target_id,
+                        range=cell_range,
+                        valueInputOption="RAW",
+                        body={"values": [[str(new_value)]]},
+                    ).execute()
+                    fields_changed.append(field)
+                    new_log_rows.append([
+                        ts, tc_id, sheet_title, str(row_index), field,
+                        (current_tc.get(field, "") or "")[:200],
+                        (new_value or "")[:200],
+                        (proposal.get("rationale") or "")[:300],
+                    ])
+                    existing_keys.add((tc_id, sheet_title, field))
+                except Exception as e:
+                    details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                      "field": field, "status": "error",
+                                      "error": f"셀 쓰기 실패: {e}"})
+
+            if fields_changed:
+                applied_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "applied",
+                                  "fields_changed": fields_changed,
+                                  "rationale": proposal.get("rationale", "")})
+            else:
+                # AI 가 변경 제안했는데 skip_existing 이 다 막은 경우 — 사실상 no_change
+                skipped_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "skipped",
+                                  "reason": "이미 TC Edit Log 에 있어 skip"})
+
+        # TC Edit Log 에 일괄 append
+        if new_log_rows:
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=target_id,
+                    range=f"'{log_title}'!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": new_log_rows},
+                ).execute()
+            except Exception:
+                pass  # 핵심 셀은 이미 박힘 — 로그 실패는 치명적 X
+
+        return jsonify({
+            "ok": True,
+            "processed": len(targets),
+            "applied": applied_count,
+            "no_change": no_change_count,
+            "skipped": skipped_count,
+            "errors": error_count,
+            "details": details,
+            "log_sheet": log_title,
+            "copy_url": sess.get("copy_info", {}).get("copy_url", ""),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "ok": False, "error": str(e),
+            "trace": traceback.format_exc()[-2500:],
+        }), 500
+
+
+# 레거시 — 기존 /update/apply 는 그대로 두고 (호환성), 새 UI 는 /update/apply-bulk 사용
+@app.route("/update/apply", methods=["POST"])
+def update_apply():
+    """3단계 (레거시) — Update Log 메모만 기록.
+
+    ⚠️ 사본 셀은 갱신하지 않음. 실제 갱신은 /update/apply-bulk 사용.
+    이전 UI 호환성 위해 유지.
+    """
+    body = request.get_json(force=True) or {}
+    session_id = (body.get("session_id") or "").strip()
+    selections = body.get("selections") or []
+    sess = _UPDATE_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션이 없습니다."}), 404
+
+    try:
+        target_id = sess["target_sheets_id"]
+        candidates = sess["candidates"]
+
+        applied = []
+        for sel in selections:
+            idx = sel.get("idx")
+            if idx is None or idx < 0 or idx >= len(candidates):
+                continue
+            if not sel.get("accept"):
+                continue
+            applied.append({**candidates[idx], "idx": idx})
+
+        if not applied:
+            return jsonify({"ok": True, "applied_count": 0,
+                            "message": "선택된 항목이 없습니다."})
+
+        svc = get_sheets_service()
+        from datetime import datetime
+        log_title = f"Update Log {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=target_id,
+            body={"requests": [{"addSheet": {"properties": {"title": log_title}}}]}
+        ).execute()
+
+        header = ["#", "액션", "SCR ID", "TC ID", "TC 제목", "시트", "변경 종류", "사유", "추출 시각"]
+        rows = [header]
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for i, a in enumerate(applied, start=1):
+            rows.append([
+                str(i), a["action"], a.get("scr_id", ""), a.get("tc_id", "") or "(신규)",
+                a.get("tc_title", ""), a.get("sheet_title", ""),
+                a.get("change_kind", ""), a.get("reason", ""), ts,
+            ])
+
+        svc.spreadsheets().values().update(
+            spreadsheetId=target_id,
+            range=f"'{log_title}'!A1",
+            valueInputOption="RAW",
+            body={"values": rows},
+        ).execute()
+
+        return jsonify({
+            "ok": True,
+            "applied_count": len(applied),
+            "log_sheet": log_title,
+            "copy_url": sess.get("copy_info", {}).get("copy_url", ""),
+            "warning": "레거시 모드 — 사본 셀은 갱신 안 됨. /update/apply-bulk 사용 권장",
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "ok": False, "error": str(e),
+            "trace": traceback.format_exc()[-2500:],
+        }), 500
 
 
 @app.route("/combo/download/<workspace_id>/<filename>", methods=["GET"])
@@ -9305,16 +12356,18 @@ def load_config():
     return {}
 
 
-def get_drive_service():
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+
+def _get_google_creds():
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
 
-    SCOPES = [
-        "https://www.googleapis.com/auth/drive.file",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
     if not DRIVE_CREDS_FILE.exists():
         raise FileNotFoundError(
             "credentials.json이 없습니다.\n"
@@ -9324,15 +12377,34 @@ def get_drive_service():
         )
     creds = None
     if DRIVE_TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_FILE), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_FILE), GOOGLE_SCOPES)
+        except Exception:
+            creds = None
+        if creds and set(creds.scopes or []) != set(GOOGLE_SCOPES):
+            # scope 가 늘어났으면 재인증 필요
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(DRIVE_CREDS_FILE), SCOPES)
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(str(DRIVE_CREDS_FILE), GOOGLE_SCOPES)
             creds = flow.run_local_server(port=0)
         DRIVE_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-    return build("drive", "v3", credentials=creds)
+    return creds
+
+
+def get_drive_service():
+    from googleapiclient.discovery import build
+    return build("drive", "v3", credentials=_get_google_creds())
+
+
+def get_sheets_service():
+    from googleapiclient.discovery import build
+    return build("sheets", "v4", credentials=_get_google_creds())
 
 
 @app.route("/open-folder", methods=["POST"])
@@ -9569,6 +12641,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
   header .header-sub { font-size: 13px; opacity: 0.7; margin-left: auto; }
   .version-badge { font-size: 11px; font-weight: 600; color: #FF8C00; letter-spacing: 0.3px; }
+  /* TC Update 직전 작업 불러오기 — 드롭다운 행 hover */
+  .recent-row:hover { background: #F9FAFB; }
   /* 헤더 우측 서버 재시작 버튼 */
   .btn-restart-server {
     padding: 6px 12px; border-radius: 6px;
@@ -10302,6 +13376,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 
+<!-- ── JS 에러 안전망 (계층 1) ─────────────────────────────────────────────
+   이 inline script 는 다른 모든 script 보다 먼저 로드/실행되어 SyntaxError 가
+   메인 스크립트에서 발생해도 살아남아 사용자에게 에러를 보여준다.
+   증상: 어제 큰 script 의 SyntaxError 로 restartServer 등 다수 함수가
+        정의되지 않아 버튼이 침묵하던 사고가 있었음.
+-->
+<div id="jsErrorBanner" style="display:none; position:sticky; top:0; z-index:99999;
+     background:#FEE2E2; color:#991B1B; padding:10px 14px; border-bottom:2px solid #DC2626;
+     font-family:system-ui, sans-serif; font-size:13px; line-height:1.5;">
+  <strong>⚠️ JavaScript 오류 감지 — 일부 버튼이 동작하지 않을 수 있습니다.</strong>
+  <span id="jsErrorBannerMsg" style="display:block; margin-top:4px; font-family:monospace; font-size:11px; white-space:pre-wrap;"></span>
+  <button onclick="document.getElementById('jsErrorBanner').style.display='none'"
+          style="float:right; background:none; border:1px solid #991B1B; color:#991B1B;
+                 padding:2px 8px; border-radius:4px; cursor:pointer; font-size:11px;">닫기</button>
+</div>
+<script>
+(function() {
+  window.__jsErrors = [];
+  function showError(msg) {
+    var b = document.getElementById('jsErrorBanner');
+    var m = document.getElementById('jsErrorBannerMsg');
+    if (!b || !m) return;
+    b.style.display = 'block';
+    var prev = m.textContent || '';
+    m.textContent = (prev ? prev + ' | ' : '') + msg;
+    window.__jsErrors.push(msg);
+  }
+  // 1) 런타임 에러 잡기
+  window.addEventListener('error', function(e) {
+    var msg = '[' + (e.filename || 'inline').split('/').pop() + ':' + (e.lineno || '?') + '] ' + (e.message || 'unknown');
+    showError(msg);
+  });
+  // 2) Promise rejection 잡기
+  window.addEventListener('unhandledrejection', function(e) {
+    showError('[Promise] ' + (e.reason && (e.reason.message || e.reason) || 'unknown'));
+  });
+  // 3) DOM 로드 후 핵심 함수 정의 점검 (큰 script 의 SyntaxError 감지)
+  window.addEventListener('DOMContentLoaded', function() {
+    var critical = ['restartServer', 'startUpdateAnalyze', 'startUpdatePlan', 'loadProjects'];
+    var missing = critical.filter(function(n) { return typeof window[n] !== 'function'; });
+    if (missing.length) {
+      showError('핵심 함수 미정의: ' + missing.join(', ') + ' — 메인 스크립트가 SyntaxError 로 중단됐을 가능성. 브라우저 콘솔(F12) 을 열어 첫 번째 빨간 에러를 확인하세요.');
+    }
+    // 서버 측 JS 검증 결과도 표시
+    if (window.__SERVER_JS_CHECK && window.__SERVER_JS_CHECK.ok === false) {
+      showError('서버 JS 검증 실패: ' + window.__SERVER_JS_CHECK.error);
+    }
+  });
+})();
+</script>
+
 {% if api_warning %}
 <div class="api-warning">
   ⚠️ <strong>ANTHROPIC_API_KEY 미설정</strong> — .env 파일에 API 키를 설정해주세요.
@@ -10485,10 +13610,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <div style="display:flex;align-items:center;justify-content:space-between;">
                 <label style="font-size:12px;color:#78350F;font-weight:600;display:flex;align-items:center;gap:5px;">
                   <span>🔄</span> 버전 diff 모드
-                  <span style="font-weight:400;color:#92400E;">— 변경된 SCR 만 재생성</span>
+                  <span style="font-weight:400;color:#92400E;">— 변경된 SCR 만 <strong>신규 TC 생성</strong></span>
                 </label>
                 <button type="button" id="btnDiffToggle" onclick="toggleDiffMode()"
                         style="padding:3px 10px;font-size:11px;border:1px solid #FCD34D;background:#FFFFFF;border-radius:4px;cursor:pointer;color:#78350F;">사용</button>
+              </div>
+              <div style="margin-top:6px; padding:6px 8px; background:#FFFFFF; border:1px dashed #FCD34D; border-radius:4px; font-size:10px; color:#92400E; line-height:1.6;">
+                💡 <strong>언제 쓰나요?</strong> TC 가 아직 없거나 처음부터 새로 만들 때. 결과는 <strong>Excel 파일</strong>.<br>
+                ⚠️ <strong>이미 운영 중인 Google Sheets TC 를 수정하고 싶다면</strong> → 상단의 <strong>"✏️ 기존 TC 수정"</strong> 모드 사용 (결과: Sheets 셀 직접 갱신 + 자동 백업).
               </div>
               <div id="diffBox" style="display:none;margin-top:8px;">
                 <label style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
@@ -10682,67 +13811,249 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- ── 수정 모드 (기획서 diff 기반 TC 갱신) ── -->
     <div id="panelModify" class="hidden">
 
+      <!-- 직전 작업 불러오기 + ⚙ 설정 (1순위 — info-box 보다 먼저) -->
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px;">
+        <div id="updateRecentArea" style="display:none; position:relative;">
+          <button type="button" id="updateRecentBtn" onclick="toggleUpdateRecent()"
+                  style="background:#EEF2FF; border:1px solid #C7D2FE;
+                         padding:10px 16px; border-radius:8px; cursor:pointer;
+                         font-size:14px; color:#3730A3; font-weight:600;
+                         display:inline-flex; align-items:center; gap:8px;">
+            <span>📂 직전 작업 불러오기</span>
+            <span id="updateRecentCount" style="background:#C7D2FE; color:#1E1B4B; font-size:11px; padding:2px 8px; border-radius:10px; font-weight:600;">0</span>
+            <span id="updateRecentChevron" style="font-size:10px; margin-left:2px;">▾</span>
+          </button>
+          <div id="updateRecentList" style="display:none; position:absolute; top:100%; left:0; right:auto; min-width:420px; max-width:640px; margin-top:4px; z-index:50;
+                  background:#FFF; border:1px solid #C7D2FE; border-radius:6px;
+                  box-shadow:0 4px 12px rgba(0,0,0,0.08);
+                  max-height:280px; overflow-y:auto;"></div>
+        </div>
+
+        <button type="button" id="updateConfigBtn" onclick="openConfigModal()"
+                style="background:#F3F4F6; border:1px solid #D1D5DB;
+                       padding:10px 14px; border-radius:8px; cursor:pointer;
+                       font-size:13px; color:#374151; font-weight:500;
+                       display:inline-flex; align-items:center; gap:6px;"
+                title="사본/백업이 저장될 Drive 폴더 설정">
+          <span>⚙</span>
+          <span>설정</span>
+          <span id="configFolderName" style="font-size:11px; color:#6B7280; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+        </button>
+      </div>
+
+      <!-- 설정 모달 -->
+      <div id="configModal" class="hidden" style="position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; padding:20px;">
+        <div style="background:#FFF; border-radius:12px; max-width:600px; width:100%; max-height:88vh; display:flex; flex-direction:column; overflow:hidden;">
+          <div style="padding:18px 22px; border-bottom:1px solid #E5E7EB; display:flex; align-items:center; justify-content:space-between;">
+            <div style="font-size:16px; font-weight:700; color:#1E3A5F;">⚙ TC Update 설정</div>
+            <button onclick="closeConfigModal()" style="background:none; border:none; cursor:pointer; font-size:22px; color:#6B7280;">×</button>
+          </div>
+          <div style="padding:20px 22px; overflow-y:auto; flex:1;">
+            <div style="font-size:13px; font-weight:600; color:#111827; margin-bottom:8px;">📁 사본·백업 보관 Drive 폴더</div>
+            <div style="font-size:11px; color:#6B7280; margin-bottom:10px; line-height:1.6;">
+              TC Update 작업으로 생성되는 사본/백업 Sheets 들이 이 폴더에 자동 저장됩니다.<br>
+              • 개인 드라이브 폴더 (본인만 접근) 또는 공유 드라이브 폴더 (팀 공유) 가능<br>
+              • 비워두면 폴더 지정 없이 Drive 루트에 만들어짐 (orphan)<br>
+              • 동료가 도구 사용 시 본인의 Drive 폴더 ID 를 따로 설정해야 함 (각자 본인 계정으로 작업)
+            </div>
+            <input type="text" id="configFolderUrl" class="form-input"
+                   placeholder="https://drive.google.com/drive/folders/..."
+                   style="font-family:monospace; font-size:12px;">
+            <div id="configCurrentInfo" style="margin-top:10px; padding:10px 12px; background:#F0F9FF; border:1px solid #BAE6FD; border-radius:6px; font-size:12px; color:#075985;"></div>
+            <div id="configMsg" style="margin-top:10px; font-size:12px;"></div>
+          </div>
+          <div style="padding:14px 22px; border-top:1px solid #E5E7EB; display:flex; gap:10px; align-items:center; justify-content:flex-end;">
+            <button class="btn" onclick="clearConfig()" style="background:#FEE2E2; color:#991B1B; border:1px solid #FCA5A5;">🗑 폴더 지정 제거</button>
+            <button class="btn" onclick="closeConfigModal()" style="background:#F3F4F6;">취소</button>
+            <button class="btn btn-primary" onclick="saveConfig()" id="configSaveBtn">💾 저장</button>
+          </div>
+        </div>
+      </div>
+
       <div class="info-box" style="margin-bottom:12px;background:#EEF2FF;border-color:#C7D2FE;">
-        📝 <strong>기획서 변경 기반 TC 갱신</strong><br>
-        <span style="font-size:12px;color:#4B5563;">이전 기획서와 새 기획서를 비교해 신규/수정/삭제된 화면을 자동 탐지합니다. 기존 TC는 ID를 유지한 채 업데이트됩니다.</span>
+        📝 <strong>기획서 변경 기반 TC 갱신</strong> <span style="font-size:11px;color:#6B7280;">(v0.11.x)</span><br>
+        <span style="font-size:12px;color:#4B5563;">
+          이전 기획서 폴더와 새 기획서 폴더를 비교해 운영 중인 Google Sheets TC 를 자동 갱신합니다.<br>
+          <strong>1단계 — 변경 분석</strong>: AI 가 SCR 별 변경 사항 요약<br>
+          <strong>2단계 — TC 매핑</strong>: 사본 자동 생성 + 영향 받는 TC 후보 산출 + 개별/일괄 적용<br>
+          <strong>3단계 — 원본 반영</strong>: 사본 검토 후 원본 Sheets 에 셀 단위 갱신 (자동 백업 + 롤백 가능)
+        </span>
       </div>
 
-      <!-- 프로젝트 선택 (선택) -->
+      <!-- Slot 1: 이전 기획서 폴더 -->
       <div class="form-group">
-        <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
-          <span>프로젝트 선택 <span style="font-size:11px;color:var(--muted);font-weight:400">(선택 — 기록용)</span></span>
-        </label>
-        <select class="project-select" id="modifyProjectSelect">
-          <option value="">— 단발성 작업 (프로젝트 없음) —</option>
-        </select>
+        <label class="form-label">📁 이전 기획서 폴더 경로 <span style="color:#DC2626;">*</span></label>
+        <input type="text" id="updatePrevFolder" class="form-input"
+               placeholder="예: /Users/me/projects/spec-v0.51.0-2026-05-01"
+               style="font-family:monospace;font-size:13px;">
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">구조화 spec 폴더 (overview/policy/design/scr 분리)</div>
       </div>
 
-      <!-- Slot 1: 이전 기획서 -->
+      <!-- Slot 2: 새 기획서 폴더 -->
       <div class="form-group">
-        <label class="form-label">📄 이전 기획서 <span style="color:#DC2626;">*</span></label>
-        <div class="src-dropzone" id="oldSpecDropzone" onclick="document.getElementById('oldSpecInput').click()"
-             style="border:2px dashed var(--border); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFAFA;">
-          📎 .md / .txt 파일 드래그 또는 클릭
+        <label class="form-label">📁 새 기획서 폴더 경로 <span style="color:#DC2626;">*</span></label>
+        <input type="text" id="updateNewFolder" class="form-input"
+               placeholder="예: /Users/me/projects/spec-v0.52.0-2026-05-08"
+               style="font-family:monospace;font-size:13px;">
+      </div>
+
+      <!-- Slot 3: 갱신 대상 Google Sheets URL -->
+      <div class="form-group">
+        <label class="form-label">📑 갱신 대상 Google Sheets URL <span style="font-size:11px;color:#DC2626;font-weight:600">(Promote 시 이 시트가 변경됩니다)</span></label>
+        <input type="text" id="updateTcUrl" class="form-input"
+               placeholder="https://docs.google.com/spreadsheets/d/..."
+               style="font-family:monospace;font-size:13px;">
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          작업 흐름: 입력한 시트 → 자동 사본 생성 → 사본에서 검토 → Promote 시 입력 시트 갱신 (+백업).<br>
+          💡 시험만 하고 싶으면 → Promote 단계 누르지 않으면 입력 시트는 안 변경됨 (사본만 만들어졌다 사라짐).
         </div>
-        <input type="file" id="oldSpecInput" accept=".md,.markdown,.txt" style="display:none" onchange="handleDiffFileUpload(event, 'old')">
-        <div id="oldSpecStatus" style="font-size:12px; color:var(--success); margin-top:6px; display:none;"></div>
       </div>
 
-      <!-- Slot 2: 새 기획서 -->
-      <div class="form-group">
-        <label class="form-label">📄 새 기획서 <span style="color:#DC2626;">*</span></label>
-        <div class="src-dropzone" id="newSpecDropzone" onclick="document.getElementById('newSpecInput').click()"
-             style="border:2px dashed var(--border); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFAFA;">
-          📎 .md / .txt 파일 드래그 또는 클릭
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-primary" id="startDiffBtn" onclick="startSmartAnalyze()">
+          🔍 변경사항 분석 (스마트)
+        </button>
+        <button class="btn" id="legacyDiffBtn" onclick="startUpdateAnalyze()" style="background:#F3F4F6;">
+          ⚡ 빠른 분석 (한 번에)
+        </button>
+      </div>
+
+      <!-- 스마트 분석 — 사전 견적 화면 -->
+      <div id="smartPlanArea" class="hidden" style="margin-top:16px; padding:16px; background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px;">
+        <div style="font-size:14px; font-weight:700; color:#1E3A5F; margin-bottom:10px;">
+          📊 사전 견적 <span style="font-size:11px; color:#6B7280; font-weight:400;">(AI 호출 전 — 즉시)</span>
         </div>
-        <input type="file" id="newSpecInput" accept=".md,.markdown,.txt" style="display:none" onchange="handleDiffFileUpload(event, 'new')">
-        <div id="newSpecStatus" style="font-size:12px; color:var(--success); margin-top:6px; display:none;"></div>
-      </div>
-
-      <!-- Slot 3: 기존 TC -->
-      <div class="form-group">
-        <label class="form-label">📑 기존 TC 파일 <span style="font-size:11px;color:var(--muted);font-weight:400">(선택 — 없으면 신규 생성 흐름)</span></label>
-        <div class="src-dropzone" id="existingTcDropzone" onclick="document.getElementById('existingTcInput').click()"
-             style="border:2px dashed var(--border); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFAFA;">
-          📎 .xlsx / .md 파일 드래그 또는 클릭
+        <div id="smartPlanStats" style="font-size:13px; color:#4B5563; margin-bottom:10px;"></div>
+        <div id="smartPlanGroups" style="margin:12px 0; max-height:340px; overflow-y:auto;"></div>
+        <div style="display:flex; gap:10px; margin-top:14px; align-items:center; flex-wrap:wrap;">
+          <button class="btn" onclick="cancelSmartPlan()" style="background:#F3F4F6;">← 취소</button>
+          <button class="btn btn-primary" id="startGroupAnalysisBtn" onclick="startGroupAnalysis()">
+            ▶ 1번째 그룹부터 분석 시작
+          </button>
+          <span style="flex:1; font-size:12px; color:#6B7280;">
+            각 그룹이 끝날 때마다 <strong>이어서/건너뛰기/종료</strong> 를 선택할 수 있어요.
+          </span>
         </div>
-        <input type="file" id="existingTcInput" accept=".xlsx,.xls,.md,.markdown" style="display:none" onchange="handleDiffFileUpload(event, 'tc')">
-        <div id="existingTcStatus" style="font-size:12px; color:var(--success); margin-top:6px; display:none;"></div>
       </div>
 
-      <button class="btn btn-primary" id="startDiffBtn" onclick="startDiffAnalyze()">
-        🔍 변경사항 분석
-      </button>
+      <!-- 스마트 분석 — 그룹별 진행 화면 -->
+      <div id="smartProgressArea" class="hidden" style="margin-top:16px; padding:16px; background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px;">
+        <div style="font-size:14px; font-weight:700; color:#1E3A5F; margin-bottom:12px;">
+          🧭 그룹별 분석 진행
+        </div>
+        <div id="smartProgressList" style="margin-bottom:12px;"></div>
+        <div id="smartCurrentResult" style="margin:14px 0; padding:12px; background:#F9FAFB; border:1px solid #E5E7EB; border-radius:6px; font-size:13px; color:#111827; line-height:1.7; max-height:420px; overflow-y:auto;"></div>
+        <div id="smartActionRow" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <!-- 동적으로 채워짐 -->
+        </div>
+      </div>
+
+      <!-- 스마트 분석 — 최종 합본 -->
+      <div id="smartFinalArea" class="hidden" style="margin-top:16px; padding:16px; background:#F0FDF4; border:1px solid #BBF7D0; border-radius:10px;">
+        <div style="font-size:14px; font-weight:700; color:#166534; margin-bottom:10px;">
+          ✅ 분석 완료 — 합본 보고서
+        </div>
+        <div id="smartFinalSummary" style="font-size:13px; color:#111827; line-height:1.7; max-height:540px; overflow-y:auto;"></div>
+        <div style="display:flex; gap:10px; margin-top:14px;">
+          <button class="btn" onclick="resetSmartAnalyze()" style="background:#F3F4F6;">← 새로 분석</button>
+          <button class="btn btn-primary" id="planBtnFromSmart" onclick="startUpdatePlan()" style="flex:0 0 auto">
+            🧭 2단계 — TC 매핑 + 영향 분석 (사본 생성)
+          </button>
+        </div>
+      </div>
 
       <!-- 변경사항 리포트 영역 (분석 후 노출) -->
       <div id="diffReportArea" class="hidden" style="margin-top:16px; padding:14px; background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px;">
-        <div style="font-size:14px; font-weight:700; color:#1E3A5F; margin-bottom:10px;">📊 변경사항 분석 결과</div>
-        <div id="diffReportSummary" style="font-size:13px; color:#4B5563; margin-bottom:10px;"></div>
-        <div id="diffReportSections"></div>
-        <div style="display:flex; gap:10px; margin-top:14px;">
-          <button class="btn btn-primary" style="flex:1" onclick="approveAndUpdate()">✅ 승인 후 TC 갱신 시작</button>
-          <button class="btn" style="flex:0 0 auto" onclick="cancelDiff()">취소</button>
+        <div style="font-size:14px; font-weight:700; color:#1E3A5F; margin-bottom:10px;">📊 변경사항 분석 결과 (1단계)</div>
+        <div id="diffReportStats" style="font-size:13px; color:#4B5563; margin-bottom:10px;"></div>
+        <div id="diffReportSummary" style="font-size:13px; color:#111827; line-height:1.7; margin-top:12px;"></div>
+        <div style="display:flex; gap:10px; margin-top:14px; align-items:center;">
+          <button class="btn" style="flex:0 0 auto" onclick="cancelUpdate()">← 입력 다시</button>
+          <button class="btn btn-primary" id="planBtn" onclick="startUpdatePlan()" style="flex:0 0 auto">
+            🧭 2단계 — TC 매핑 + 영향 분석 (사본 생성)
+          </button>
+          <span style="flex:1; font-size:12px; color:#6B7280;">
+            기존 TC Sheets 의 사본을 만들고, 변경 SCR 에 영향받는 TC 후보를 보여줍니다.
+          </span>
         </div>
+      </div>
+
+      <!-- 2단계 — 영향 분석 (Plan) 결과 -->
+      <div id="planReportArea" class="hidden" style="margin-top:16px; padding:14px; background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px;">
+        <div style="font-size:14px; font-weight:700; color:#1E3A5F; margin-bottom:10px;">🧭 영향 분석 (2단계)</div>
+        <div id="planStats" style="font-size:13px; color:#4B5563; margin-bottom:10px;"></div>
+        <div id="planCopyLink" style="font-size:13px; margin-bottom:10px;"></div>
+
+        <!-- 필터 -->
+        <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
+          <label style="font-size:12px;"><input type="checkbox" id="filterAdd" checked onchange="renderCandidates()"> 🆕 신규</label>
+          <label style="font-size:12px;"><input type="checkbox" id="filterModify" checked onchange="renderCandidates()"> ✏️ 수정</label>
+          <label style="font-size:12px;"><input type="checkbox" id="filterDelete" checked onchange="renderCandidates()"> 🗑️ 삭제</label>
+          <span style="flex:1"></span>
+          <button class="btn" style="font-size:12px; padding:4px 10px;" onclick="checkAll(true)">모두 체크</button>
+          <button class="btn" style="font-size:12px; padding:4px 10px;" onclick="checkAll(false)">모두 해제</button>
+        </div>
+
+        <div id="candidatesList" style="max-height:480px; overflow-y:auto; border:1px solid #E5E7EB; border-radius:6px;"></div>
+
+        <!-- 일괄 적용 영역 — 사본의 실제 셀을 AI 제안으로 갱신 -->
+        <div style="margin-top:14px; padding:12px 14px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:8px;">
+          <div style="font-size:13px; font-weight:600; color:#3730A3; margin-bottom:6px;">
+            📦 일괄 적용 — 체크된 수정 후보 전부에 AI 제안 + 사본 셀 갱신
+          </div>
+          <div style="font-size:11px; color:#4B5563; margin-bottom:10px; line-height:1.6;">
+            각 후보마다 AI 가 수정안을 만들고 <strong>사본 시트의 셀을 실제로 갱신</strong>합니다.<br>
+            건당 약 5초 소요. 이미 TC Edit Log 에 있는 항목은 자동 skip 됩니다.<br>
+            <em>개별로 검토하면서 "이 TC 만 사본에 적용" 으로도 하나씩 적용 가능합니다.</em>
+          </div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="applyBulkBtn" onclick="applyBulk()" style="flex:0 0 auto;">
+              📦 선택 항목 일괄 적용 (AI 호출 + 사본 셀 갱신)
+            </button>
+            <span id="applyStatus" style="flex:1; font-size:12px; color:#4B5563;">
+              적용 후 사본 'TC Edit Log' 시트에 이력 기록 + 사본 셀에 실제 반영됩니다.
+            </span>
+          </div>
+          <div id="applyBulkProgress" class="hidden" style="margin-top:10px;"></div>
+        </div>
+
+        <!-- 3단계: 사본 → 원본 적용 (별도 영역, 시각적 구분) -->
+        <div style="margin-top:24px; padding:14px 16px; background:linear-gradient(135deg, #FEF2F2 0%, #FEE2E2 100%); border:2px solid #DC2626; border-radius:10px;">
+          <div style="font-size:14px; font-weight:700; color:#991B1B; margin-bottom:6px;">
+            ⚠️ 3단계 — 사본 → 원본 적용 (실제 갱신)
+          </div>
+          <div style="font-size:12px; color:#7F1D1D; margin-bottom:12px; line-height:1.6;">
+            지금까지는 모두 <strong>사본</strong> 에서 작업했습니다. 검토가 끝났다면 사본의 변경을 <strong>원본 Sheets 에 반영</strong> 합니다.<br>
+            원본은 자동으로 <strong>백업</strong> 되며, 적용 후 <strong>롤백</strong> 가능합니다.
+          </div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <button class="btn" id="promoteBtn" onclick="startPromote()" style="background:#DC2626; color:#FFF; border:none; font-weight:600;">
+              ✏️ 원본에 반영 (미리보기 → 확인 → 적용)
+            </button>
+            <button class="btn" id="rollbackBtn" onclick="startRollback()" style="background:#FFF; color:#991B1B; border:1px solid #DC2626; display:none;">
+              🔄 마지막 적용 롤백
+            </button>
+            <span id="promoteStatus" style="flex:1; font-size:11px; color:#7F1D1D;"></span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- Promote 미리보기 모달 -->
+  <div id="promoteModal" class="hidden" style="position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; padding:20px;">
+    <div style="background:#FFF; border-radius:12px; max-width:880px; width:100%; max-height:88vh; display:flex; flex-direction:column; overflow:hidden;">
+      <div style="padding:18px 22px; border-bottom:1px solid #E5E7EB; display:flex; align-items:center; justify-content:space-between;">
+        <div style="font-size:16px; font-weight:700; color:#991B1B;">⚠️ 원본 Sheets 갱신 — 미리보기</div>
+        <button onclick="closePromoteModal()" style="background:none; border:none; cursor:pointer; font-size:22px; color:#6B7280;">×</button>
+      </div>
+      <div id="promoteModalBody" style="padding:18px 22px; overflow-y:auto; flex:1;"></div>
+      <div style="padding:14px 22px; border-top:1px solid #E5E7EB; display:flex; gap:10px; align-items:center; justify-content:flex-end;">
+        <button class="btn" onclick="closePromoteModal()" style="background:#F3F4F6;">취소</button>
+        <button class="btn btn-primary" id="promoteConfirmBtn" onclick="confirmPromote()" style="background:#DC2626; color:#FFF; border:none; font-weight:600;" disabled>
+          ✏️ 원본에 적용 (백업 + 갱신)
+        </button>
       </div>
     </div>
   </div>
@@ -10788,10 +14099,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <span>🔍 분류표 검토 <span class="badge">Step 3 · Human Gate</span></span>
       <span style="display:flex;gap:6px;flex-wrap:wrap;">
         <button type="button" onclick="restartFromScratch()"
-                style="padding:6px 12px;font-size:12px;background:#F1F5F9;color:#1F2937;border:1px solid #94A3B8;border-radius:6px;cursor:pointer;font-weight:500;">
-          ← 처음으로 (입력 변경)
+                title="입력 필드 값은 그대로 유지 + Step 1 화면으로 복귀 (TC 생성 범위 등 변경 가능)"
+                style="padding:6px 12px;font-size:12px;background:#FEF3C7;color:#78350F;border:1px solid #FBBF24;border-radius:6px;cursor:pointer;font-weight:600;">
+          ← 입력 화면으로 (값 유지)
         </button>
       </span>
+    </div>
+    <!-- 통합 네비게이션 — 평시: 입력 변경 안내 / 중단 후: 처음부터/이어서 -->
+    <div id="gateNavBox" style="margin:0 0 10px 0; padding:10px 14px; background:#FEF3C7; border:1px dashed #FBBF24; border-radius:6px; font-size:12px; color:#78350F; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <div id="gateNavMsg" style="flex:1; min-width:240px;">
+        💡 <strong>분류표를 다시 만들고 싶나요?</strong><br>
+        <span style="font-size:11px;">예: TC 생성 범위 추가/수정 — 입력값은 그대로 보존됩니다.</span>
+      </div>
+      <div id="gateNavButtons" style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
+        <button type="button" onclick="restartFromScratch()"
+                style="padding:8px 16px; font-size:13px; background:#F59E0B; color:#FFF; border:none; border-radius:6px; cursor:pointer; font-weight:600;">
+          ← 입력 화면으로 (값 유지)
+        </button>
+      </div>
     </div>
     <div class="info-box" id="gateInfoBox">
       AI가 생성한 분류표입니다. 하단 AI 도우미로 수정을 요청하고, 아래 표에서 결과를 확인한 뒤 승인하세요.
@@ -11137,10 +14462,13 @@ async function loadDashProjects() {
 async function onProjectDropdownChange() {
   const name = document.getElementById('projectDropdown').value;
   projectResumeState = null;
+  // TC Update history 도 새 프로젝트 기준으로 다시 로드
+  _updateRecentLoaded = '';
+  if (typeof loadUpdateRecent === 'function') loadUpdateRecent();
 
   // ── UI 전체 초기화 ──
   // SSE 연결 종료
-  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
   currentSid = null;
   currentFilename = null;
   stopCountdown();
@@ -11198,7 +14526,7 @@ async function onProjectDropdownChange() {
   window._previousFocusArea = '';
 
   // SSE 연결 끊기 + 세션 참조 리셋
-  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
   currentSid = null;
   currentFilename = null;
   stopCountdown();
@@ -11355,13 +14683,63 @@ async function retryPipeline() {
   }
 }
 
+function isPipelineRunning() {
+  // 파이프라인이 진행 중인지 (SSE 연결 살아있고 + currentSid 있음)
+  return !!(eventSource && currentSid);
+}
+
 function restartFromScratch() {
-  document.querySelectorAll('.error-banner').forEach(el => el.remove());
+  // 진행 중 가드 — 사용자에게 명확히 알림 + 강제 종료 방지
+  if (isPipelineRunning()) {
+    alert('⚠️ 파이프라인이 진행 중입니다.\\n\\n'
+      + '먼저 진행 중인 작업을 완료하거나 [■ 파이프라인 중단] 버튼으로 중단하세요.\\n\\n'
+      + '입력 화면으로 돌아가면 화면은 바뀌지만 백엔드 작업은 계속 진행되어 결과 충돌이 발생할 수 있습니다.');
+    return;
+  }
+  document.querySelectorAll('.error-banner, .stopped-banner').forEach(el => el.remove());
   document.getElementById('card1').classList.remove('hidden');
   document.getElementById('card2').classList.add('hidden');
+  document.getElementById('card3').classList.add('hidden');
   document.getElementById('startBtn').disabled = false;
   setStepBar(1);
+  // gateNavBox 평시 상태로 reset (다음에 Step 3 진입 시 깨끗하게)
+  resetGateNavBox();
   showToast('소스를 확인하고 파이프라인을 다시 시작하세요.');
+}
+
+function resetGateNavBox() {
+  const box = document.getElementById('gateNavBox');
+  const msg = document.getElementById('gateNavMsg');
+  const btns = document.getElementById('gateNavButtons');
+  if (!box || !msg || !btns) return;
+  box.style.background = '#FEF3C7';
+  box.style.borderColor = '#FBBF24';
+  box.style.borderStyle = 'dashed';
+  msg.style.color = '#78350F';
+  msg.innerHTML = '💡 <strong>분류표를 다시 만들고 싶나요?</strong><br>'
+    + '<span style="font-size:11px;">예: TC 생성 범위 추가/수정 — 입력값은 그대로 보존됩니다.</span>';
+  btns.innerHTML = ''
+    + '<button type="button" onclick="restartFromScratch()" '
+    +   'style="padding:8px 16px; font-size:13px; background:#F59E0B; color:#FFF; border:none; border-radius:6px; cursor:pointer; font-weight:600;">'
+    +   '← 입력 화면으로 (값 유지)'
+    + '</button>';
+}
+
+// 진행 중 상태에 따라 '입력 화면으로' 버튼 시각 갱신 — 회색 + 안내 툴팁
+function updateRestartButtonState() {
+  const buttons = document.querySelectorAll('button[onclick="restartFromScratch()"]');
+  const running = isPipelineRunning();
+  buttons.forEach(function(btn) {
+    if (running) {
+      btn.style.opacity = '0.4';
+      btn.style.cursor = 'not-allowed';
+      btn.title = '⚠️ 파이프라인 진행 중 — 중단 후 사용 가능';
+    } else {
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+      btn.title = '입력 필드 값은 그대로 유지 + Step 1 화면으로 복귀';
+    }
+  });
 }
 
 function startNextIteration(focusOnly) {
@@ -11389,7 +14767,7 @@ function startNextIteration(focusOnly) {
   document.getElementById('startBtn').disabled = false;
   setStepBar(1);
   stopCountdown();
-  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
   // 범위만 변경 모드: 포커스 입력란으로 스크롤
   if (focusOnly) {
     document.getElementById('focusArea').focus();
@@ -11475,6 +14853,16 @@ async function createDashProject() {
 // 페이지 로드 시 프로젝트 목록 불러오기
 setTimeout(loadDashProjects, 100);
 
+// 페이지 로드 시 modify 패널이 이미 보이는 상태면 history 도 같이 로드
+// (프로젝트 목록 로딩 끝나기까지 약간 여유를 줘서 500ms 후)
+setTimeout(function() {
+  const panelMod = document.getElementById('panelModify');
+  if (panelMod && !panelMod.classList.contains('hidden')) {
+    _updateRecentLoaded = '';
+    loadUpdateRecent();
+  }
+}, 500);
+
 // ── 모드 전환 ──────────────────────────────────────────────────────────────────
 function switchMode(mode) {
   currentMode = mode;
@@ -11485,8 +14873,262 @@ function switchMode(mode) {
   if (mode === 'modify') {
     loadProjects();
     initTcDropzone();
+    _updateRecentLoaded = '';  // 모드 진입 시 캐시 무시하고 강제 재로드
+    loadUpdateConfig();  // 설정 라벨 갱신 (폴더 이름 표시)
+    loadUpdateRecent();
   }
 }
+
+// ── TC Update 직전 작업 불러오기 ──────────────────────────────────────────
+let _updateRecentLoaded = '';
+
+// ── TC Update 설정 (Drive 폴더 ID 등) ────────────────────────────────────
+async function loadUpdateConfig() {
+  try {
+    const r = await fetch('/update/config');
+    const d = await r.json();
+    const labelEl = document.getElementById('configFolderName');
+    if (!labelEl) return;
+    if (d.drive_folder_id && d.drive_folder_name) {
+      labelEl.textContent = '· ' + d.drive_folder_name;
+      labelEl.style.color = '#166534';
+    } else if (d.drive_folder_id) {
+      labelEl.textContent = '· (폴더 지정됨)';
+      labelEl.style.color = '#6B7280';
+    } else {
+      labelEl.textContent = '· 폴더 미지정';
+      labelEl.style.color = '#DC2626';
+    }
+  } catch (e) {
+    // 무시
+  }
+}
+
+async function openConfigModal() {
+  document.getElementById('configModal').classList.remove('hidden');
+  document.getElementById('configMsg').textContent = '';
+  const infoEl = document.getElementById('configCurrentInfo');
+  const urlInput = document.getElementById('configFolderUrl');
+  infoEl.innerHTML = '⏳ 현재 설정 확인 중...';
+  try {
+    const r = await fetch('/update/config');
+    const d = await r.json();
+    if (d.drive_folder_id) {
+      urlInput.value = d.drive_folder_url || '';
+      infoEl.innerHTML = '✅ 현재 폴더: <strong>' + escapeHtml(d.drive_folder_name || '(이름 조회 불가)') + '</strong><br>'
+        + '<span style="font-family:monospace; font-size:11px;">ID: ' + escapeHtml(d.drive_folder_id) + '</span>';
+    } else {
+      urlInput.value = '';
+      infoEl.innerHTML = '⚠️ 폴더 미지정 — 사본이 Drive 루트에 만들어집니다 (orphan).';
+      infoEl.style.background = '#FEF3C7';
+      infoEl.style.borderColor = '#FBBF24';
+      infoEl.style.color = '#78350F';
+    }
+  } catch (e) {
+    infoEl.innerHTML = '<span style="color:#DC2626;">설정 조회 실패: ' + escapeHtml(e.message) + '</span>';
+  }
+}
+
+function closeConfigModal() {
+  document.getElementById('configModal').classList.add('hidden');
+}
+
+async function saveConfig() {
+  const url = document.getElementById('configFolderUrl').value.trim();
+  const msgEl = document.getElementById('configMsg');
+  const btn = document.getElementById('configSaveBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 저장 중...';
+  msgEl.innerHTML = '';
+  try {
+    const r = await fetch('/update/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ drive_folder_url: url }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      msgEl.innerHTML = '<span style="color:#DC2626;">❌ ' + escapeHtml(d.error || '오류') + '</span>';
+      return;
+    }
+    if (d.cleared) {
+      msgEl.innerHTML = '<span style="color:#166534;">✅ 폴더 지정 제거됨 — 다음 사본부터 Drive 루트에 생성됩니다.</span>';
+    } else {
+      msgEl.innerHTML = '<span style="color:#166534;">✅ 저장 완료 — 폴더: <strong>' + escapeHtml(d.drive_folder_name || '(이름 없음)') + '</strong></span>';
+    }
+    // 버튼 옆 라벨 갱신
+    await loadUpdateConfig();
+    // 잠깐 후 자동 닫기
+    setTimeout(closeConfigModal, 1200);
+  } catch (e) {
+    msgEl.innerHTML = '<span style="color:#DC2626;">❌ ' + escapeHtml(e.message) + '</span>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '💾 저장';
+  }
+}
+
+async function clearConfig() {
+  if (!confirm('Drive 폴더 지정을 제거할까요?\\n\\n이후 만들어지는 사본은 Drive 루트 (orphan) 에 생성됩니다.')) {
+    return;
+  }
+  document.getElementById('configFolderUrl').value = '';
+  await saveConfig();
+}
+
+async function loadUpdateRecent() {
+  // 활성 select 찾기 — projectDropdown (현재) 또는 projectSelect (레거시)
+  const projSelect = document.getElementById('projectDropdown')
+                       || document.getElementById('projectSelect');
+  const project = projSelect ? (projSelect.value || '').trim() : '';
+  const area = document.getElementById('updateRecentArea');
+  const countEl = document.getElementById('updateRecentCount');
+  if (!area) return;
+
+  if (!project) {
+    area.style.display = 'none';
+    _updateRecentLoaded = '';
+    window._updateRecentCache = [];
+    return;
+  }
+  if (_updateRecentLoaded === project) return;  // 같은 프로젝트면 재로드 skip
+  _updateRecentLoaded = project;
+
+  try {
+    const r = await fetch('/update/history?project=' + encodeURIComponent(project));
+    const d = await r.json();
+    const hist = (d && d.history) || [];
+    window._updateRecentCache = hist;
+    if (!hist.length) {
+      area.style.display = 'none';
+      return;
+    }
+    area.style.display = 'inline-block';
+    if (countEl) countEl.textContent = String(hist.length);
+  } catch (e) {
+    area.style.display = 'none';
+  }
+}
+
+function toggleUpdateRecent() {
+  const list = document.getElementById('updateRecentList');
+  const chev = document.getElementById('updateRecentChevron');
+  if (!list) return;
+  const open = list.style.display !== 'none';
+  if (open) {
+    list.style.display = 'none';
+    if (chev) chev.textContent = '▾';
+    return;
+  }
+  // 펼치기 — 그 시점에 항상 신선한 데이터로 렌더
+  const hist = window._updateRecentCache || [];
+  if (!hist.length) {
+    list.innerHTML = '<div style="padding:14px; font-size:12px; color:#6B7280; text-align:center;">저장된 작업 이력이 없습니다.</div>';
+  } else {
+    list.innerHTML = hist.map(function(h, i) {
+      const prevShort = escapeHtml((h.prev_folder || '').split('/').slice(-2).join('/'));
+      const newShort = escapeHtml((h.new_folder || '').split('/').slice(-2).join('/'));
+      const sheetShort = (h.existing_tc_url || '').replace(/^https?:\/\/docs\.google\.com\/spreadsheets\/d\//, '').slice(0, 24) + '…';
+      return ''
+        + '<div class="recent-row" style="padding:10px 14px; border-bottom:1px solid #F3F4F6; display:flex; align-items:center; gap:10px;">'
+        +   '<div style="flex:1; min-width:0; cursor:pointer;" onclick="applyUpdateRecent(' + i + ')">'
+        +     '<div style="font-size:13px; font-weight:600; color:#111827;">' + escapeHtml(h.label || '?') + '</div>'
+        +     '<div style="font-size:10px; color:#6B7280; margin-top:3px; font-family:monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">'
+        +       '📁 …/' + prevShort + ' → …/' + newShort
+        +     '</div>'
+        +     '<div style="font-size:10px; color:#9CA3AF; margin-top:2px;">📑 ' + escapeHtml(sheetShort) + ' · ' + escapeHtml(h.saved_at || '') + '</div>'
+        +   '</div>'
+        +   '<button type="button" onclick="applyUpdateRecent(' + i + ')" '
+        +     'style="flex:0 0 auto; font-size:11px; padding:5px 10px; background:#EEF2FF; color:#3730A3; border:1px solid #C7D2FE; border-radius:4px; cursor:pointer; font-weight:600;">'
+        +     '↻ 불러오기</button>'
+        +   '<button type="button" onclick="deleteUpdateRecent(event, ' + i + ')" '
+        +     'title="이 이력 삭제" '
+        +     'style="flex:0 0 auto; font-size:13px; padding:5px 9px; background:#FFF; color:#991B1B; border:1px solid #FCA5A5; border-radius:4px; cursor:pointer; line-height:1;">'
+        +     '✕</button>'
+        + '</div>';
+    }).join('');
+  }
+  list.style.display = 'block';
+  if (chev) chev.textContent = '▴';
+}
+
+function applyUpdateRecent(idx) {
+  const hist = window._updateRecentCache || [];
+  const h = hist[idx];
+  if (!h) return;
+  document.getElementById('updatePrevFolder').value = h.prev_folder || '';
+  document.getElementById('updateNewFolder').value = h.new_folder || '';
+  document.getElementById('updateTcUrl').value = h.existing_tc_url || '';
+  // 드롭다운 닫기
+  document.getElementById('updateRecentList').style.display = 'none';
+  const chev = document.getElementById('updateRecentChevron');
+  if (chev) chev.textContent = '▾';
+  if (typeof showToast === 'function') {
+    showToast('✅ 불러옴: ' + (h.label || '?'));
+  }
+}
+
+async function deleteUpdateRecent(ev, idx) {
+  if (ev && ev.stopPropagation) ev.stopPropagation();
+  const hist = window._updateRecentCache || [];
+  const h = hist[idx];
+  if (!h) return;
+  if (!confirm('이 이력을 삭제할까요?\\n\\n' + (h.label || '?') + ' (' + (h.saved_at || '') + ')\\n\\n원본 Sheets 와 spec 폴더는 영향 없음.')) {
+    return;
+  }
+  const projSelect = document.getElementById('projectDropdown')
+                       || document.getElementById('projectSelect');
+  const project = projSelect ? (projSelect.value || '').trim() : '';
+  if (!project) {
+    alert('프로젝트를 먼저 선택하세요.');
+    return;
+  }
+  try {
+    const r = await fetch('/update/history/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: project, index: idx }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      alert('삭제 실패: ' + (d.error || '오류'));
+      return;
+    }
+    // 캐시 갱신 + 드롭다운 다시 그림
+    window._updateRecentCache = d.history || [];
+    _updateRecentLoaded = '';  // 다음 toggle 에서 강제 재로드
+    const countEl = document.getElementById('updateRecentCount');
+    if (countEl) countEl.textContent = String((d.history || []).length);
+    // 0개면 드롭다운 + 버튼 자체 숨김
+    if (!(d.history || []).length) {
+      document.getElementById('updateRecentList').style.display = 'none';
+      const area = document.getElementById('updateRecentArea');
+      if (area) area.style.display = 'none';
+    } else {
+      // 다시 렌더 — toggleUpdateRecent 를 강제로 다시 호출 (열린 상태 유지)
+      const list = document.getElementById('updateRecentList');
+      list.style.display = 'none';
+      toggleUpdateRecent();
+    }
+    if (typeof showToast === 'function') {
+      showToast('🗑 삭제됨: ' + (h.label || '?'));
+    }
+  } catch (e) {
+    alert('네트워크 오류: ' + e.message);
+  }
+}
+
+// 외부 클릭 시 드롭다운 닫기
+document.addEventListener('click', function(e) {
+  const area = document.getElementById('updateRecentArea');
+  const list = document.getElementById('updateRecentList');
+  if (!area || !list || list.style.display === 'none') return;
+  if (!area.contains(e.target)) {
+    list.style.display = 'none';
+    const chev = document.getElementById('updateRecentChevron');
+    if (chev) chev.textContent = '▾';
+  }
+});
 
 // 샘플 기획서 불러오기 — 직접 입력 모드로 전환 후 textarea 채우기
 // 간단한 토스트 메시지
@@ -11513,19 +15155,12 @@ async function loadProjects() {
     // 빈 이름 유령 레코드 제거 (최종 프론트엔드 방어선)
     projects = Array.isArray(raw) ? raw.filter(p => p && (p.name || '').trim()) : [];
     const sel = document.getElementById('projectSelect');
-    const selMod = document.getElementById('modifyProjectSelect');
     sel.innerHTML = '<option value="">— 프로젝트를 선택하세요 —</option>';
-    if (selMod) selMod.innerHTML = '<option value="">— 단발성 작업 (프로젝트 없음) —</option>';
     projects.forEach(p => {
       const label = p.name + ' (' + (p.updated_at || '신규') + ')';
       const opt = document.createElement('option');
       opt.value = p.name; opt.textContent = label;
       sel.appendChild(opt);
-      if (selMod) {
-        const opt2 = document.createElement('option');
-        opt2.value = p.name; opt2.textContent = label;
-        selMod.appendChild(opt2);
-      }
     });
     if (projects.length === 0) {
       const opt = document.createElement('option');
@@ -11543,6 +15178,11 @@ function onProjectSelect() {
   const name = document.getElementById('projectSelect').value;
   const card = document.getElementById('projectCard');
   const deleteBtn = document.getElementById('btnDeleteProject');
+  // TC 수정 모드면 history 다시 로드 (선택 변경 시)
+  if (currentMode === 'modify') {
+    _updateRecentLoaded = '';  // 강제 재로드
+    loadUpdateRecent();
+  }
   if (!name) { card.classList.remove('visible'); deleteBtn.style.display = 'none'; return; }
   const proj = projects.find(p => p.name === name);
   if (!proj) return;
@@ -11755,7 +15395,7 @@ async function startDiffAnalyze() {
     alert('이전 기획서와 새 기획서를 모두 업로드하세요.');
     return;
   }
-  const projectName = document.getElementById('modifyProjectSelect').value || '';
+  const projectName = (document.getElementById('projectDropdown') || document.getElementById('projectSelect') || {}).value || '';
   const btn = document.getElementById('startDiffBtn');
   btn.disabled = true;
   btn.textContent = '⏳ 분석 중...';
@@ -11933,6 +15573,1716 @@ function cancelDiff() {
   document.getElementById('diffReportArea').classList.add('hidden');
   _diffSid = null;
   _diffReport = null;
+}
+
+// ──────────────────────────────────────────────────────────
+// v0.11.x — 스마트 분석 (그룹별 진행 + 캐시 + 사용자 통제)
+// ──────────────────────────────────────────────────────────
+let _smartPlan = null;            // 사전 견적 결과
+let _smartCurrentIndex = 0;        // 현재 진행 그룹 index
+let _smartResults = [];            // 누적된 summary 배열
+let _smartStopped = false;
+
+async function startSmartAnalyze() {
+  const prevFolder = document.getElementById('updatePrevFolder').value.trim();
+  const newFolder = document.getElementById('updateNewFolder').value.trim();
+  if (!prevFolder || !newFolder) {
+    alert('이전 기획서 폴더와 새 기획서 폴더 경로 모두 입력하세요.');
+    return;
+  }
+
+  // 다른 영역 숨기기
+  document.getElementById('diffReportArea').classList.add('hidden');
+  document.getElementById('smartProgressArea').classList.add('hidden');
+  document.getElementById('smartFinalArea').classList.add('hidden');
+
+  const planArea = document.getElementById('smartPlanArea');
+  const statsEl = document.getElementById('smartPlanStats');
+  const groupsEl = document.getElementById('smartPlanGroups');
+  planArea.classList.remove('hidden');
+  statsEl.innerHTML = '<em style="color:#6B7280;">⏳ 견적 산출 중... (AI 없음, 즉시)</em>';
+  groupsEl.innerHTML = '';
+
+  try {
+    const r = await fetch('/update/analyze-plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prev_folder: prevFolder, new_folder: newFolder }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      statsEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (d.error || '오류') + '</span>';
+      return;
+    }
+    _smartPlan = d;
+    _smartCurrentIndex = 0;
+    _smartResults = [];
+    _smartStopped = false;
+    renderSmartPlan(d);
+  } catch (e) {
+    statsEl.innerHTML = '<span style="color:#DC2626;">❌ 네트워크 오류: ' + e.message + '</span>';
+  }
+}
+
+function renderSmartPlan(d) {
+  const statsEl = document.getElementById('smartPlanStats');
+  const groupsEl = document.getElementById('smartPlanGroups');
+  const s = d.scr_diff_stats || {};
+  const scrs = d.scrs || [];
+  const cachedScrs = d.cached_scrs || [];
+
+  statsEl.innerHTML =
+    '<div style="display:flex; gap:10px; flex-wrap:wrap; font-size:12px;">' +
+    '<span style="background:#DCFCE7; color:#166534; padding:4px 10px; border-radius:4px;">🆕 신규 SCR ' + s.added + '</span>' +
+    '<span style="background:#FEF3C7; color:#92400E; padding:4px 10px; border-radius:4px;">✏️ 수정 SCR ' + s.modified + '</span>' +
+    '<span style="background:#FEE2E2; color:#991B1B; padding:4px 10px; border-radius:4px;">🗑️ 삭제 SCR ' + s.removed + '</span>' +
+    '<span style="background:#F3F4F6; color:#374151; padding:4px 10px; border-radius:4px;">⚪ 동일 ' + s.unchanged + '</span>' +
+    '</div>' +
+    '<div style="margin-top:8px; font-size:12px; color:#374151;">' +
+    '📋 <strong>' + scrs.length + '개 SCR 변경</strong> · 💾 캐시 ' + cachedScrs.length +
+    ' · ⏱ 예상 ' + Math.max(1, Math.ceil((scrs.length - cachedScrs.length) * 5 / 60)) + '~' +
+    Math.max(1, Math.ceil((scrs.length - cachedScrs.length) * 10 / 60)) + '분 (선택한 SCR 기준)' +
+    '</div>';
+
+  // 종류별 정렬 — added → modified → removed (백엔드가 이미 그 순서로 보냄)
+  // 타입별 일괄 토글 + 전체 체크박스
+  const byType = { added: [], modified: [], removed: [] };
+  scrs.forEach(function(s) { (byType[s.type] || []).push(s); });
+
+  const icon = { added: '🆕', modified: '✏️', removed: '🗑️' };
+  const typeLabel = { added: '신규 SCR', modified: '수정 SCR', removed: '삭제 SCR' };
+  const bg = { added: '#F0FDF4', modified: '#FFFBEB', removed: '#FEF2F2' };
+  const border = { added: '#BBF7D0', modified: '#FDE68A', removed: '#FCA5A5' };
+
+  let html = '';
+  // 전체 토글
+  html += '<div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid #E5E7EB;">'
+    +   '<label style="font-size:12px; font-weight:600; cursor:pointer;"><input type="checkbox" id="scrSelectAll" onchange="toggleAllScrs(this.checked)" checked> 전체 선택</label>'
+    +   '<span style="font-size:11px; color:#6B7280;">— 분석할 SCR 만 체크하세요 (캐시된 SCR 은 즉시 결과)</span>'
+    + '</div>';
+
+  ['added', 'modified', 'removed'].forEach(function(t) {
+    const list = byType[t];
+    if (!list.length) return;
+    // 신규 (added) 타입은 헤더에 "신규 TC 생성 모드로 이동" 버튼 추가
+    const newTcBtn = t === 'added'
+      ? '<button type="button" onclick="goToNewTcForAddedScrs()" '
+        + 'style="margin-left:auto; font-size:11px; padding:4px 10px; background:#F0FDF4; color:#166534; border:1px solid #86EFAC; border-radius:4px; cursor:pointer; font-weight:600;">'
+        + '✨ 신규 TC 생성 모드로 이동 →'
+        + '</button>'
+      : '';
+    html += '<div style="margin-bottom:14px;">'
+      + '<div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">'
+      +   '<label style="font-size:12px; font-weight:600; cursor:pointer;">'
+      +     '<input type="checkbox" class="scr-type-all" data-type="' + t + '" checked>'
+      +     ' ' + icon[t] + ' ' + typeLabel[t] + ' (' + list.length + '개)'
+      +   '</label>'
+      +   newTcBtn
+      + '</div>'
+      + '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:6px;">';
+    list.forEach(function(s) {
+      const cacheTag = s.from_cache
+        ? '<span style="background:#DBEAFE; color:#1E40AF; padding:0 4px; border-radius:3px; font-size:9px; margin-left:4px;">💾</span>'
+        : '';
+      html += '<label class="scr-check-row" style="display:flex; align-items:center; gap:6px; padding:5px 8px; background:' + bg[t] + '; border:1px solid ' + border[t] + '; border-radius:4px; cursor:pointer; font-size:12px;">'
+        + '<input type="checkbox" class="scr-chk" data-scr="' + escapeHtml(s.scr_id) + '" data-type="' + t + '" checked>'
+        + '<span style="font-family:monospace;">' + escapeHtml(s.scr_id) + '</span>'
+        + cacheTag
+        + '</label>';
+    });
+    html += '</div></div>';
+  });
+
+  groupsEl.innerHTML = html;
+  updateStartButtonLabel();
+
+  // 체크박스 변화 시 시작 버튼 라벨 갱신
+  document.querySelectorAll('.scr-chk').forEach(function(cb) {
+    cb.addEventListener('change', function() {
+      updateStartButtonLabel();
+      syncTypeCheckbox(cb.dataset.type);
+      syncSelectAllCheckbox();
+    });
+  });
+  // 타입별 일괄 토글
+  document.querySelectorAll('.scr-type-all').forEach(function(cb) {
+    cb.addEventListener('change', function() {
+      toggleTypeScrs(cb.dataset.type, cb.checked);
+    });
+  });
+}
+
+function toggleAllScrs(checked) {
+  document.querySelectorAll('.scr-chk').forEach(function(cb) { cb.checked = checked; });
+  document.querySelectorAll('.scr-type-all').forEach(function(cb) { cb.checked = checked; });
+  updateStartButtonLabel();
+}
+
+function toggleTypeScrs(type, checked) {
+  document.querySelectorAll('.scr-chk[data-type="' + type + '"]').forEach(function(cb) {
+    cb.checked = checked;
+  });
+  updateStartButtonLabel();
+  syncSelectAllCheckbox();
+}
+
+function syncTypeCheckbox(type) {
+  const all = document.querySelectorAll('.scr-chk[data-type="' + type + '"]');
+  const checked = document.querySelectorAll('.scr-chk[data-type="' + type + '"]:checked');
+  const typeCb = document.querySelector('.scr-type-all[data-type="' + type + '"]');
+  if (typeCb) typeCb.checked = all.length === checked.length;
+}
+
+function syncSelectAllCheckbox() {
+  const all = document.querySelectorAll('.scr-chk');
+  const checked = document.querySelectorAll('.scr-chk:checked');
+  const allCb = document.getElementById('scrSelectAll');
+  if (allCb) allCb.checked = all.length === checked.length;
+}
+
+function getSelectedScrs() {
+  return Array.from(document.querySelectorAll('.scr-chk:checked'))
+    .map(function(cb) { return cb.dataset.scr; });
+}
+
+function updateStartButtonLabel() {
+  const btn = document.getElementById('startGroupAnalysisBtn');
+  if (!btn) return;
+  const n = getSelectedScrs().length;
+  if (n === 0) {
+    btn.textContent = '⚠ SCR 을 선택하세요';
+    btn.disabled = true;
+  } else {
+    btn.textContent = '▶ 선택한 ' + n + '개 SCR 분석 시작';
+    btn.disabled = false;
+  }
+}
+
+function cancelSmartPlan() {
+  document.getElementById('smartPlanArea').classList.add('hidden');
+  _smartPlan = null;
+}
+
+// 선택된 SCR 리스트 (사용자가 체크박스로 고른 것)
+let _selectedScrs = [];
+
+async function startGroupAnalysis() {
+  if (!_smartPlan) return;
+  const selected = getSelectedScrs();
+  if (selected.length === 0) {
+    alert('분석할 SCR 을 하나 이상 선택하세요.');
+    return;
+  }
+  _selectedScrs = selected;
+  _smartResults = [];
+  _smartCurrentIndex = 0;
+  _smartStopped = false;
+  document.getElementById('smartPlanArea').classList.add('hidden');
+  document.getElementById('smartProgressArea').classList.remove('hidden');
+  document.getElementById('smartCurrentResult').innerHTML = '';
+  await runScr(0);
+}
+
+async function runScr(idx) {
+  if (!_selectedScrs || idx >= _selectedScrs.length) {
+    showFinalSummary();
+    return;
+  }
+  _smartCurrentIndex = idx;
+  _smartStopped = false;
+
+  renderProgressList();
+  const resultEl = document.getElementById('smartCurrentResult');
+  const actionEl = document.getElementById('smartActionRow');
+  const scrId = _selectedScrs[idx];
+  resultEl.innerHTML = '<em style="color:#6B7280;">⏳ ' + escapeHtml(scrId) + ' 분석 중 ('
+    + (idx + 1) + '/' + _selectedScrs.length + ')...</em>';
+  actionEl.innerHTML = '';
+
+  const prevFolder = document.getElementById('updatePrevFolder').value.trim();
+  const newFolder = document.getElementById('updateNewFolder').value.trim();
+
+  try {
+    const r = await fetch('/update/analyze-scr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prev_folder: prevFolder,
+        new_folder: newFolder,
+        scr_id: scrId,
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      resultEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (d.error || '오류') + '</span>';
+      renderActionRow(idx, idx + 1 >= _selectedScrs.length);
+      return;
+    }
+    _smartResults[idx] = {
+      scr_id: d.scr_id,
+      change_type: d.change_type,
+      summary: d.summary,
+      from_cache: d.from_cache,
+      cached_at: d.cached_at,
+      skipped: false,
+    };
+    const cacheTag = d.from_cache
+      ? '<span style="background:#DBEAFE; color:#1E40AF; padding:1px 8px; border-radius:4px; font-size:10px; margin-left:6px;">💾 캐시 ' + escapeHtml(d.cached_at || '') + '</span>'
+      : '<span style="background:#DCFCE7; color:#166534; padding:1px 8px; border-radius:4px; font-size:10px; margin-left:6px;">✨ 새 분석</span>';
+    const typeIcon = { added: '🆕', modified: '✏️', removed: '🗑️' }[d.change_type] || '·';
+    resultEl.innerHTML = '<div style="margin-bottom:8px;">'
+      + '<strong>' + (idx + 1) + ' / ' + _selectedScrs.length + ' · ' + typeIcon + ' '
+      + escapeHtml(d.scr_id) + '</strong>' + cacheTag + '</div>'
+      + renderMarkdownBasic(d.summary || '(요약 없음)');
+    renderProgressList();
+    const isLast = (idx + 1) >= _selectedScrs.length;
+    renderActionRow(idx, isLast);
+  } catch (e) {
+    resultEl.innerHTML = '<span style="color:#DC2626;">❌ 네트워크 오류: ' + e.message + '</span>';
+    renderActionRow(idx, idx + 1 >= _selectedScrs.length);
+  }
+}
+
+function renderProgressList() {
+  const listEl = document.getElementById('smartProgressList');
+  if (!_selectedScrs || !_selectedScrs.length) { listEl.innerHTML = ''; return; }
+  const total = _selectedScrs.length;
+  let html = '<div style="display:flex; gap:4px; flex-wrap:wrap;">';
+  for (let i = 0; i < total; i++) {
+    const r = _smartResults[i];
+    let state, bg, color;
+    if (i < _smartCurrentIndex) {
+      if (r && r.skipped) { state = '⏭'; bg = '#F3F4F6'; color = '#6B7280'; }
+      else if (r && r.from_cache) { state = '💾'; bg = '#DBEAFE'; color = '#1E40AF'; }
+      else if (r) { state = '✅'; bg = '#DCFCE7'; color = '#166534'; }
+      else { state = '?'; bg = '#F3F4F6'; color = '#6B7280'; }
+    } else if (i === _smartCurrentIndex) {
+      if (r) {
+        if (r.skipped) { state = '⏭'; bg = '#F3F4F6'; color = '#6B7280'; }
+        else if (r.from_cache) { state = '💾'; bg = '#DBEAFE'; color = '#1E40AF'; }
+        else { state = '✅'; bg = '#DCFCE7'; color = '#166534'; }
+      } else {
+        state = '⏳'; bg = '#FEF3C7'; color = '#92400E';
+      }
+    } else {
+      state = '⏸'; bg = '#F9FAFB'; color = '#9CA3AF';
+    }
+    const scr = _selectedScrs[i];
+    html += '<span style="background:' + bg + '; color:' + color + '; padding:3px 8px; border-radius:4px; font-size:10px; font-family:monospace;">'
+      + state + ' ' + escapeHtml(scr) + '</span>';
+  }
+  html += '</div>';
+  listEl.innerHTML = html;
+}
+
+function renderActionRow(idx, isLast) {
+  const actionEl = document.getElementById('smartActionRow');
+  if (isLast) {
+    actionEl.innerHTML = ''
+      + '<button class="btn btn-primary" onclick="showFinalSummary()">'
+      +   '✅ 완료 — 합본 보기'
+      + '</button>';
+  } else {
+    const nextScr = _selectedScrs[idx + 1] || '';
+    actionEl.innerHTML = ''
+      + '<button class="btn btn-primary" onclick="continueScr(' + (idx + 1) + ')">'
+      +   '▶ 이어서 ' + escapeHtml(nextScr) + ' 분석'
+      + '</button>'
+      + '<button class="btn" onclick="skipScr(' + (idx + 1) + ')" style="background:#F3F4F6;">'
+      +   '⏭ ' + escapeHtml(nextScr) + ' 건너뛰기'
+      + '</button>'
+      + '<button class="btn" onclick="stopAnalysis()" style="background:#FEE2E2; color:#991B1B;">'
+      +   '🛑 여기서 종료'
+      + '</button>';
+  }
+}
+
+async function continueScr(idx) {
+  await runScr(idx);
+}
+
+function skipScr(idx) {
+  if (!_selectedScrs) return;
+  _smartResults[idx] = {
+    scr_id: _selectedScrs[idx],
+    summary: '_(건너뛰었습니다 — 사용자 선택)_',
+    from_cache: false,
+    skipped: true,
+  };
+  _smartCurrentIndex = idx;
+  renderProgressList();
+  const resultEl = document.getElementById('smartCurrentResult');
+  resultEl.innerHTML = '<div style="color:#6B7280;">⏭ ' + escapeHtml(_selectedScrs[idx]) + ' 건너뜀.</div>';
+  renderActionRow(idx, idx + 1 >= _selectedScrs.length);
+}
+
+function stopAnalysis() {
+  _smartStopped = true;
+  showFinalSummary();
+}
+
+function showFinalSummary() {
+  document.getElementById('smartProgressArea').classList.add('hidden');
+  const finalArea = document.getElementById('smartFinalArea');
+  finalArea.classList.remove('hidden');
+  const sumEl = document.getElementById('smartFinalSummary');
+
+  const analyzed = _smartResults.filter(function(r) { return r && !r.skipped; }).length;
+  const skipped = _smartResults.filter(function(r) { return r && r.skipped; }).length;
+  const stopped = _smartStopped;
+  const total = _selectedScrs ? _selectedScrs.length : 0;
+
+  let html = '<div style="font-size:12px; color:#374151; margin-bottom:10px;">';
+  html += '📊 총 ' + total + '개 SCR — ✅ 분석 ' + analyzed + ' · ⏭ 건너뜀 ' + skipped;
+  if (stopped) html += ' · 🛑 중단됨';
+  html += '</div>';
+
+  const typeIcon = { added: '🆕', modified: '✏️', removed: '🗑️' };
+  for (let i = 0; i < _smartResults.length; i++) {
+    const r = _smartResults[i];
+    if (!r) continue;
+    html += '<div style="margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid #E5E7EB;">';
+    html += '<div style="font-size:12px; font-weight:700; color:#1E3A5F; margin-bottom:6px;">';
+    html += (typeIcon[r.change_type] || '·') + ' ' + escapeHtml(r.scr_id || '?');
+    if (r.from_cache) html += ' <span style="background:#DBEAFE; color:#1E40AF; padding:1px 6px; border-radius:3px; font-size:10px;">💾 캐시</span>';
+    if (r.skipped) html += ' <span style="background:#F3F4F6; color:#6B7280; padding:1px 6px; border-radius:3px; font-size:10px;">⏭ 건너뜀</span>';
+    html += '</div>';
+    html += '<div style="font-size:12px; color:#111827;">' + renderMarkdownBasic(r.summary || '') + '</div>';
+    html += '</div>';
+  }
+  sumEl.innerHTML = html;
+}
+
+function resetSmartAnalyze() {
+  document.getElementById('smartFinalArea').classList.add('hidden');
+  document.getElementById('smartPlanArea').classList.add('hidden');
+  document.getElementById('smartProgressArea').classList.add('hidden');
+  _smartPlan = null;
+  _smartResults = [];
+  _smartCurrentIndex = 0;
+}
+
+// ──────────────────────────────────────────────────────────
+// v0.11.x 신규 — 폴더 기반 spec diff 분석 (1단계: 분석만, 레거시)
+// ──────────────────────────────────────────────────────────
+function cancelUpdate() {
+  document.getElementById('diffReportArea').classList.add('hidden');
+}
+
+async function startUpdateAnalyze() {
+  const prevFolder = document.getElementById('updatePrevFolder').value.trim();
+  const newFolder = document.getElementById('updateNewFolder').value.trim();
+  const tcUrl = document.getElementById('updateTcUrl').value.trim();
+  const btn = document.getElementById('startDiffBtn');
+  const reportArea = document.getElementById('diffReportArea');
+  const statsEl = document.getElementById('diffReportStats');
+  const summaryEl = document.getElementById('diffReportSummary');
+
+  if (!prevFolder || !newFolder) {
+    alert('이전 기획서 폴더와 새 기획서 폴더 경로 모두 입력하세요.');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '⏳ 분석 중... (1~3분)';
+  reportArea.classList.remove('hidden');
+  statsEl.innerHTML = '<em style="color:#6B7280;">AI 가 spec 폴더 비교 + 요약 작성 중...</em>';
+  summaryEl.innerHTML = '';
+
+  const projectName = (document.getElementById('projectDropdown') || document.getElementById('projectSelect') || {}).value || '';
+
+  try {
+    const resp = await fetch('/update/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prev_folder: prevFolder,
+        new_folder: newFolder,
+        existing_tc_url: tcUrl,
+        project_name: projectName,
+      })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      statsEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (data.error || '오류') + '</span>';
+      if (data.trace) {
+        summaryEl.innerHTML = '<pre style="font-size:11px;color:#991B1B;background:#FEE2E2;padding:8px;border-radius:4px;overflow:auto;">' + escapeHtml(data.trace) + '</pre>';
+      }
+      return;
+    }
+
+    // 통계 렌더
+    const d = data.diff || {};
+    statsEl.innerHTML =
+      '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px;">' +
+      '<span style="background:#DCFCE7;color:#166534;padding:4px 10px;border-radius:4px;">➕ 신규 ' + (d.added || []).length + '개</span>' +
+      '<span style="background:#FEF3C7;color:#92400E;padding:4px 10px;border-radius:4px;">✏️ 수정 ' + (d.modified || []).length + '개</span>' +
+      '<span style="background:#FEE2E2;color:#991B1B;padding:4px 10px;border-radius:4px;">🗑️ 삭제 ' + (d.removed || []).length + '개</span>' +
+      '<span style="background:#F3F4F6;color:#374151;padding:4px 10px;border-radius:4px;">⚪ 동일 ' + (d.unchanged || []).length + '개</span>' +
+      (d.common_changed ? '<span style="background:#FED7AA;color:#9A3412;padding:4px 10px;border-radius:4px;">📋 공통 문서 변경</span>' : '') +
+      '</div>' +
+      '<div style="margin-top:8px;font-size:11px;color:#6B7280;">분석 시각: ' + (data.meta && data.meta.analyzed_at || '-') + '</div>';
+
+    // AI 요약 마크다운 렌더 (간단 HTML 변환 — 마크다운 라이브러리 없으니 기본만)
+    const summaryMd = data.summary || '(요약 없음)';
+    summaryEl.innerHTML = renderMarkdownBasic(summaryMd);
+
+    if (typeof showToast === 'function') {
+      showToast('✅ 변경 분석 완료 — 신규 ' + (d.added || []).length + ' / 수정 ' + (d.modified || []).length + ' / 삭제 ' + (d.removed || []).length, 'success');
+    }
+  } catch (e) {
+    statsEl.innerHTML = '<span style="color:#DC2626;">❌ 네트워크 오류: ' + e.message + '</span>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔍 변경사항 분석';
+  }
+}
+
+// 매우 기본적인 markdown → HTML 변환 (h1/h2/h3/bold/code/list/줄바꿈)
+function renderMarkdownBasic(md) {
+  if (!md) return '';
+  let html = escapeHtml(md);
+  // 코드 블록 — \\n 으로 escape (Python f-string 안에 있어서)
+  html = html.replace(/```(\\w*)\\n([\\s\\S]*?)```/g, function(_, lang, code) {
+    return '<pre style="background:#F3F4F6;padding:10px;border-radius:4px;overflow:auto;font-size:11px;">' + code + '</pre>';
+  });
+  // 헤딩
+  html = html.replace(/^### (.+)$/gm, '<h3 style="font-size:14px;color:#1E40AF;margin:14px 0 6px 0;font-weight:700;">$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2 style="font-size:16px;color:#1E3A8A;margin:18px 0 8px 0;font-weight:700;border-bottom:1px solid #E5E7EB;padding-bottom:4px;">$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1 style="font-size:18px;color:#1E3A8A;margin:20px 0 10px 0;font-weight:700;">$1</h1>');
+  // 인라인 코드
+  html = html.replace(/`([^`]+)`/g, '<code style="background:#F3F4F6;padding:1px 5px;border-radius:3px;font-size:12px;">$1</code>');
+  // 굵게
+  html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+  // 리스트
+  html = html.replace(/^- (.+)$/gm, '<li style="margin-left:18px;">$1</li>');
+  // 줄바꿈
+  html = html.replace(/\\n\\n/g, '<br><br>').replace(/\\n/g, '<br>');
+  return html;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// ── TC Update 2단계 — Plan + 4-way UI ──────────────────────────────────────
+let _updateSessionId = null;
+let _updateCandidates = [];
+
+// 검증용 — 자동 점검 (Playwright) 에서 모듈 스코프 변수에 접근하기 위해
+window.__debugSetCandidates = function(items) {
+  _updateCandidates = Array.isArray(items) ? items : [];
+  if (!_updateSessionId) _updateSessionId = 'debug-session';
+  renderCandidates();
+};
+
+async function startUpdatePlan() {
+  const prevFolder = document.getElementById('updatePrevFolder').value.trim();
+  const newFolder = document.getElementById('updateNewFolder').value.trim();
+  const tcUrl = document.getElementById('updateTcUrl').value.trim();
+  const btn = document.getElementById('planBtn');
+  const planArea = document.getElementById('planReportArea');
+  const statsEl = document.getElementById('planStats');
+  const linkEl = document.getElementById('planCopyLink');
+  const listEl = document.getElementById('candidatesList');
+
+  if (!tcUrl) {
+    alert('기존 TC Google Sheets URL 을 입력하세요.');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '⏳ 사본 생성 + 매핑 중...';
+  planArea.classList.remove('hidden');
+  // 큰 진행 배너 — 노란 배경 + 스피너 + 강조된 글자
+  statsEl.innerHTML =
+    '<div style="display:flex; align-items:center; gap:12px; padding:14px 16px; '
+    + 'background:linear-gradient(135deg, #FEF3C7 0%, #FDE68A 100%); '
+    + 'border:1px solid #F59E0B; border-radius:8px;">'
+    +   '<div class="plan-spinner" style="width:24px; height:24px; '
+    +     'border:3px solid #FCD34D; border-top-color:#92400E; '
+    +     'border-radius:50%; animation:plan-spin 0.8s linear infinite; flex-shrink:0;"></div>'
+    +   '<div style="flex:1;">'
+    +     '<div style="font-size:14px; font-weight:700; color:#78350F;">⏳ 후보 산출 중 — 잠시 기다려주세요</div>'
+    +     '<div style="font-size:12px; color:#92400E; margin-top:4px;">'
+    +       'Sheets 사본 생성 → TC↔SCR 매핑 → 4-way 후보 리스트 산출'
+    +     '</div>'
+    +   '</div>'
+    + '</div>'
+    + '<style>@keyframes plan-spin { to { transform:rotate(360deg); } }</style>';
+  linkEl.innerHTML = '';
+  listEl.innerHTML = '';
+  // 적용 버튼이 이미 화면에 있을 수 있으므로 비활성화 (이전 plan 의 잔존)
+  const applyBtn = document.getElementById('applyBtn');
+  if (applyBtn) {
+    applyBtn.disabled = true;
+    applyBtn.style.opacity = '0.4';
+    applyBtn.style.cursor = 'not-allowed';
+    applyBtn.dataset.loadingMsg = '⏳ 후보 산출 중 — 잠시만요';
+  }
+
+  const projectName = (document.getElementById('projectDropdown') || document.getElementById('projectSelect') || {}).value || '';
+
+  try {
+    const resp = await fetch('/update/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prev_folder: prevFolder,
+        new_folder: newFolder,
+        existing_tc_url: tcUrl,
+        make_copy: true,
+        project_name: projectName,
+        // 1단계에서 사용자가 선택한 SCR 들 (없으면 백엔드가 전체 처리)
+        scr_filter: (typeof _selectedScrs !== 'undefined' && _selectedScrs && _selectedScrs.length)
+                      ? _selectedScrs : null,
+        // 신규(add) 는 별도 '신규 TC 생성 모드' 에서 처리 → 2단계에서는 수정/삭제만
+        exclude_actions: ['add'],
+      })
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      statsEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (data.error || '오류') + '</span>';
+      if (data.trace) {
+        listEl.innerHTML = '<pre style="font-size:11px;color:#991B1B;background:#FEE2E2;padding:8px;overflow:auto;">' + escapeHtml(data.trace) + '</pre>';
+      }
+      return;
+    }
+
+    _updateSessionId = data.session_id;
+    _updateCandidates = data.candidates || [];
+    const s = data.stats || {};
+
+    // 필터 적용 여부 안내
+    const filterNote = (typeof _selectedScrs !== 'undefined' && _selectedScrs && _selectedScrs.length)
+      ? '<div style="margin-bottom:8px; padding:6px 10px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; font-size:12px; color:#3730A3;">'
+          + '🎯 <strong>필터 적용</strong> — 1단계 선택 ' + _selectedScrs.length + '개 SCR 중 <strong>수정/삭제</strong>만 (신규는 별도 모드)<br>'
+          + '<span style="font-size:11px;">' + _selectedScrs.map(escapeHtml).join(', ') + '</span>'
+          + '</div>'
+      : '<div style="margin-bottom:8px; padding:6px 10px; background:#F3F4F6; border:1px solid #D1D5DB; border-radius:4px; font-size:11px; color:#6B7280;">'
+          + 'ℹ️ 신규(add) 후보는 제외됨 — 신규 SCR 은 <strong>신규 TC 생성 모드</strong> 에서 처리하세요.'
+          + '</div>';
+
+    statsEl.innerHTML = filterNote +
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;font-size:12px;">' +
+      '<span style="background:#DCFCE7;color:#166534;padding:4px 10px;border-radius:4px;">🆕 신규 ' + s.add + '</span>' +
+      '<span style="background:#FEF3C7;color:#92400E;padding:4px 10px;border-radius:4px;">✏️ 수정 ' + s.modify + '</span>' +
+      '<span style="background:#FEE2E2;color:#991B1B;padding:4px 10px;border-radius:4px;">🗑️ 삭제 ' + s.delete + '</span>' +
+      '<span style="background:#E0E7FF;color:#3730A3;padding:4px 10px;border-radius:4px;">기본 체크 ' + s.default_checked + '/' + s.total + '</span>' +
+      '<span style="background:#F3F4F6;color:#374151;padding:4px 10px;border-radius:4px;">기존 TC ' + s.tcs_total + '개</span>' +
+      '</div>' +
+      '<div style="margin-top:6px;font-size:11px;color:#6B7280;">SCR diff — 신규 ' + s.scr_added + ' · 수정 ' + s.scr_modified + ' · 삭제 ' + s.scr_removed + ' · 동일 ' + s.scr_unchanged + ' | 시트: ' + (s.tabs || []).join(', ') + '</div>';
+
+    if (data.copy_url) {
+      linkEl.innerHTML = '📋 사본 생성됨: <a href="' + data.copy_url + '" target="_blank" style="color:#1E40AF;">' + escapeHtml(data.copy_title || '사본 Sheets') + '</a>';
+      window._lastPlanCopyUrl = data.copy_url;  // promote 에서 사용
+    }
+
+    renderCandidates();
+
+    if (typeof showToast === 'function') {
+      showToast('✅ 영향 분석 완료 — 후보 ' + s.total + '건', 'success');
+    }
+  } catch (e) {
+    statsEl.innerHTML = '<span style="color:#DC2626;">❌ 네트워크 오류: ' + e.message + '</span>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🧭 2단계 — TC 매핑 + 영향 분석 (사본 생성)';
+    // 적용 버튼 다시 활성화 (로딩 끝)
+    const applyBtn2 = document.getElementById('applyBtn');
+    if (applyBtn2) {
+      applyBtn2.disabled = false;
+      applyBtn2.style.opacity = '';
+      applyBtn2.style.cursor = '';
+      delete applyBtn2.dataset.loadingMsg;
+    }
+  }
+}
+
+function renderCandidates() {
+  const listEl = document.getElementById('candidatesList');
+  const filters = {
+    add: document.getElementById('filterAdd').checked,
+    modify: document.getElementById('filterModify').checked,
+    delete: document.getElementById('filterDelete').checked,
+  };
+  const visible = _updateCandidates
+    .map((c, idx) => ({ ...c, idx }))
+    .filter(c => filters[c.action]);
+
+  if (visible.length === 0) {
+    listEl.innerHTML = '<div style="padding:14px;color:#6B7280;text-align:center;">후보 없음 (필터 또는 unchanged-only)</div>';
+    return;
+  }
+
+  const icon = { add: '🆕', modify: '✏️', delete: '🗑️', skip: '⏸️' };
+  const bg = { add: '#F0FDF4', modify: '#FFFBEB', delete: '#FEF2F2', skip: '#F9FAFB' };
+
+  // SCR 별 그룹화 — Map 으로 순서 보존
+  const groups = new Map();
+  visible.forEach(function(c) {
+    const key = c.scr_id || '(공통)';
+    if (!groups.has(key)) {
+      groups.set(key, { scr_id: key, sheet_title: c.sheet_title || '', items: [] });
+    }
+    groups.get(key).items.push(c);
+  });
+
+  function renderRow(c) {
+    const kindTag = c.change_kind
+      ? '<span style="background:#E0E7FF;color:#3730A3;padding:1px 6px;border-radius:3px;font-size:10px;margin-left:6px;">' + c.change_kind + '</span>'
+      : '';
+    const tcInfo = c.tc_id
+      ? '<code style="background:#F3F4F6;padding:1px 5px;border-radius:3px;font-size:11px;">' + escapeHtml(c.tc_id) + '</code>'
+        + (c.tc_title ? ' <span style="color:#374151;">' + escapeHtml(c.tc_title) + '</span>' : '')
+      : '<em style="color:#6B7280;">(신규 — TC ID 미정)</em>';
+    return ''
+      + '<div style="border-bottom:1px solid #E5E7EB; background:' + bg[c.action] + ';">'
+      +   '<div style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px;">'
+      +     '<input type="checkbox" class="cand-chk" data-idx="' + c.idx + '" data-scr="' + escapeHtml(c.scr_id || '(공통)') + '" data-action="' + c.action + '"'
+      +       (c.default_checked ? ' checked' : '') + ' style="margin-top:3px;" onchange="updateGroupCheckCounts()">'
+      +     '<div style="flex:1;">'
+      +       '<div style="font-size:12px; font-weight:600; color:#111827;">'
+      +         icon[c.action] + ' ' + c.action.toUpperCase() + kindTag
+      +       '</div>'
+      +       '<div style="font-size:12px; margin-top:3px;">' + tcInfo + '</div>'
+      +       '<div style="font-size:11px; color:#6B7280; margin-top:3px;">' + escapeHtml(c.reason || '') + '</div>'
+      +     '</div>'
+      +     '<div style="display:flex; flex-direction:column; gap:4px; flex:0 0 auto; align-self:flex-start;">'
+      +       '<button type="button" class="btn-preview" data-idx="' + c.idx + '" onclick="togglePreview(' + c.idx + ')" '
+      +         'style="font-size:11px; padding:4px 8px; background:#FFF; border:1px solid #CBD5E1; border-radius:4px; cursor:pointer; color:#1E40AF; white-space:nowrap;">'
+      +         '▼ diff 보기'
+      +       '</button>'
+      +       (c.action === 'modify' && c.tc_id
+        ? '<button type="button" class="btn-propose" data-idx="' + c.idx + '" onclick="toggleProposal(' + c.idx + ')" '
+          + 'style="font-size:11px; padding:4px 8px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; cursor:pointer; color:#3730A3; white-space:nowrap;">'
+          + '💡 수정안 보기'
+          + '</button>'
+        : '')
+      +       (c.action === 'add'
+        ? '<button type="button" class="btn-new-tc" data-scr="' + escapeHtml(c.scr_id || '') + '" onclick="goToNewTcMode(\\'' + (c.scr_id || '') + '\\')" '
+          + 'style="font-size:11px; padding:4px 8px; background:#F0FDF4; border:1px solid #86EFAC; border-radius:4px; cursor:pointer; color:#166534; white-space:nowrap; font-weight:600;">'
+          + '✨ 신규 TC 생성 →'
+          + '</button>'
+        : '')
+      +     '</div>'
+      +   '</div>'
+      +   '<div id="preview-' + c.idx + '" class="cand-preview" style="display:none; padding:8px 14px 12px 38px; background:#FFFFFF; border-top:1px dashed #E5E7EB;"></div>'
+      +   '<div id="proposal-' + c.idx + '" class="cand-proposal" style="display:none; padding:10px 14px 14px 38px; background:#FAFBFF; border-top:1px dashed #C7D2FE;"></div>'
+      + '</div>';
+  }
+
+  // 그룹 헤더의 change_kind 요약: 그룹 안 action 모음
+  function summarizeKinds(items) {
+    const counts = { add: 0, modify: 0, delete: 0, skip: 0 };
+    items.forEach(function(c) { counts[c.action] = (counts[c.action] || 0) + 1; });
+    const parts = [];
+    if (counts.add) parts.push('<span style="background:#DCFCE7;color:#166534;padding:1px 6px;border-radius:3px;font-size:10px;">🆕 ' + counts.add + '</span>');
+    if (counts.modify) parts.push('<span style="background:#FEF3C7;color:#92400E;padding:1px 6px;border-radius:3px;font-size:10px;">✏️ ' + counts.modify + '</span>');
+    if (counts.delete) parts.push('<span style="background:#FEE2E2;color:#991B1B;padding:1px 6px;border-radius:3px;font-size:10px;">🗑️ ' + counts.delete + '</span>');
+    return parts.join(' ');
+  }
+
+  // 그룹 헤더 + 그룹 본문 렌더
+  const groupHtml = Array.from(groups.values()).map(function(g) {
+    const scrId = g.scr_id;
+    const sheetTitle = g.sheet_title || '';
+    const total = g.items.length;
+    const checkedInit = g.items.filter(function(c) { return c.default_checked; }).length;
+    const kindBadges = summarizeKinds(g.items);
+    const sheetTag = sheetTitle
+      ? '<span style="font-size:11px; color:#6B7280;">[' + escapeHtml(sheetTitle) + ']</span>'
+      : '';
+    // modify + tc_id 가 있어야 일괄 적용 가능
+    const groupHasApplicable = g.items.some(function(c) { return c.action === 'modify' && c.tc_id; });
+
+    const headerHtml = ''
+      + '<summary style="cursor:pointer; padding:10px 12px; background:#F8FAFC; border-bottom:1px solid #E5E7EB; '
+      +   'display:flex; align-items:center; gap:10px; list-style:none;" '
+      +   'data-scr-header="' + escapeHtml(scrId) + '">'
+      +   '<span class="grp-caret" style="font-size:10px; color:#6B7280; width:10px;">▶</span>'
+      +   '<strong style="font-size:13px; color:#111827; font-family:monospace;">' + escapeHtml(scrId) + '</strong>'
+      +   sheetTag
+      +   '<span style="font-size:11px; color:#374151;">' + total + ' TC</span>'
+      +   '<span style="display:flex; gap:4px;">' + kindBadges + '</span>'
+      +   '<span class="grp-checked-count" data-scr="' + escapeHtml(scrId) + '" '
+      +     'style="font-size:11px; color:#3730A3; background:#E0E7FF; padding:2px 8px; border-radius:10px; margin-left:auto;">'
+      +     '체크 <strong>' + checkedInit + '</strong>/' + total
+      +   '</span>'
+      +   (groupHasApplicable
+        ? '<button type="button" class="btn-grp-apply" data-scr="' + escapeHtml(scrId) + '" '
+          + 'onclick="event.preventDefault(); event.stopPropagation(); applyBulkForScr(\\'' + escapeJsString(scrId) + '\\');" '
+          + 'style="font-size:11px; padding:5px 10px; background:#FEF3C7; border:1px solid #F59E0B; border-radius:4px; cursor:pointer; color:#78350F; font-weight:600; white-space:nowrap;">'
+          + '📦 SCR 일괄 적용'
+          + '</button>'
+        : '')
+      + '</summary>';
+
+    const bodyHtml = g.items.map(renderRow).join('');
+
+    return ''
+      + '<details class="scr-group" data-scr="' + escapeHtml(scrId) + '" style="border:1px solid #E5E7EB; border-radius:6px; margin-bottom:8px; overflow:hidden; background:#FFF;">'
+      +   headerHtml
+      +   '<div>' + bodyHtml + '</div>'
+      + '</details>';
+  }).join('');
+
+  listEl.innerHTML = ''
+    + '<div style="display:flex; gap:8px; margin-bottom:8px; font-size:11px;">'
+    +   '<button type="button" onclick="expandAllScrGroups(true)" '
+    +     'style="padding:4px 10px; background:#FFF; border:1px solid #CBD5E1; border-radius:4px; cursor:pointer; color:#374151;">▼ 모두 펼치기</button>'
+    +   '<button type="button" onclick="expandAllScrGroups(false)" '
+    +     'style="padding:4px 10px; background:#FFF; border:1px solid #CBD5E1; border-radius:4px; cursor:pointer; color:#374151;">▶ 모두 접기</button>'
+    +   '<span style="color:#6B7280; align-self:center; margin-left:4px;">SCR ' + groups.size + '개 — 그룹 헤더 클릭으로 펼침/접기</span>'
+    + '</div>'
+    + groupHtml;
+
+  // caret 회전 — details 의 toggle 이벤트 캡쳐
+  listEl.querySelectorAll('details.scr-group').forEach(function(d) {
+    d.addEventListener('toggle', function() {
+      const caret = d.querySelector('.grp-caret');
+      if (caret) caret.textContent = d.open ? '▼' : '▶';
+    });
+  });
+}
+
+// JS 문자열 안에 단일 따옴표 안전하게 끼우기
+function escapeJsString(s) {
+  return String(s || '').replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+}
+
+function expandAllScrGroups(open) {
+  document.querySelectorAll('details.scr-group').forEach(function(d) {
+    d.open = !!open;
+  });
+}
+
+// 체크박스 변경 시 각 SCR 그룹의 체크 수 라이브 업데이트
+function updateGroupCheckCounts() {
+  document.querySelectorAll('.grp-checked-count').forEach(function(el) {
+    const scr = el.dataset.scr;
+    const all = document.querySelectorAll('.cand-chk[data-scr="' + (scr || '').replace(/"/g, '\\\\"') + '"]');
+    const checked = Array.from(all).filter(function(cb) { return cb.checked; }).length;
+    el.innerHTML = '체크 <strong>' + checked + '</strong>/' + all.length;
+  });
+}
+
+async function togglePreview(idx) {
+  const area = document.getElementById('preview-' + idx);
+  const btn = document.querySelector('.btn-preview[data-idx="' + idx + '"]');
+  if (!area) return;
+  if (area.style.display !== 'none' && area.dataset.loaded === '1') {
+    area.style.display = 'none';
+    if (btn) btn.textContent = '▼ diff 보기';
+    return;
+  }
+  area.style.display = 'block';
+  if (btn) btn.textContent = '▲ 닫기';
+  if (area.dataset.loaded === '1') return;
+
+  area.innerHTML = '<em style="font-size:11px;color:#6B7280;">⏳ SCR 본문 불러오는 중...</em>';
+  try {
+    const r = await fetch('/update/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _updateSessionId, idx: idx }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      area.innerHTML = '<span style="color:#DC2626;font-size:11px;">❌ ' + (d.error || '오류') + '</span>';
+      return;
+    }
+    area.innerHTML = renderPreview(d);
+    area.dataset.loaded = '1';
+  } catch (e) {
+    area.innerHTML = '<span style="color:#DC2626;font-size:11px;">❌ ' + e.message + '</span>';
+  }
+}
+
+function renderPreview(d) {
+  const c = d.candidate || {};
+  let html = '';
+
+  // 메타 정보
+  html += '<div style="font-size:11px; color:#374151; margin-bottom:8px;">';
+  html += '<strong>SCR:</strong> ' + escapeHtml(d.scr_id || '-') + ' · ';
+  html += '<strong>판정:</strong> ' + escapeHtml(c.change_kind || c.action || '-');
+  if (c.action === 'add') {
+    html += ' · <em>(신규 SCR — 이전 본문 없음, 새 본문만 표시)</em>';
+  } else if (c.action === 'delete') {
+    html += ' · <em>(삭제된 SCR — 새 본문 없음, 이전 본문만 표시)</em>';
+  }
+  html += '</div>';
+
+  // unified diff (가장 유용)
+  if (d.unified_diff && d.unified_diff.trim()) {
+    html += '<div style="font-size:10px; color:#6B7280; margin-bottom:4px;">📋 spec 본문 diff (이전 → 새 버전):</div>';
+    html += '<pre style="font-size:11px; line-height:1.5; background:#0F172A; color:#E2E8F0; padding:10px 12px; border-radius:6px; overflow-x:auto; max-height:340px; overflow-y:auto;">';
+    html += d.unified_diff.split('\\n').map(function(ln) {
+      const esc = escapeHtml(ln);
+      if (ln.startsWith('+++') || ln.startsWith('---')) {
+        return '<span style="color:#94A3B8;">' + esc + '</span>';
+      } else if (ln.startsWith('@@')) {
+        return '<span style="color:#A78BFA;">' + esc + '</span>';
+      } else if (ln.startsWith('+')) {
+        return '<span style="color:#86EFAC; background:rgba(34,197,94,0.15);">' + esc + '</span>';
+      } else if (ln.startsWith('-')) {
+        return '<span style="color:#FCA5A5; background:rgba(239,68,68,0.15);">' + esc + '</span>';
+      }
+      return '<span style="color:#CBD5E1;">' + esc + '</span>';
+    }).join('\\n');
+    html += '</pre>';
+  } else if (c.action === 'add') {
+    // 신규 SCR — 새 본문만 표시
+    html += '<div style="font-size:10px; color:#6B7280; margin-bottom:4px;">📄 신규 SCR 본문:</div>';
+    html += '<pre style="font-size:11px; line-height:1.5; background:#F9FAFB; padding:10px 12px; border-radius:6px; max-height:340px; overflow-y:auto; white-space:pre-wrap;">';
+    html += escapeHtml(d.new_text || '(본문 없음)');
+    html += '</pre>';
+  } else if (c.action === 'delete') {
+    html += '<div style="font-size:10px; color:#6B7280; margin-bottom:4px;">📄 삭제된 SCR 본문 (이전):</div>';
+    html += '<pre style="font-size:11px; line-height:1.5; background:#FEF2F2; padding:10px 12px; border-radius:6px; max-height:340px; overflow-y:auto; white-space:pre-wrap;">';
+    html += escapeHtml(d.prev_text || '(본문 없음)');
+    html += '</pre>';
+  } else {
+    html += '<div style="font-size:11px; color:#6B7280;">변경된 내용이 없거나 본문을 찾지 못했습니다.</div>';
+  }
+
+  return html;
+}
+
+// ── TC Update — AI 수정안 제안/적용 ──────────────────────────────────────
+async function toggleProposal(idx) {
+  const area = document.getElementById('proposal-' + idx);
+  const btn = document.querySelector('.btn-propose[data-idx="' + idx + '"]');
+  if (!area) return;
+  if (area.style.display !== 'none' && area.dataset.loaded === '1') {
+    area.style.display = 'none';
+    if (btn) btn.textContent = '💡 수정안 보기';
+    return;
+  }
+  area.style.display = 'block';
+  if (btn) btn.textContent = '▲ 닫기';
+  if (area.dataset.loaded === '1') return;
+
+  area.innerHTML = '<em style="font-size:11px;color:#6B7280;">⏳ AI 가 수정안 작성 중... (10-20초)</em>';
+  try {
+    const r = await fetch('/update/propose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _updateSessionId, idx: idx }),
+    });
+    // HTTP 자체 오류 (429 등) 우선 처리
+    if (!r.ok) {
+      let text = '';
+      try { text = await r.text(); } catch(_) {}
+      const msg = 'HTTP ' + r.status + (text ? ' — ' + text.slice(0, 300) : '');
+      area.innerHTML = '<div style="padding:8px 10px; background:#FEE2E2; border:1px solid #FCA5A5; border-radius:4px; font-size:11px; color:#991B1B;">'
+        + '❌ ' + escapeHtml(msg)
+        + (r.status === 429 ? '<br><br>⚠️ Google Sheets API 분당 한도 초과 (60회). 1-2분 기다린 후 다시 시도하세요.' : '')
+        + '<br><button onclick="retryProposal(' + idx + ')" style="margin-top:6px; padding:3px 8px; font-size:10px; background:#FFF; border:1px solid #DC2626; border-radius:3px; cursor:pointer;">🔁 재시도</button>'
+        + '</div>';
+      return;
+    }
+    const d = await r.json();
+    if (!d.ok) {
+      const errMsg = d.error || d.trace || '오류 (응답에 메시지 없음)';
+      area.innerHTML = '<div style="padding:8px 10px; background:#FEE2E2; border:1px solid #FCA5A5; border-radius:4px; font-size:11px; color:#991B1B;">'
+        + '❌ ' + escapeHtml(String(errMsg).slice(0, 500))
+        + '<br><button onclick="retryProposal(' + idx + ')" style="margin-top:6px; padding:3px 8px; font-size:10px; background:#FFF; border:1px solid #DC2626; border-radius:3px; cursor:pointer;">🔁 재시도</button>'
+        + '</div>';
+      return;
+    }
+    area.innerHTML = renderProposal(d, idx);
+    area.dataset.loaded = '1';
+  } catch (e) {
+    area.innerHTML = '<div style="padding:8px 10px; background:#FEE2E2; border:1px solid #FCA5A5; border-radius:4px; font-size:11px; color:#991B1B;">'
+      + '❌ 네트워크 오류: ' + escapeHtml(e.message || '(메시지 없음)')
+      + '<br><button onclick="retryProposal(' + idx + ')" style="margin-top:6px; padding:3px 8px; font-size:10px; background:#FFF; border:1px solid #DC2626; border-radius:3px; cursor:pointer;">🔁 재시도</button>'
+      + '</div>';
+  }
+}
+
+function retryProposal(idx) {
+  // 캐시 상태 reset 하고 다시 호출
+  const area = document.getElementById('proposal-' + idx);
+  if (area) {
+    delete area.dataset.loaded;
+    area.style.display = 'none';
+  }
+  toggleProposal(idx);
+}
+
+function renderProposal(d, idx) {
+  const p = d.proposal || {};
+  const cur = d.current_tc || {};
+
+  if (p.no_change) {
+    return ''
+      + '<div style="font-size:12px; color:#374151; padding:8px 10px; background:#F0FDF4; border:1px solid #BBF7D0; border-radius:4px;">'
+      +   '<strong style="color:#166534;">✅ 변경 불필요</strong> '
+      +   '<span style="color:#6B7280; margin-left:6px;">' + escapeHtml(p.rationale || '') + '</span>'
+      + '</div>';
+  }
+
+  function fieldDiff(label, before, after) {
+    if (after === null || after === undefined) {
+      return ''
+        + '<div style="margin-bottom:8px;">'
+        +   '<div style="font-size:11px; color:#6B7280; margin-bottom:3px;">' + escapeHtml(label) + ' — <em>변경 없음</em></div>'
+        + '</div>';
+    }
+    return ''
+      + '<div style="margin-bottom:10px;">'
+      +   '<div style="font-size:11px; font-weight:600; color:#3730A3; margin-bottom:4px;">' + escapeHtml(label) + '</div>'
+      +   '<div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">'
+      +     '<div style="background:#FEF2F2; border:1px solid #FCA5A5; border-radius:4px; padding:6px 8px;">'
+      +       '<div style="font-size:9px; color:#991B1B; margin-bottom:2px; text-transform:uppercase;">현재</div>'
+      +       '<pre style="font-size:11px; color:#7F1D1D; white-space:pre-wrap; word-break:break-word; margin:0; font-family:inherit; line-height:1.5;">' + escapeHtml(before || '(없음)') + '</pre>'
+      +     '</div>'
+      +     '<div style="background:#F0FDF4; border:1px solid #86EFAC; border-radius:4px; padding:6px 8px;">'
+      +       '<div style="font-size:9px; color:#166534; margin-bottom:2px; text-transform:uppercase;">제안</div>'
+      +       '<pre style="font-size:11px; color:#14532D; white-space:pre-wrap; word-break:break-word; margin:0; font-family:inherit; line-height:1.5;">' + escapeHtml(after || '') + '</pre>'
+      +     '</div>'
+      +   '</div>'
+      + '</div>';
+  }
+
+  let html = ''
+    + '<div style="font-size:11px; color:#3730A3; padding:6px 10px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; margin-bottom:10px;">'
+    +   '💡 <strong>AI 수정안</strong> — ' + escapeHtml(p.rationale || '')
+    + '</div>';
+
+  html += fieldDiff('사전조건', cur.precondition, p.precondition);
+  html += fieldDiff('테스트 스텝', cur.steps, p.steps);
+  html += fieldDiff('기대결과', cur.expected, p.expected);
+
+  // 적용 버튼 — 각 필드별 체크박스 + 일괄 적용
+  const hasAny = (p.steps !== null) || (p.expected !== null) || (p.precondition !== null);
+  if (hasAny) {
+    html += '<div style="display:flex; gap:8px; align-items:center; margin-top:10px; padding-top:8px; border-top:1px solid #E5E7EB;">';
+    if (p.precondition !== null) html += '<label style="font-size:11px;"><input type="checkbox" class="prop-field" data-idx="' + idx + '" data-field="precondition" checked> 사전조건</label>';
+    if (p.steps !== null) html += '<label style="font-size:11px;"><input type="checkbox" class="prop-field" data-idx="' + idx + '" data-field="steps" checked> 테스트 스텝</label>';
+    if (p.expected !== null) html += '<label style="font-size:11px;"><input type="checkbox" class="prop-field" data-idx="' + idx + '" data-field="expected" checked> 기대결과</label>';
+    html += '<span style="flex:1;"></span>';
+    html += '<button type="button" onclick="applyProposal(' + idx + ')" '
+      + 'style="font-size:11px; padding:5px 12px; background:#1E40AF; color:#FFF; border:none; border-radius:4px; cursor:pointer; font-weight:600;">'
+      + '✏️ 이 TC 만 사본에 적용</button>';
+    html += '</div>';
+    html += '<div id="proposal-status-' + idx + '" style="font-size:11px; color:#6B7280; margin-top:6px;"></div>';
+  }
+
+  return html;
+}
+
+async function applyProposal(idx) {
+  // 어느 필드를 적용할지 — 체크박스 상태 수집
+  const checkboxes = document.querySelectorAll('.prop-field[data-idx="' + idx + '"]');
+  const fields = {};
+  checkboxes.forEach(cb => {
+    if (cb.checked) {
+      // proposal 카드에서 텍스트 직접 추출하기보다 다시 propose 호출해 가져오는 게 깨끗
+      // 다만 비용 절약을 위해 cache 활용 — 현재는 단순히 dataset 으로 처리
+      fields[cb.dataset.field] = '__USE_LAST_PROPOSAL__';
+    }
+  });
+
+  if (Object.keys(fields).length === 0) {
+    alert('적용할 필드를 하나 이상 선택하세요.');
+    return;
+  }
+
+  // 마지막 propose 결과를 다시 가져옴 (서버 캐시 X — 항상 fresh 한 게 안전)
+  const statusEl = document.getElementById('proposal-status-' + idx);
+  if (statusEl) statusEl.textContent = '⏳ 적용 준비 중 — 수정안 재확인...';
+
+  let proposal;
+  try {
+    const r = await fetch('/update/propose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _updateSessionId, idx: idx }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      if (statusEl) statusEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (d.error || '오류') + '</span>';
+      return;
+    }
+    proposal = d.proposal;
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<span style="color:#DC2626;">❌ ' + e.message + '</span>';
+    return;
+  }
+
+  // 선택된 필드만 추출
+  const accepted = { _rationale: proposal.rationale || '' };
+  for (const f of Object.keys(fields)) {
+    accepted[f] = proposal[f];
+  }
+
+  if (!confirm('선택한 필드를 사본 시트에 적용합니다. 진행할까요?\\n\\n사본만 수정하며 원본은 그대로입니다.')) {
+    if (statusEl) statusEl.textContent = '취소됨.';
+    return;
+  }
+
+  if (statusEl) statusEl.textContent = '⏳ 사본에 적용 중...';
+
+  try {
+    const r = await fetch('/update/commit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _updateSessionId, idx: idx, accepted: accepted }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      if (statusEl) statusEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (d.error || '오류') + '</span>';
+      return;
+    }
+    const n = (d.written_cells || []).length;
+    if (statusEl) statusEl.innerHTML = '<span style="color:#166534;">✅ 적용 완료 — ' + n + '개 셀 갱신 ('
+      + escapeHtml(d.sheet_title) + ' 행 ' + d.row_index + '). TC Edit Log 에 기록됨.</span>';
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<span style="color:#DC2626;">❌ ' + e.message + '</span>';
+  }
+}
+
+function checkAll(checked) {
+  document.querySelectorAll('.cand-chk').forEach(cb => { cb.checked = checked; });
+}
+
+// 신규 TC 생성 모드로 이동 — TC 수정 모드의 add 후보에서 호출
+// 1단계 (스마트 분석) 결과의 신규 SCR 그룹에서 호출 — 여러 신규 SCR 처리
+function goToNewTcForAddedScrs() {
+  const added = (_smartPlan?.scrs || []).filter(s => s.type === 'added').map(s => s.scr_id);
+  if (!added.length) {
+    alert('신규 SCR 이 없습니다.');
+    return;
+  }
+  // 첫 번째 SCR ID 로 진입 (안내 메시지에 표시) + 전체 목록은 안내에 풀어줌
+  goToNewTcMode(added[0], added);
+}
+
+function goToNewTcMode(scrId, addedList) {
+  // 1. 새 기획서 폴더 (modify 모드의 입력) → spec 폴더 (new 모드의 입력) 으로 복사
+  const newFolder = document.getElementById('updateNewFolder')?.value?.trim() || '';
+  const specPathEl = document.getElementById('specFolderPath');
+  if (specPathEl && newFolder) {
+    specPathEl.value = newFolder;
+  }
+
+  // 2. 안내 토스트 (모드 전환 전에 한 번)
+  if (typeof showToast === 'function') {
+    showToast('✨ 신규 TC 생성 모드로 이동 — ' + scrId + ' (spec 폴더 자동 채워짐)');
+  }
+
+  // 3. 모드 전환 (existing TC 수정 → 신규 TC 생성)
+  if (typeof switchMode === 'function') {
+    switchMode('new');
+  }
+
+  // 3-1. 생성 모드를 '정책 반영 (summary)' 로 강제 리셋 — Combo 카드 같은 잔존 상태 정리
+  //   (의도 = SCR 의 신규 TC 작성. Combo 가 아님)
+  const summaryRadio = document.querySelector('input[name="genMode"][value="summary"]');
+  if (summaryRadio) {
+    summaryRadio.checked = true;
+    if (typeof onGenModeChanged === 'function') onGenModeChanged();
+  }
+
+  // 4. 화면 상단으로 스크롤
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+
+  // 5. 사용자에게 다음 액션 안내 (alert 대신 안내 박스 사용)
+  setTimeout(function() {
+    const panelNew = document.getElementById('panelNew');
+    if (panelNew) {
+      // 안내 박스 — 이미 있으면 갱신, 없으면 추가
+      let helpBox = document.getElementById('newTcGuideForScr');
+      if (!helpBox) {
+        helpBox = document.createElement('div');
+        helpBox.id = 'newTcGuideForScr';
+        helpBox.style.cssText = 'margin:10px 0; padding:10px 14px; background:#F0FDF4; border:2px solid #86EFAC; border-radius:8px; font-size:12px; color:#166534; line-height:1.6;';
+        panelNew.insertBefore(helpBox, panelNew.firstChild);
+      }
+      // 여러 SCR 처리 모드 (addedList 가 있으면) 또는 단일 SCR 모드
+      const scrListHtml = (addedList && addedList.length)
+        ? '<div style="margin:6px 0; padding:6px 10px; background:#FFF; border:1px solid #D1FAE5; border-radius:4px; font-family:monospace; font-size:11px;">'
+          + addedList.map(escapeHtml).join(', ')
+          + '</div>'
+        : '';
+      const titleHtml = (addedList && addedList.length > 1)
+        ? '✨ <strong>' + addedList.length + '개 신규 SCR</strong> 의 TC 를 생성하려고 왔어요.'
+        : '✨ <strong>' + escapeHtml(scrId) + '</strong> 의 신규 TC 를 생성하려고 왔어요.';
+      helpBox.innerHTML = titleHtml + '<br>'
+        + scrListHtml
+        + '• spec 폴더는 자동 채워졌습니다.<br>'
+        + '• 아래 진행 흐름대로 분석을 시작하세요.<br>'
+        + '• Step 3 (검토) 단계에서 <strong>위 SCR 들만 체크</strong> → TC 생성으로 진행.<br>'
+        + '<button onclick="document.getElementById(\\'newTcGuideForScr\\').remove()" style="margin-top:6px; padding:2px 8px; font-size:10px; background:#FFF; border:1px solid #166534; border-radius:3px; cursor:pointer;">알겠어요 — 안내 닫기</button>';
+    }
+  }, 300);
+}
+
+// SCR 단위 일괄 적용 — 해당 SCR 그룹의 체크된 modify 만 처리
+async function applyBulkForScr(scrId) {
+  if (!_updateSessionId) {
+    alert('먼저 2단계 영향 분석을 실행하세요.');
+    return;
+  }
+  if (!scrId) return;
+
+  // 해당 SCR 그룹의 체크된 modify 후보 idx 만 수집
+  const escSel = String(scrId).replace(/"/g, '\\\\"');
+  const checkboxes = Array.from(document.querySelectorAll('.cand-chk[data-scr="' + escSel + '"]'));
+  const selections = checkboxes.map(function(cb) {
+    return { idx: parseInt(cb.dataset.idx, 10), accept: cb.checked };
+  });
+  const checkedModifyCount = selections.filter(function(s) {
+    if (!s.accept) return false;
+    const c = (_updateCandidates || [])[s.idx];
+    return c && c.action === 'modify' && c.tc_id;
+  }).length;
+
+  if (checkedModifyCount === 0) {
+    alert('이 SCR 그룹에 체크된 수정 후보가 없습니다.\\n\\nSCR: ' + scrId + '\\n수정 후보 (✏️ MODIFY) 항목을 하나 이상 체크하세요.');
+    return;
+  }
+
+  const estimateSec = checkedModifyCount * 5;
+  const estimateMin = Math.max(1, Math.ceil(estimateSec / 60));
+  if (!confirm(
+    '📦 SCR 일괄 적용 — ' + scrId + '\\n\\n'
+    + checkedModifyCount + '개 수정 후보에 대해:\\n'
+    + '  1. AI 가 각 TC 의 수정안 생성\\n'
+    + '  2. 사본 시트의 셀을 실제로 갱신\\n'
+    + '  3. TC Edit Log 에 이력 기록\\n\\n'
+    + '⏱ 예상 시간: 약 ' + estimateMin + '분 (건당 ~5초)\\n'
+    + '💰 AI 호출 ' + checkedModifyCount + '회 발생\\n\\n'
+    + '진행할까요?'
+  )) {
+    return;
+  }
+
+  // 그룹 헤더의 버튼 + 그룹 헤더 옆에 진행 표시
+  const groupBtn = document.querySelector('.btn-grp-apply[data-scr="' + escSel + '"]');
+  if (groupBtn) {
+    groupBtn.disabled = true;
+    groupBtn.textContent = '⏳ 적용 중...';
+    groupBtn.style.opacity = '0.6';
+    groupBtn.style.cursor = 'not-allowed';
+  }
+  // 전체 일괄 적용 영역에도 SCR 단위 진행 표시 — 사용자가 결과를 한 곳에서 보도록
+  const progressEl = document.getElementById('applyBulkProgress');
+  const statusEl = document.getElementById('applyStatus');
+  if (progressEl) {
+    progressEl.classList.remove('hidden');
+    progressEl.innerHTML = ''
+      + '<div style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:#FEF3C7; border:1px solid #FBBF24; border-radius:6px;">'
+      +   '<div style="width:20px; height:20px; border:3px solid #FCD34D; border-top-color:#92400E; border-radius:50%; animation:plan-spin 0.8s linear infinite; flex-shrink:0;"></div>'
+      +   '<div style="flex:1; font-size:12px; color:#78350F;">'
+      +     '<strong>SCR 일괄 적용 중 — ' + escapeHtml(scrId) + '</strong> · ' + checkedModifyCount + '건 (약 ' + estimateMin + '분).<br>'
+      +     '<span style="font-size:11px;">⚠ 페이지를 닫지 마세요. 완료 후 결과가 표시됩니다.</span>'
+      +   '</div>'
+      + '</div>';
+  }
+  if (statusEl) statusEl.innerHTML = '';
+
+  try {
+    const r = await fetch('/update/apply-bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: _updateSessionId,
+        selections: selections,
+        skip_existing: true,
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      if (progressEl) {
+        progressEl.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(d.error || '오류') + '</div>';
+      }
+      return;
+    }
+    // 결과 카드 — SCR 표기 추가
+    d._scope_label = 'SCR ' + scrId;
+    renderBulkResult(d);
+  } catch (e) {
+    if (progressEl) {
+      progressEl.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ 네트워크 오류: ' + escapeHtml(e.message) + '</div>';
+    }
+  } finally {
+    if (groupBtn) {
+      groupBtn.disabled = false;
+      groupBtn.textContent = '📦 SCR 일괄 적용';
+      groupBtn.style.opacity = '';
+      groupBtn.style.cursor = 'pointer';
+    }
+  }
+}
+
+// 일괄 적용 — 체크된 modify 후보 전부에 AI 호출 + 사본 셀 갱신
+async function applyBulk() {
+  if (!_updateSessionId) {
+    alert('먼저 2단계 영향 분석을 실행하세요.');
+    return;
+  }
+
+  const selections = Array.from(document.querySelectorAll('.cand-chk')).map(function(cb) {
+    return { idx: parseInt(cb.dataset.idx, 10), accept: cb.checked };
+  });
+  // 체크된 modify 후보만 카운트
+  const checkedModifyCount = selections.filter(function(s) {
+    if (!s.accept) return false;
+    const c = (_updateCandidates || [])[s.idx];
+    return c && c.action === 'modify' && c.tc_id;
+  }).length;
+
+  if (checkedModifyCount === 0) {
+    alert('체크된 수정 후보가 없습니다.\\n\\n수정 후보 (✏️ MODIFY) 항목을 하나 이상 체크하세요.');
+    return;
+  }
+
+  const estimateSec = checkedModifyCount * 5;
+  const estimateMin = Math.ceil(estimateSec / 60);
+  if (!confirm(
+    '📦 일괄 적용\\n\\n'
+    + checkedModifyCount + '개 수정 후보에 대해:\\n'
+    + '  1. AI 가 각 TC 의 수정안 생성\\n'
+    + '  2. 사본 시트의 셀을 실제로 갱신\\n'
+    + '  3. TC Edit Log 에 이력 기록\\n\\n'
+    + '⏱ 예상 시간: 약 ' + estimateMin + '분 (건당 ~5초)\\n'
+    + '💰 AI 호출 ' + checkedModifyCount + '회 발생\\n\\n'
+    + '진행할까요?'
+  )) {
+    return;
+  }
+
+  const btn = document.getElementById('applyBulkBtn');
+  const progressEl = document.getElementById('applyBulkProgress');
+  const statusEl = document.getElementById('applyStatus');
+  btn.disabled = true;
+  btn.textContent = '⏳ 일괄 적용 중...';
+  progressEl.classList.remove('hidden');
+  progressEl.innerHTML = ''
+    + '<div style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:#FEF3C7; border:1px solid #FBBF24; border-radius:6px;">'
+    +   '<div style="width:20px; height:20px; border:3px solid #FCD34D; border-top-color:#92400E; border-radius:50%; animation:plan-spin 0.8s linear infinite; flex-shrink:0;"></div>'
+    +   '<div style="flex:1; font-size:12px; color:#78350F;">'
+    +     '<strong>일괄 적용 중...</strong> AI 호출 + 사본 셀 갱신 — ' + checkedModifyCount + '건 처리 (약 ' + estimateMin + '분 소요).<br>'
+    +     '<span style="font-size:11px;">⚠ 페이지를 닫지 마세요. 완료 후 자동으로 결과가 표시됩니다.</span>'
+    +   '</div>'
+    + '</div>';
+  statusEl.innerHTML = '';
+
+  try {
+    const r = await fetch('/update/apply-bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: _updateSessionId,
+        selections: selections,
+        skip_existing: true,
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      progressEl.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(d.error || '오류') + '</div>';
+      return;
+    }
+    // 결과 카드 렌더
+    renderBulkResult(d);
+  } catch (e) {
+    progressEl.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ 네트워크 오류: ' + escapeHtml(e.message) + '</div>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📦 선택 항목 일괄 적용 (AI 호출 + 사본 셀 갱신)';
+  }
+}
+
+function renderBulkResult(d) {
+  const progressEl = document.getElementById('applyBulkProgress');
+  const scopeText = d._scope_label ? ' (' + d._scope_label + ')' : '';
+  let html = ''
+    + '<div style="padding:14px 16px; background:linear-gradient(135deg, #F0FDF4 0%, #DCFCE7 100%); border:2px solid #16A34A; border-radius:8px;">'
+    +   '<div style="font-size:14px; font-weight:700; color:#166534; margin-bottom:10px;">'
+    +     '✅ 일괄 적용 완료' + escapeHtml(scopeText) + ' — ' + d.processed + '건 처리'
+    +   '</div>'
+    +   '<div style="display:flex; gap:10px; flex-wrap:wrap; font-size:12px; margin-bottom:12px;">'
+    +     '<span style="background:#FFF; color:#166534; padding:4px 10px; border-radius:4px; border:1px solid #BBF7D0;">✏️ 적용 ' + d.applied + '건</span>'
+    +     '<span style="background:#FFF; color:#1E40AF; padding:4px 10px; border-radius:4px; border:1px solid #BFDBFE;">✅ 변경 불필요 ' + d.no_change + '건</span>';
+  if (d.skipped) html += '<span style="background:#FFF; color:#6B7280; padding:4px 10px; border-radius:4px; border:1px solid #E5E7EB;">⏭ 중복 skip ' + d.skipped + '건</span>';
+  if (d.errors) html += '<span style="background:#FEE2E2; color:#991B1B; padding:4px 10px; border-radius:4px; border:1px solid #FCA5A5;">⚠ 오류 ' + d.errors + '건</span>';
+  html += '</div>';
+
+  if (d.copy_url) {
+    html += '<div style="font-size:12px; color:#374151; margin-bottom:10px;">'
+      + '📋 사본에서 확인: <a href="' + d.copy_url + '" target="_blank" style="color:#1E40AF;">사본 Sheets 열기 →</a>'
+      + ' · 이력은 <strong>TC Edit Log</strong> 시트에 기록됨'
+      + '</div>';
+  }
+
+  // 상세 토글
+  html += '<details style="margin-top:8px;"><summary style="cursor:pointer; font-size:11px; color:#6B7280; padding:4px 0;">▸ 상세 결과 보기 (' + (d.details || []).length + '건)</summary>';
+  html += '<div style="margin-top:6px; max-height:240px; overflow-y:auto; border:1px solid #E5E7EB; border-radius:6px; background:#FFF;">';
+  html += '<table style="width:100%; font-size:11px; border-collapse:collapse;">';
+  html += '<thead style="background:#F9FAFB; position:sticky; top:0;"><tr>'
+    + '<th style="padding:5px 8px; text-align:left; border-bottom:1px solid #E5E7EB; width:130px;">TC ID</th>'
+    + '<th style="padding:5px 8px; text-align:left; border-bottom:1px solid #E5E7EB; width:90px; white-space:nowrap;">상태</th>'
+    + '<th style="padding:5px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">필드/이유</th>'
+    + '</tr></thead><tbody>';
+  (d.details || []).forEach(function(item) {
+    const stateLabel = {
+      applied: '<span style="color:#166534;">✏️ 적용</span>',
+      no_change: '<span style="color:#1E40AF;">✅ 불필요</span>',
+      skipped: '<span style="color:#6B7280;">⏭ skip</span>',
+      error: '<span style="color:#991B1B;">⚠ 오류</span>',
+    }[item.status] || escapeHtml(item.status);
+    const detail = item.fields_changed
+      ? item.fields_changed.join(', ')
+      : (item.rationale || item.reason || item.error || '');
+    html += '<tr style="border-bottom:1px solid #F3F4F6;">'
+      + '<td style="padding:5px 8px; font-family:monospace;">' + escapeHtml(item.tc_id || '') + '</td>'
+      + '<td style="padding:5px 8px; white-space:nowrap;">' + stateLabel + '</td>'
+      + '<td style="padding:5px 8px; color:#374151;">' + escapeHtml(detail).slice(0, 200) + '</td>'
+      + '</tr>';
+  });
+  html += '</tbody></table></div></details>';
+  html += '</div>';
+
+  progressEl.innerHTML = html;
+
+  if (typeof showToast === 'function') {
+    showToast('✅ 일괄 적용 완료 — 적용 ' + d.applied + ' / 변경불필요 ' + d.no_change + ' / 오류 ' + d.errors);
+  }
+}
+
+async function applyUpdates() {
+  if (!_updateSessionId) {
+    alert('먼저 2단계 영향 분석을 실행하세요.');
+    return;
+  }
+  // 분석 진행 중이면 차단 (사용자가 로딩 못 봤어도 클릭 안 통하게)
+  const applyBtn = document.getElementById('applyBtn');
+  if (applyBtn && applyBtn.disabled) {
+    alert(applyBtn.dataset.loadingMsg || '분석 진행 중입니다. 잠시 기다려주세요.');
+    return;
+  }
+  const selections = Array.from(document.querySelectorAll('.cand-chk')).map(cb => ({
+    idx: parseInt(cb.dataset.idx, 10),
+    accept: cb.checked,
+  }));
+  const accepted = selections.filter(s => s.accept).length;
+  if (accepted === 0) {
+    if (!confirm('선택된 항목이 없습니다. 그래도 진행할까요?')) return;
+  } else if (!confirm(accepted + '건을 사본 Sheets 의 Update Log 시트에 기록합니다. 진행할까요?')) {
+    return;
+  }
+
+  const btn = document.getElementById('applyBtn');
+  const statusEl = document.getElementById('applyStatus');
+  btn.disabled = true;
+  btn.textContent = '⏳ 적용 중...';
+  statusEl.textContent = '사본 Sheets 에 기록 중...';
+
+  try {
+    const resp = await fetch('/update/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _updateSessionId, selections: selections }),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      statusEl.innerHTML = '<span style="color:#DC2626;">❌ ' + (data.error || '오류') + '</span>';
+      return;
+    }
+    statusEl.innerHTML = '✅ 적용 완료 — ' + data.applied_count + '건이 [' + escapeHtml(data.log_sheet || '') + '] 시트에 기록됨. '
+      + (data.copy_url ? '<a href="' + data.copy_url + '" target="_blank" style="color:#1E40AF;">사본 열기 →</a>' : '');
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:#DC2626;">❌ ' + e.message + '</span>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '✅ 선택 항목 사본에 적용';
+  }
+}
+
+// ── 사본 → 원본 적용 (Promote) + 롤백 ────────────────────────────────────
+let _promotePlan = null;           // dry_run 결과 보관
+let _lastBackupUrl = '';           // promote 완료 후 롤백 위해
+
+async function startPromote() {
+  // 중복 클릭 가드 — 이미 한 번 promote 했으면 명시 확인
+  if (_lastBackupUrl) {
+    if (!confirm(
+      '⚠️ 이미 원본에 반영했습니다.\\n\\n'
+      + '다시 누르면 다음이 발생합니다:\\n'
+      + '  • 새 백업 사본이 또 만들어짐 (Drive 용량 낭비)\\n'
+      + '  • Promote Log 시트에 같은 행이 중복 추가\\n'
+      + '  • 롤백 기준이 새 백업으로 바뀜 (이전 백업 추적 어려움)\\n\\n'
+      + '💡 권장: 사본 셀을 더 수정한 뒤에 다시 promote 하세요.\\n'
+      + '그래도 진행할까요?'
+    )) {
+      return;
+    }
+  }
+
+  const copyUrl = (window._lastPlanCopyUrl || '').trim() ||
+                    (document.querySelector('#planCopyLink a')?.href || '').trim();
+  const sourceUrl = document.getElementById('updateTcUrl').value.trim();
+  if (!copyUrl) {
+    alert('사본 URL 을 찾을 수 없어요. 2단계 분석을 먼저 실행하세요.');
+    return;
+  }
+  if (!sourceUrl) {
+    alert('원본 Sheets URL 이 비어있습니다.');
+    return;
+  }
+
+  const modal = document.getElementById('promoteModal');
+  const body = document.getElementById('promoteModalBody');
+  const confirmBtn = document.getElementById('promoteConfirmBtn');
+  modal.classList.remove('hidden');
+  confirmBtn.disabled = true;
+  body.innerHTML = ''
+    + '<div style="display:flex; align-items:center; gap:12px; padding:14px;">'
+    +   '<div style="width:20px; height:20px; border:3px solid #FDE68A; border-top-color:#92400E; border-radius:50%; animation:plan-spin 0.8s linear infinite;"></div>'
+    +   '<div>'
+    +     '<div style="font-size:13px; font-weight:600; color:#78350F;">⏳ 미리보기 산출 중</div>'
+    +     '<div style="font-size:11px; color:#92400E; margin-top:3px;">사본의 TC Edit Log → 원본 셀 좌표 매칭</div>'
+    +   '</div>'
+    + '</div>';
+
+  try {
+    const r = await fetch('/update/promote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        copy_url: copyUrl,
+        source_url: sourceUrl,
+        dry_run: true,
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      body.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(d.error || '오류') + '</div>';
+      return;
+    }
+    _promotePlan = d;
+    renderPromotePreview(d, copyUrl, sourceUrl);
+    confirmBtn.disabled = false;
+  } catch (e) {
+    body.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function renderPromotePreview(d, copyUrl, sourceUrl) {
+  const body = document.getElementById('promoteModalBody');
+  const plan = d.plan || [];
+  const missing = d.missing || [];
+
+  let html = '';
+
+  // 갱신 대상 URL 강조 — 사용자가 무엇을 변경하는지 명확히
+  html += '<div style="padding:10px 14px; background:#FEE2E2; border:2px solid #DC2626; border-radius:6px; margin-bottom:14px; font-size:13px; color:#7F1D1D;">'
+    + '🎯 <strong>갱신 대상 Sheets:</strong><br>'
+    + '<a href="' + (sourceUrl || '#') + '" target="_blank" style="color:#991B1B; font-family:monospace; font-size:11px; word-break:break-all;">' + escapeHtml(sourceUrl || '(없음)') + '</a>'
+    + '<br><span style="font-size:11px;">이 시트의 셀이 실제로 변경됩니다. 백업이 자동 생성되니 롤백 가능합니다.</span>'
+    + '</div>';
+
+  // 요약
+  html += '<div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; font-size:12px;">'
+    + '<span style="background:#DCFCE7; color:#166534; padding:4px 10px; border-radius:4px;">📋 적용 대상 ' + plan.length + '개 셀</span>'
+    + '<span style="background:#F3F4F6; color:#374151; padding:4px 10px; border-radius:4px;">📄 TC Edit Log 총 ' + d.log_count + '건</span>'
+    + (missing.length ? '<span style="background:#FEE2E2; color:#991B1B; padding:4px 10px; border-radius:4px;">⚠️ 매칭 실패 ' + missing.length + '건</span>' : '')
+    + '<span style="background:#FEF3C7; color:#92400E; padding:4px 10px; border-radius:4px;">📁 영향 시트: ' + (d.sheets_seen || []).join(', ') + '</span>'
+    + '</div>';
+
+  // 안내
+  html += '<div style="padding:10px 12px; background:#FEF3C7; border:1px solid #FBBF24; border-radius:6px; margin-bottom:14px; font-size:12px; color:#78350F; line-height:1.6;">'
+    + '⚠️ <strong>적용 시 자동 진행:</strong><br>'
+    + '&nbsp;&nbsp;1. 원본 Sheets 를 <code>backup before update YYYY-MM-DD HH:MM</code> 이름으로 사본 복사 (자동 백업)<br>'
+    + '&nbsp;&nbsp;2. ' + plan.length + '개 셀을 원본에 갱신 (batchUpdate)<br>'
+    + '&nbsp;&nbsp;3. 원본에 <code>Promote Log</code> 시트 생성/추가 (적용 이력)<br>'
+    + '&nbsp;&nbsp;4. 적용 후 <strong>🔄 마지막 적용 롤백</strong> 버튼 활성화'
+    + '</div>';
+
+  // 적용 셀 리스트
+  if (plan.length) {
+    html += '<div style="font-size:13px; font-weight:600; color:#1E3A5F; margin-bottom:6px;">📝 적용 셀 (앞 20개)</div>';
+    html += '<div style="max-height:280px; overflow-y:auto; border:1px solid #E5E7EB; border-radius:6px; margin-bottom:14px;">';
+    html += '<table style="width:100%; font-size:11px; border-collapse:collapse;">';
+    html += '<thead style="background:#F9FAFB; position:sticky; top:0;"><tr>'
+      + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">TC ID</th>'
+      + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">필드</th>'
+      + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">원본 셀</th>'
+      + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">새 값 (앞 100자)</th>'
+      + '</tr></thead><tbody>';
+    plan.slice(0, 20).forEach(function(p) {
+      html += '<tr style="border-bottom:1px solid #F3F4F6;">'
+        + '<td style="padding:5px 8px; font-family:monospace;">' + escapeHtml(p.tc_id) + '</td>'
+        + '<td style="padding:5px 8px;">' + escapeHtml(p.field) + '</td>'
+        + '<td style="padding:5px 8px; font-family:monospace; color:#1E40AF;">' + escapeHtml(p.source_cell) + '</td>'
+        + '<td style="padding:5px 8px; color:#374151;">' + escapeHtml((p.new_value || '').slice(0, 100)) + (p.new_value && p.new_value.length > 100 ? '…' : '') + '</td>'
+        + '</tr>';
+    });
+    html += '</tbody></table>';
+    if (plan.length > 20) {
+      html += '<div style="padding:8px; background:#F9FAFB; font-size:11px; color:#6B7280; text-align:center;">… 외 ' + (plan.length - 20) + '건</div>';
+    }
+    html += '</div>';
+  }
+
+  // 매칭 실패
+  if (missing.length) {
+    html += '<div style="font-size:13px; font-weight:600; color:#991B1B; margin-bottom:6px;">⚠️ 매칭 실패 (' + missing.length + '건)</div>';
+    html += '<div style="background:#FEF2F2; border:1px solid #FCA5A5; border-radius:6px; padding:8px 12px; font-size:11px; color:#7F1D1D; max-height:150px; overflow-y:auto;">';
+    missing.forEach(function(m) {
+      html += '<div>• ' + escapeHtml(m.tc_id) + ' [' + escapeHtml(m.sheet_title) + '] — ' + escapeHtml(m.reason) + '</div>';
+    });
+    html += '</div>';
+  }
+
+  body.innerHTML = html;
+}
+
+function closePromoteModal() {
+  document.getElementById('promoteModal').classList.add('hidden');
+}
+
+async function confirmPromote() {
+  if (!_promotePlan) return;
+  const copyUrl = (window._lastPlanCopyUrl || '').trim() ||
+                    (document.querySelector('#planCopyLink a')?.href || '').trim();
+  const sourceUrl = document.getElementById('updateTcUrl').value.trim();
+  const confirmBtn = document.getElementById('promoteConfirmBtn');
+  const body = document.getElementById('promoteModalBody');
+
+  if (!confirm('원본 Sheets 에 ' + _promotePlan.count + '개 셀을 갱신합니다.\\n\\n원본은 자동 백업되며, 적용 후 롤백 가능합니다.\\n\\n진행할까요?')) {
+    return;
+  }
+
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = '⏳ 백업 + 적용 중...';
+
+  try {
+    const r = await fetch('/update/promote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        copy_url: copyUrl,
+        source_url: sourceUrl,
+        dry_run: false,
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      body.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(d.error || '오류') + '</div>';
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = '✏️ 원본에 적용 (백업 + 갱신)';
+      return;
+    }
+    _lastBackupUrl = d.backup?.backup_url || '';
+    // 모달 닫고 상태 갱신
+    closePromoteModal();
+    const statusEl = document.getElementById('promoteStatus');
+    // 갱신된 원본 (= source_url) 링크도 함께 표시 — 사용자가 결과물 바로 확인 가능
+    const updatedSourceUrl = d.source_url || sourceUrl || '';
+    statusEl.innerHTML = '✅ 적용 완료 — <strong>' + d.applied_count + '개 셀</strong> 갱신됨'
+      + ' · 적용 시각 ' + escapeHtml(d.applied_at)
+      + '<br><span style="font-size:11px;">'
+      + (updatedSourceUrl
+          ? '📄 <a href="' + updatedSourceUrl + '" target="_blank" style="color:#166534; font-weight:600;">갱신된 원본 열기 →</a> · '
+          : '')
+      + '<a href="' + d.backup.backup_url + '" target="_blank" style="color:#1E40AF;">💾 백업 사본 열기</a>'
+      + '</span>';
+    statusEl.style.color = '#166534';
+
+    // promote 버튼 시각 갱신 — '이미 적용됨' 표시 (회색) + 라벨 변경
+    const promoteBtn = document.getElementById('promoteBtn');
+    if (promoteBtn) {
+      promoteBtn.textContent = '✓ 이미 적용됨 — 다시 적용하려면 클릭';
+      promoteBtn.style.background = '#9CA3AF';
+      promoteBtn.style.opacity = '0.7';
+      promoteBtn.title = '주의: 다시 누르면 새 백업 + Promote Log 중복';
+    }
+
+    // 롤백 버튼 노출
+    const rbBtn = document.getElementById('rollbackBtn');
+    rbBtn.style.display = 'inline-block';
+    rbBtn.dataset.backupUrl = d.backup.backup_url;
+
+    if (typeof showToast === 'function') {
+      showToast('✅ 원본 갱신 완료 — ' + d.applied_count + '개 셀');
+    }
+  } catch (e) {
+    body.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(e.message) + '</div>';
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = '✏️ 원본에 적용 (백업 + 갱신)';
+  }
+}
+
+async function startRollback() {
+  const rbBtn = document.getElementById('rollbackBtn');
+  const backupUrl = rbBtn.dataset.backupUrl || _lastBackupUrl;
+  const sourceUrl = document.getElementById('updateTcUrl').value.trim();
+  if (!backupUrl) {
+    alert('백업 URL 이 없습니다. 먼저 promote 를 실행하세요.');
+    return;
+  }
+  // 중복 클릭 가드 — 이미 한 번 롤백했으면 명시 확인
+  if (rbBtn.dataset.rolledBack === '1') {
+    if (!confirm(
+      '⚠️ 이미 롤백했습니다.\\n\\n'
+      + '같은 백업 기준으로 다시 롤백을 시도하면 같은 셀에 같은 값이 한 번 더 쓰입니다 (idempotent).\\n'
+      + '대부분 의미 없습니다.\\n\\n'
+      + '그래도 진행할까요?'
+    )) {
+      return;
+    }
+  }
+  if (!confirm('마지막 적용을 롤백합니다.\\n\\n원본의 Promote Log 에 기록된 셀들이 백업 시점의 값으로 복원됩니다.\\n진행할까요?')) {
+    return;
+  }
+
+  rbBtn.disabled = true;
+  rbBtn.textContent = '⏳ 롤백 중...';
+
+  try {
+    const r = await fetch('/update/rollback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source_url: sourceUrl,
+        backup_url: backupUrl,
+        scope: 'promote_log',
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      alert('롤백 실패: ' + (d.error || '오류'));
+      rbBtn.disabled = false;
+      rbBtn.textContent = '🔄 마지막 적용 롤백';
+      return;
+    }
+    const statusEl = document.getElementById('promoteStatus');
+    statusEl.innerHTML = '🔄 롤백 완료 — <strong>' + d.restored_count + '개 셀</strong> 백업 시점으로 복원됨 · ' + escapeHtml(d.restored_at || '');
+    statusEl.style.color = '#1E40AF';
+
+    // 롤백 버튼 시각 갱신 — '이미 롤백됨' 표시 (회색)
+    rbBtn.dataset.rolledBack = '1';
+    rbBtn.style.background = '#F3F4F6';
+    rbBtn.style.color = '#6B7280';
+    rbBtn.style.borderColor = '#D1D5DB';
+    rbBtn.title = '이미 롤백됨 — 다시 누르면 같은 값으로 idempotent 복원';
+
+    if (typeof showToast === 'function') {
+      showToast('🔄 롤백 완료 — ' + d.restored_count + '개 셀');
+    }
+  } catch (e) {
+    alert('롤백 네트워크 오류: ' + e.message);
+  } finally {
+    rbBtn.disabled = false;
+    rbBtn.textContent = '🔄 마지막 적용 롤백';
+  }
 }
 
 // 섹션(add/mod/rem/all)별 체크박스 일괄 선택/해제
@@ -13168,6 +18518,7 @@ function connectStream(sid) {
     // 성공 연결 → 재연결 카운트 리셋, 중단 버튼 활성
     _sseReconnectCount = 0;
     setStopButtonsDisabled(false);
+    if (typeof updateRestartButtonState === 'function') updateRestartButtonState();
   };
   eventSource.onmessage = (e) => {
     try {
@@ -13189,7 +18540,7 @@ function connectStream(sid) {
 
     if (!sessionAlive) {
       // 세션 소멸 확정 → 재연결 중단 + 명확한 안내
-      if (eventSource) { eventSource.close(); eventSource = null; }
+      if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
       showSessionLostBanner();
       setStopButtonsDisabled(true);
       stopCountdown();
@@ -13202,7 +18553,7 @@ function connectStream(sid) {
       addLog('⚠️ SSE 연결 오류. 재연결 시도 중...', true);
     } else if (_sseReconnectCount >= _SSE_MAX_RECONNECT) {
       addLog(`⚠️ 재연결 실패(${_sseReconnectCount}회). 새로고침이나 세션 확인 필요.`, true);
-      if (eventSource) { eventSource.close(); eventSource = null; }
+      if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
       showSessionLostBanner(true);
       return;
     }
@@ -13371,7 +18722,24 @@ function handleEvent(evt) {
   if (evt.type === 'stopped') {
     stopCountdown();
     setStopButtonsDisabled(true);
-    ['card2', 'card3'].forEach(id => {
+    // 상단 gateNavBox 가 보이면 그곳을 중단 상태로 갱신 (단일 네비게이션)
+    const gateNavBox = document.getElementById('gateNavBox');
+    const gateNavMsg = document.getElementById('gateNavMsg');
+    const gateNavButtons = document.getElementById('gateNavButtons');
+    if (gateNavBox && gateNavMsg && gateNavButtons) {
+      // 시각 — 빨간 톤으로
+      gateNavBox.style.background = '#FEE2E2';
+      gateNavBox.style.borderColor = '#FCA5A5';
+      gateNavBox.style.borderStyle = 'solid';
+      gateNavMsg.style.color = '#991B1B';
+      gateNavMsg.innerHTML = '⏹ <strong>파이프라인이 중단되었습니다</strong><br>'
+        + '<span style="font-size:11px;">아래 버튼으로 다음 작업을 선택하세요.</span>';
+      gateNavButtons.innerHTML = ''
+        + '<button onclick="restartFromScratch()" style="padding:8px 16px; background:#2563EB; color:#fff; border:none; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer;">🏠 처음부터 (입력 유지)</button>'
+        + '<button onclick="retryPipeline()" style="padding:8px 14px; background:#fff; color:#1D4ED8; border:1.5px solid #93C5FD; border-radius:8px; font-size:12px; cursor:pointer;">🔄 이어서 재시작</button>';
+    }
+    // card2 에만 별도 banner (gateNavBox 는 card3 에만 있음)
+    ['card2'].forEach(id => {
       const card = document.getElementById(id);
       if (!card.classList.contains('hidden')) {
         const banner = document.createElement('div');
@@ -14716,6 +20084,13 @@ async function stopPipeline() {
   try {
     await fetch('/stop/' + currentSid, { method: 'POST' });
     showToast('⏹ 중단 요청을 보냈습니다...', 'error');
+    // 프론트에서도 SSE 즉시 끊기 — 가드 (isPipelineRunning) 가 풀리도록
+    // 서버는 백그라운드에서 현 단계 종료 후 멈춤. 프론트는 더 이상 이벤트 받을 필요 없음.
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+      if (typeof updateRestartButtonState === 'function') updateRestartButtonState();
+    }
   } catch(e) {
     showToast('❌ 중단 요청 실패: ' + e.message, 'error');
     setStopButtonsDisabled(false);
