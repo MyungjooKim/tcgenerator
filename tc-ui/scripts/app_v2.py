@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.1"
+APP_VERSION         = "v0.12.2"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -18293,10 +18293,16 @@ async function previewDiff() {
     });
     const d = await r.json();
     if (!d.ok) { prev.innerHTML = '<span style="color:#DC2626;">❌ ' + d.error + '</span>'; return; }
+    // 미리 저장 — 펼치기/복사 버튼이 참조
+    window._diffPreviewData = {
+      added: d.added || [],
+      modified: d.modified || [],
+      removed: d.removed || [],
+    };
     let html = '<div style="line-height:1.6;">';
-    html += `<div><strong>🆕 추가:</strong> ${d.added.length}개${d.added.length ? ' — <code>' + d.added.slice(0, 8).join(', ') + (d.added.length > 8 ? ', ...' : '') + '</code>' : ''}</div>`;
-    html += `<div><strong>📝 수정:</strong> ${d.modified.length}개${d.modified.length ? ' — <code>' + d.modified.slice(0, 8).join(', ') + (d.modified.length > 8 ? ', ...' : '') + '</code>' : ''}</div>`;
-    html += `<div><strong>🗑 삭제:</strong> ${d.removed.length}개${d.removed.length ? ' — <code>' + d.removed.slice(0, 8).join(', ') + (d.removed.length > 8 ? ', ...' : '') + '</code>' : ''}</div>`;
+    html += renderDiffLine('added',    '🆕 추가', d.added || []);
+    html += renderDiffLine('modified', '📝 수정', d.modified || []);
+    html += renderDiffLine('removed',  '🗑 삭제', d.removed || []);
     html += `<div><strong>✅ 동일:</strong> ${d.unchanged_count}개</div>`;
     if (d.common_changed) {
       html += '<div style="margin-top:4px;color:#B45309;"><strong>⚠️ 공통 문서(정책/디자인/overview) 변경됨</strong> — 모든 화면 재생성을 권장합니다 (전체 일관성 위해).</div>';
@@ -18306,6 +18312,64 @@ async function previewDiff() {
     prev.innerHTML = html;
   } catch(e) {
     prev.innerHTML = '<span style="color:#DC2626;">❌ 서버 오류: ' + e.message + '</span>';
+  }
+}
+
+// diff 한 줄 렌더 — 8개까지 inline + 펼치기/복사 버튼 (9개 이상일 때)
+function renderDiffLine(key, label, items) {
+  const total = items.length;
+  if (total === 0) {
+    return `<div><strong>${label}:</strong> 0개</div>`;
+  }
+  const PREVIEW_N = 8;
+  const previewHtml = '<code>' + items.slice(0, PREVIEW_N).join(', ')
+    + (total > PREVIEW_N ? ', …' : '') + '</code>';
+  const expandable = total > PREVIEW_N;
+  const btns = ''
+    + '<button type="button" onclick="copyDiffList(\\'' + key + '\\')" '
+    +   'style="font-size:10px; padding:2px 8px; margin-left:6px; background:#FFF; border:1px solid #CBD5E1; '
+    +   'border-radius:3px; cursor:pointer; color:#1E40AF; vertical-align:middle;" '
+    +   'title="화면 코드 ' + total + '개를 콤마 분리로 복사 (TC 생성 범위에 붙여넣기)">📋 ' + total + '개 복사</button>'
+    + (expandable
+      ? '<button type="button" id="btn-toggle-' + key + '" onclick="toggleDiffList(\\'' + key + '\\')" '
+        + 'style="font-size:10px; padding:2px 8px; margin-left:4px; background:#FFF; border:1px solid #CBD5E1; '
+        + 'border-radius:3px; cursor:pointer; color:#374151; vertical-align:middle;">▼ 전체 보기</button>'
+      : '');
+  // 펼친 영역 — 기본 숨김
+  const fullId = 'diff-full-' + key;
+  const fullPanel = expandable
+    ? '<div id="' + fullId + '" style="display:none; margin-top:4px; padding:6px 8px; background:#F9FAFB; border:1px solid #E5E7EB; border-radius:4px; font-family:monospace; font-size:11px; color:#374151; word-break:break-all; line-height:1.5;">'
+      + items.join(', ')
+      + '</div>'
+    : '';
+  return ''
+    + '<div data-diff-key="' + key + '" style="margin-bottom:2px;">'
+    +   '<strong>' + label + ':</strong> ' + total + '개 — ' + previewHtml + btns
+    + '</div>'
+    + fullPanel;
+}
+
+function toggleDiffList(key) {
+  const panel = document.getElementById('diff-full-' + key);
+  const btn = document.getElementById('btn-toggle-' + key);
+  if (!panel) return;
+  const open = panel.style.display === 'none';
+  panel.style.display = open ? 'block' : 'none';
+  if (btn) btn.textContent = open ? '▲ 접기' : '▼ 전체 보기';
+}
+
+function copyDiffList(key) {
+  const data = window._diffPreviewData;
+  if (!data || !data[key]) return;
+  const text = data[key].join(', ');
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function() {
+      showToast('📋 화면 코드 ' + data[key].length + '개 복사됨 — TC 생성 범위에 Cmd+V 로 붙여넣기', 'success');
+    }, function() {
+      window.prompt('복사 자동 실패 — 아래 텍스트를 직접 복사하세요:', text);
+    });
+  } else {
+    window.prompt('아래 텍스트를 복사하세요 (Cmd+C):', text);
   }
 }
 
