@@ -53,20 +53,19 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.11.0"
-APP_VERSION_DATE    = "2026-05-11"
-APP_VERSION_TAGLINE = "Combo 모드 — 옵션 조합 + 사용자 시나리오 그레이박스 TC"
+APP_VERSION         = "v0.12.0"
+APP_VERSION_DATE    = "2026-05-14"
+APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🧩 Combo 모드 신규 — 옵션 조합 매트릭스 + 페르소나 시나리오 기반 그레이박스 TC 자동 생성",
-    "🤖 AI 가 spec 폴더 분석해 *_combinations.md 명세 초안 작성 (참조 명세 일관성)",
-    "📋 시나리오 체크박스 선택 UI — 파일 그룹 + 출처 라벨 + 중복 도메인 강조",
-    "🗑️ 명세 파일 UI 삭제 버튼 (Soft delete — *.deleted_<timestamp> 백업)",
-    "🆔 도메인별 SuiteCode 분리 (SM-ORDR-COMBO / SM-LITE-COMBO) — TC ID 충돌 방지",
-    "🔄 Combo 모드 자동 복원 — 프로젝트 재선택 시 라디오/파일/시나리오 체크 상태 복원",
-    "⚡ Combo only 단축 경로 — SCR 분류·Gate·TC 생성 모두 skip, 바로 Combo TC",
-    "🛡 소분류 정규화 강화 — State 라벨, trigger label, 카테고리 헤딩, URL 일반화",
-    "📐 시트 1행만 고정으로 통일, TC 검토에 규칙 기반 품질 검출 통합",
+    "🆕 TC Update 모드 — 기획서 버전업 시 기존 Google Sheets TC 를 사본에 자동 갱신",
+    "🗂️ 후보 리스트 SCR 단위 그룹화 — 기본 접힘 + 헤더에 TC 수/체크 카운트/일괄 적용 버튼",
+    "✨ 신규 SCR 은 별도 '신규 TC 생성 모드' 로 분기 — 1단계 분석 결과에서 바로 진입",
+    "🛡️ 통합 게이트 네비게이션 박스 + 진행 중 재시작 가드 + SSE 정상 종료",
+    "🤖 propose AI 6 원칙 강화 — UI 검증 TC 인식 + 보수적 판단 + no_change 남용 방지",
+    "⚡ Sheets API 쿼터 방어 — 헤더/TC 본문 세션 캐시 + 429 명시 안내",
+    "📁 TC Update Drive 폴더 사용자 설정 (~/.tc-update-config.json)",
+    "📦 SCR 일괄 적용 — 해당 SCR 의 체크된 modify 만 AI 호출 + 사본 셀 갱신",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
