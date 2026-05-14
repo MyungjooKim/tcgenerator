@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.5"
+APP_VERSION         = "v0.12.6"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -868,10 +868,35 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
                 add(label)
 
     # 4) 비고의 [정책]/[제약]/[접근성]/[세션]/[타이밍] 마커
+    # v0.12.6: 백틱 코드 안 (` ... `[정책]` ... `) 의 마커는 무시 — 본문 마커만 추출.
+    # 사고 사례: SCR-221 의 `\`[정책]\` 참조)` → body=`\` 참조)` 같은 깨진 라벨 발생
     for m in re.finditer(r"\[(정책|제약|접근성|세션|타이밍|보안|성능)\]\s*([^\n]{5,80})", md_text):
+        # 시작 위치를 보고, 직전 backtick 이 닫히지 않았으면 백틱 안 → 무시
+        start = m.start()
+        # 같은 줄 안에서 [ 직전까지의 백틱 개수가 홀수면 코드 안
+        line_start = md_text.rfind("\n", 0, start) + 1
+        prefix_in_line = md_text[line_start:start]
+        if prefix_in_line.count("`") % 2 == 1:
+            continue
         marker, body = m.group(1), m.group(2)
         # 첫 문장만
         body = re.split(r"[.。]", body)[0].strip(" ·-")
+        # 백틱·HTML 제거 (extract_minors 의 add() 도 하지만 여기서 한 번 더 — 깨진 단편 방어)
+        body = re.sub(r"`[^`]*`?", "", body)        # 닫는 백틱 빠진 케이스도 잡음
+        body = re.sub(r"<[^>]+>", "", body)
+        body = re.sub(r"\s+", " ", body).strip(" .·-—()")
+        # 단편 거부 — '참조', '참조)', '같음' 같은 짧은 부연만 남으면 라벨로 부적합
+        FRAGMENT_PATTERNS = (
+            r"^참조\)?$",
+            r"^같음\)?$",
+            r"^동일\)?$",
+            r"^위 참조\)?$",
+            r"^아래 참조\)?$",
+        )
+        if any(re.match(p, body) for p in FRAGMENT_PATTERNS):
+            continue
+        if len(body) < 5:
+            continue
         if body:
             add(f"[{marker}] {body}")
 
