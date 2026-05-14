@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.4"
+APP_VERSION         = "v0.12.5"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -776,10 +776,13 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
                     if not is_trigger:
                         label = head
                         break
-        # 짧은 라벨 (32자) 보장 — 길면 '…' 없이 깔끔하게 잘라냄
+        # 공백 정리만 — 의미 보존을 위해 길이 절단하지 않음 (v0.12.5).
+        # 이전: 32자에서 무조건 자르다보니 'Conditional.push-permission-not-' 같이
+        # 의미가 깨진 채 표시되던 문제. 사용자 요청에 따라 그대로 둠.
+        # 안전망 — 추출 실수로 비정상적으로 긴 라벨 (200자 초과) 만 차단.
         label = re.sub(r"\s+", " ", label).strip(" .·-—")
-        if len(label) > 32:
-            label = label[:32].rstrip()
+        if len(label) > 200:
+            label = label[:200].rstrip()
         if len(label) < 3:
             return
         key = re.sub(r"\s+", "", label.lower())
