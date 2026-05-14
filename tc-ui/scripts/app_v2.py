@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.0"
+APP_VERSION         = "v0.12.1"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -18762,7 +18762,10 @@ function handleEvent(evt) {
     document.getElementById('card1').classList.remove('hidden');
     setStepBar(1);
     showToast('⏹ 파이프라인이 중단되었습니다.', 'error');
-    if (eventSource) eventSource.close();
+    // 가드 해제 — isPipelineRunning() 이 true 로 남아 처음부터 시작이 막히던 버그 차단
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    currentSid = null;
+    if (typeof updateRestartButtonState === 'function') updateRestartButtonState();
   }
 
   if (evt.type === 'error') {
@@ -18771,7 +18774,10 @@ function handleEvent(evt) {
     addLog('❌ 오류: ' + evt.data.msg, true);
     document.getElementById('stageLabel').textContent = '오류 발생';
     document.getElementById('startBtn').disabled = false;
-    if (eventSource) eventSource.close();
+    // 가드 해제 — error 후에도 처음부터 시작 / 입력 화면으로 가 막히지 않게
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    currentSid = null;
+    if (typeof updateRestartButtonState === 'function') updateRestartButtonState();
     // 오류 배너 + 재시작 버튼
     var card2 = document.getElementById('card2');
     var existing = card2.querySelector('.error-banner');
