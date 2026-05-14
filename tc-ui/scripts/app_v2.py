@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.2"
+APP_VERSION         = "v0.12.3"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -15582,6 +15582,14 @@ let _smartCurrentIndex = 0;        // 현재 진행 그룹 index
 let _smartResults = [];            // 누적된 summary 배열
 let _smartStopped = false;
 
+// 검증용 hook — Playwright 가 모듈 스코프 변수 set 후 showFinalSummary 호출 가능
+window.__debugSetSmartResults = function(scrs, results, stopped) {
+  _selectedScrs = Array.isArray(scrs) ? scrs : [];
+  _smartResults = Array.isArray(results) ? results : [];
+  _smartStopped = !!stopped;
+  showFinalSummary();
+};
+
 async function startSmartAnalyze() {
   const prevFolder = document.getElementById('updatePrevFolder').value.trim();
   const newFolder = document.getElementById('updateNewFolder').value.trim();
@@ -15920,6 +15928,56 @@ function stopAnalysis() {
   showFinalSummary();
 }
 
+// summary 텍스트에서 'TC 영향' 라인을 추출해 보수적으로 분류
+// 반환: 'needs_fix' | 'no_change' | 'unclear'
+function classifyTcImpact(summary) {
+  if (!summary) return 'unclear';
+  // 'TC 영향' 또는 'TC 영향 추정' 라벨이 있는 줄 추출 (마크다운 bold 포함)
+  // 주의: Python f-string 컨텍스트 — regex 안 \\n 은 진짜 줄바꿈으로 변환되어 깨짐.
+  // 줄 단위 split 후 라벨 검출로 우회 (split 인자는 fromCharCode 로 안전 생성).
+  const NL = String.fromCharCode(10);
+  const lines = String(summary).split(NL);
+  let line = '';
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (/(?:\*\*)?TC[\s ]*영향(?:[\s ]*추정)?(?:\*\*)?\s*[:：]/.test(ln)) {
+      const colonIdx = Math.max(ln.indexOf(':'), ln.indexOf('：'));
+      line = (colonIdx >= 0 ? ln.substring(colonIdx + 1) : ln).trim();
+      break;
+    }
+  }
+  if (!line) return 'unclear';
+  // 명확한 '변경 없음' 시그널 — 보수적으로 좁게 매칭
+  const noChangePatterns = [
+    /^\s*없음/,
+    /영향[\s ]*없음/,
+    /변경[\s ]*없음/,
+    /수정[\s ]*불필요/,
+    /기능\/UI\/로직[\s ]*변경이[\s ]*감지되지[\s ]*않/,
+    /동일함/,
+    /TC[\s ]*수정이?[\s ]*필요[\s ]*없/,
+  ];
+  for (const p of noChangePatterns) {
+    if (p.test(line)) return 'no_change';
+  }
+  // 명확한 '수정 필요' 시그널
+  const needsFixPatterns = [
+    /수정[\s ]*필요/,
+    /변경[\s ]*필요/,
+    /업데이트[\s ]*필요/,
+    /추가[\s ]*필요/,
+    /검토[\s ]*필요/,
+    /신규[\s ]*TC/,
+    /TC[\s ]*수정/,
+    /TC[\s ]*추가/,
+    /TC[\s ]*갱신/,
+  ];
+  for (const p of needsFixPatterns) {
+    if (p.test(line)) return 'needs_fix';
+  }
+  return 'unclear';
+}
+
 function showFinalSummary() {
   document.getElementById('smartProgressArea').classList.add('hidden');
   const finalArea = document.getElementById('smartFinalArea');
@@ -15931,20 +15989,59 @@ function showFinalSummary() {
   const stopped = _smartStopped;
   const total = _selectedScrs ? _selectedScrs.length : 0;
 
-  let html = '<div style="font-size:12px; color:#374151; margin-bottom:10px;">';
+  // 분류 — 분석된 항목에 대해서만
+  const classified = _smartResults.map(function(r) {
+    if (!r || r.skipped) return null;
+    return { r: r, impact: classifyTcImpact(r.summary || '') };
+  });
+  const needsFix = classified.filter(function(c) { return c && c.impact === 'needs_fix'; }).length;
+  const noChange = classified.filter(function(c) { return c && c.impact === 'no_change'; }).length;
+  const unclear  = classified.filter(function(c) { return c && c.impact === 'unclear'; }).length;
+
+  let html = '';
+  // 1줄 — 상위 카운트
+  html += '<div style="font-size:12px; color:#374151; margin-bottom:6px;">';
   html += '📊 총 ' + total + '개 SCR — ✅ 분석 ' + analyzed + ' · ⏭ 건너뜀 ' + skipped;
   if (stopped) html += ' · 🛑 중단됨';
   html += '</div>';
+  // 2줄 — 영향 분류 요약 (분석된 게 1건 이상일 때만)
+  if (analyzed > 0) {
+    html += '<div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; padding:8px 10px; '
+          + 'background:#F8FAFC; border:1px solid #E2E8F0; border-radius:6px; font-size:12px;">';
+    html += '<span style="background:#FEF3C7; color:#92400E; padding:3px 10px; border-radius:4px; font-weight:600;">'
+          + '🛠 수정 필요 ' + needsFix + '</span>';
+    html += '<span style="background:#DCFCE7; color:#166534; padding:3px 10px; border-radius:4px; font-weight:600;">'
+          + '✅ 변경 없음 ' + noChange + '</span>';
+    if (unclear > 0) {
+      html += '<span style="background:#FEE2E2; color:#991B1B; padding:3px 10px; border-radius:4px; font-weight:600;">'
+            + '⚠️ 판단 필요 ' + unclear + '</span>';
+    }
+    if (needsFix > 0) {
+      html += '<span style="margin-left:auto; align-self:center; color:#6B7280; font-size:11px;">'
+            + '💡 2단계에서 수정 필요 ' + needsFix + '건만 처리됩니다.</span>';
+    } else if (noChange === analyzed) {
+      html += '<span style="margin-left:auto; align-self:center; color:#166534; font-size:11px;">'
+            + '🎉 실질 변경 없음 — TC 수정 작업 불필요</span>';
+    }
+    html += '</div>';
+  }
 
   const typeIcon = { added: '🆕', modified: '✏️', removed: '🗑️' };
+  const impactBadge = {
+    needs_fix: '<span style="background:#FEF3C7; color:#92400E; padding:1px 6px; border-radius:3px; font-size:10px; margin-left:6px;">🛠 수정 필요</span>',
+    no_change: '<span style="background:#DCFCE7; color:#166534; padding:1px 6px; border-radius:3px; font-size:10px; margin-left:6px;">✅ 변경 없음</span>',
+    unclear:   '<span style="background:#FEE2E2; color:#991B1B; padding:1px 6px; border-radius:3px; font-size:10px; margin-left:6px;">⚠️ 판단 필요</span>',
+  };
   for (let i = 0; i < _smartResults.length; i++) {
     const r = _smartResults[i];
     if (!r) continue;
+    const c = classified[i];
     html += '<div style="margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid #E5E7EB;">';
     html += '<div style="font-size:12px; font-weight:700; color:#1E3A5F; margin-bottom:6px;">';
     html += (typeIcon[r.change_type] || '·') + ' ' + escapeHtml(r.scr_id || '?');
     if (r.from_cache) html += ' <span style="background:#DBEAFE; color:#1E40AF; padding:1px 6px; border-radius:3px; font-size:10px;">💾 캐시</span>';
     if (r.skipped) html += ' <span style="background:#F3F4F6; color:#6B7280; padding:1px 6px; border-radius:3px; font-size:10px;">⏭ 건너뜀</span>';
+    if (c && impactBadge[c.impact]) html += impactBadge[c.impact];
     html += '</div>';
     html += '<div style="font-size:12px; color:#111827;">' + renderMarkdownBasic(r.summary || '') + '</div>';
     html += '</div>';
