@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.3"
+APP_VERSION         = "v0.12.4"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -15998,6 +15998,15 @@ function showFinalSummary() {
   const noChange = classified.filter(function(c) { return c && c.impact === 'no_change'; }).length;
   const unclear  = classified.filter(function(c) { return c && c.impact === 'unclear'; }).length;
 
+  // 2단계로 넘기기 위한 분류 결과 보존 — needs_fix + unclear 만 후보, no_change 제외
+  window._smartImpactBySrc = {};
+  for (let i = 0; i < classified.length; i++) {
+    const c = classified[i];
+    if (c && c.r && c.r.scr_id) {
+      window._smartImpactBySrc[c.r.scr_id] = c.impact;
+    }
+  }
+
   let html = '';
   // 1줄 — 상위 카운트
   html += '<div style="font-size:12px; color:#374151; margin-bottom:6px;">';
@@ -16174,6 +16183,17 @@ window.__debugSetCandidates = function(items) {
   renderCandidates();
 };
 
+// '변경 없음' 포함 전체로 다시 산출
+function reRunPlanIncludeAll() {
+  window._planIncludeAll = true;
+  startUpdatePlan();
+}
+// 1단계 분류 기반 좁힘으로 다시 산출
+function reRunPlanWithImpactFilter() {
+  window._planIncludeAll = false;
+  startUpdatePlan();
+}
+
 async function startUpdatePlan() {
   const prevFolder = document.getElementById('updatePrevFolder').value.trim();
   const newFolder = document.getElementById('updateNewFolder').value.trim();
@@ -16221,6 +16241,41 @@ async function startUpdatePlan() {
 
   const projectName = (document.getElementById('projectDropdown') || document.getElementById('projectSelect') || {}).value || '';
 
+  // 분류 기반 자동 필터링 — 1단계에서 'no_change' 로 분류된 SCR 은 2단계에서 제외.
+  // 사용자가 '전체 보기' 토글로 끄지 않은 경우에만 적용.
+  const includeAll = !!window._planIncludeAll;
+  let scrFilter = (typeof _selectedScrs !== 'undefined' && _selectedScrs && _selectedScrs.length)
+                    ? _selectedScrs.slice() : null;
+  let filterReason = 'selected';   // selected | impact_filtered | all
+  let impactSkipped = [];
+  if (!includeAll && scrFilter && window._smartImpactBySrc) {
+    const filtered = scrFilter.filter(function(scr) {
+      const imp = window._smartImpactBySrc[scr];
+      // 분류 정보 없는 SCR 은 안전하게 포함
+      if (!imp) return true;
+      if (imp === 'no_change') { impactSkipped.push(scr); return false; }
+      return true;  // needs_fix, unclear → 포함
+    });
+    if (filtered.length < scrFilter.length) {
+      scrFilter = filtered;
+      filterReason = 'impact_filtered';
+    }
+  } else if (includeAll) {
+    filterReason = 'all';
+  }
+  // 빈 필터는 백엔드가 '전체 처리' 로 해석 → 의도 보존 위해 sentinel 처리
+  if (scrFilter && scrFilter.length === 0) {
+    // 전부 no_change 로 제외된 경우 — 진행 의미 없음
+    statsEl.innerHTML = '<div style="padding:14px 16px; background:#F0FDF4; border:1px solid #86EFAC; border-radius:8px; color:#166534; font-size:13px;">'
+      + '🎉 <strong>수정 대상이 없습니다</strong><br>'
+      + '<span style="font-size:12px;">1단계 분석에서 모든 SCR 이 \\'변경 없음\\' 으로 분류되어 2단계 작업이 불필요합니다.'
+      + ' 그래도 진행하려면 합본 보고서에서 \\'🔁 전체 16개로 다시 산출\\' 토글을 켜고 다시 시도하세요.</span>'
+      + '</div>';
+    btn.disabled = false;
+    btn.textContent = '🧭 2단계 — TC 매핑 + 영향 분석 (사본 생성)';
+    return;
+  }
+
   try {
     const resp = await fetch('/update/plan', {
       method: 'POST',
@@ -16231,9 +16286,7 @@ async function startUpdatePlan() {
         existing_tc_url: tcUrl,
         make_copy: true,
         project_name: projectName,
-        // 1단계에서 사용자가 선택한 SCR 들 (없으면 백엔드가 전체 처리)
-        scr_filter: (typeof _selectedScrs !== 'undefined' && _selectedScrs && _selectedScrs.length)
-                      ? _selectedScrs : null,
+        scr_filter: scrFilter,
         // 신규(add) 는 별도 '신규 TC 생성 모드' 에서 처리 → 2단계에서는 수정/삭제만
         exclude_actions: ['add'],
       })
@@ -16251,15 +16304,37 @@ async function startUpdatePlan() {
     _updateCandidates = data.candidates || [];
     const s = data.stats || {};
 
-    // 필터 적용 여부 안내
-    const filterNote = (typeof _selectedScrs !== 'undefined' && _selectedScrs && _selectedScrs.length)
-      ? '<div style="margin-bottom:8px; padding:6px 10px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; font-size:12px; color:#3730A3;">'
-          + '🎯 <strong>필터 적용</strong> — 1단계 선택 ' + _selectedScrs.length + '개 SCR 중 <strong>수정/삭제</strong>만 (신규는 별도 모드)<br>'
-          + '<span style="font-size:11px;">' + _selectedScrs.map(escapeHtml).join(', ') + '</span>'
-          + '</div>'
-      : '<div style="margin-bottom:8px; padding:6px 10px; background:#F3F4F6; border:1px solid #D1D5DB; border-radius:4px; font-size:11px; color:#6B7280;">'
-          + 'ℹ️ 신규(add) 후보는 제외됨 — 신규 SCR 은 <strong>신규 TC 생성 모드</strong> 에서 처리하세요.'
+    // 필터 적용 여부 안내 — 1단계 분류 기반 자동 좁힘 여부도 표시
+    let filterNote = '';
+    if (scrFilter && scrFilter.length) {
+      if (filterReason === 'impact_filtered') {
+        filterNote = '<div style="margin-bottom:8px; padding:8px 12px; background:#FEF3C7; border:1px solid #F59E0B; border-radius:6px; font-size:12px; color:#78350F;">'
+          + '🛠 <strong>1단계 분류 기반 자동 필터</strong> — 수정 필요/판단 필요 <strong>' + scrFilter.length + '개</strong>만 처리'
+          + ' <span style="color:#92400E;">(✅ 변경 없음 ' + impactSkipped.length + '개 제외)</span><br>'
+          + '<span style="font-size:11px; font-family:monospace;">' + scrFilter.map(escapeHtml).join(', ') + '</span><br>'
+          + '<button type="button" onclick="reRunPlanIncludeAll()" '
+          +   'style="margin-top:6px; font-size:11px; padding:3px 10px; background:#FFF; border:1px solid #F59E0B; border-radius:3px; cursor:pointer; color:#78350F;">'
+          +   '🔁 \\'변경 없음\\' 포함 전체 ' + _selectedScrs.length + '개로 다시 산출</button>'
           + '</div>';
+      } else if (filterReason === 'all') {
+        filterNote = '<div style="margin-bottom:8px; padding:6px 10px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; font-size:12px; color:#3730A3;">'
+          + '🌐 <strong>전체 처리 모드</strong> — 1단계 선택 ' + scrFilter.length + '개 SCR 전부 (변경 없음 포함)'
+          + '<button type="button" onclick="reRunPlanWithImpactFilter()" '
+          +   'style="margin-left:8px; font-size:11px; padding:2px 8px; background:#FFF; border:1px solid #C7D2FE; border-radius:3px; cursor:pointer; color:#3730A3;">'
+          +   '🛠 수정 필요만 다시 산출</button>'
+          + '</div>';
+      } else {
+        // selected — 1단계 분류 정보 없음 (예: 캐시 미존재)
+        filterNote = '<div style="margin-bottom:8px; padding:6px 10px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; font-size:12px; color:#3730A3;">'
+          + '🎯 <strong>필터 적용</strong> — 1단계 선택 ' + scrFilter.length + '개 SCR (분류 정보 없음)<br>'
+          + '<span style="font-size:11px;">' + scrFilter.map(escapeHtml).join(', ') + '</span>'
+          + '</div>';
+      }
+    } else {
+      filterNote = '<div style="margin-bottom:8px; padding:6px 10px; background:#F3F4F6; border:1px solid #D1D5DB; border-radius:4px; font-size:11px; color:#6B7280;">'
+        + 'ℹ️ 신규(add) 후보는 제외됨 — 신규 SCR 은 <strong>신규 TC 생성 모드</strong> 에서 처리하세요.'
+        + '</div>';
+    }
 
     statsEl.innerHTML = filterNote +
       '<div style="display:flex;gap:10px;flex-wrap:wrap;font-size:12px;">' +
