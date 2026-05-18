@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.13"
+APP_VERSION         = "v0.12.14"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -10554,10 +10554,11 @@ def update_apply_bulk():
                 ci = field_to_col.get(field, -1)
                 if ci < 0:
                     continue
-                # v0.12.13: 현재 값 == 새 값 가드 — AI 가 같은 텍스트 그대로 반환한 경우
-                # 사본 셀 덮어쓰기 + TC Edit Log 박힘 사고 차단. 공백·줄바꿈 정규화 비교.
+                # v0.12.14: 현재 값 == 새 값 가드 — AI 가 의미 동일한 텍스트 반환한 경우.
+                # 모든 공백·줄바꿈 제거 후 비교 (공백 1개 유무, 줄바꿈 위치 등 미세 차이는 무시).
+                # 사용자 의도: '의미 일치 우선' — 'Cross) 가' vs 'Cross)가' 같이 공백 1개 차이는 동일 처리.
                 def _norm(s):
-                    return re.sub(r"\s+", " ", str(s or "")).strip()
+                    return re.sub(r"\s+", "", str(s or ""))
                 if _norm(current_tc.get(field, "")) == _norm(new_value):
                     unchanged_fields.append(field)
                     continue
@@ -10571,11 +10572,12 @@ def update_apply_bulk():
                         body={"values": [[str(new_value)]]},
                     ).execute()
                     fields_changed.append(field)
+                    # v0.12.14: 200자 → 1000자 완화 (의미 보존). Sheets 셀은 50K 자까지 안전.
                     new_log_rows.append([
                         ts, tc_id, sheet_title, str(row_index), field,
-                        (current_tc.get(field, "") or "")[:200],
-                        (new_value or "")[:200],
-                        (proposal.get("rationale") or "")[:300],
+                        (current_tc.get(field, "") or "")[:1000],
+                        (new_value or "")[:1000],
+                        (proposal.get("rationale") or "")[:500],
                     ])
                     existing_keys.add((tc_id, sheet_title, field))
                 except Exception as e:
