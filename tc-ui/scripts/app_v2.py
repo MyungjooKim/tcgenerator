@@ -53,19 +53,19 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.17"
-APP_VERSION_DATE    = "2026-05-14"
-APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
+APP_VERSION         = "v0.13.0"
+APP_VERSION_DATE    = "2026-05-18"
+APP_VERSION_TAGLINE = "TC Update 모드 강화 — AI 차원 매칭 + 신규 TC 자동 권장 + 진행률 + 안정성"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "🆕 TC Update 모드 — 기획서 버전업 시 기존 Google Sheets TC 를 사본에 자동 갱신",
-    "🗂️ 후보 리스트 SCR 단위 그룹화 — 기본 접힘 + 헤더에 TC 수/체크 카운트/일괄 적용 버튼",
-    "✨ 신규 SCR 은 별도 '신규 TC 생성 모드' 로 분기 — 1단계 분석 결과에서 바로 진입",
-    "🛡️ 통합 게이트 네비게이션 박스 + 진행 중 재시작 가드 + SSE 정상 종료",
-    "🤖 propose AI 6 원칙 강화 — UI 검증 TC 인식 + 보수적 판단 + no_change 남용 방지",
-    "⚡ Sheets API 쿼터 방어 — 헤더/TC 본문 세션 캐시 + 429 명시 안내",
-    "📁 TC Update Drive 폴더 사용자 설정 (~/.tc-update-config.json)",
-    "📦 SCR 일괄 적용 — 해당 SCR 의 체크된 modify 만 AI 호출 + 사본 셀 갱신",
+    "⭐ AI 차원 매칭 — TC 검증 차원과 SCR 변경 차원 일치 검사 (우겨넣기 사고 차단)",
+    "🆕 needs_new_tc 자동 권장 — 차원 불일치 시 별도 TC 작성 권장 + 카테고리 표시",
+    "📊 일괄 적용 진행률 실시간 — 1.5초마다 polling + 처리 카운트/현재 TC ID 표시",
+    "📝 TC Edit Log incremental append — 5건마다 자동 flush (긴 작업도 중간 확인 가능)",
+    "🔌 SSE 재연결 강화 — 8회/60초 견딤 + 조용한 자동 복구 안내",
+    "🔄 admin/restart 안정화 — subprocess launcher 로 자기 재시작 (execv 한계 우회)",
+    "💨 브라우저 캐시 자동 무효화 — meta no-cache + HTTP header (Cmd+Shift+R 불필요)",
+    "🛠 기존 v0.12.x 누적 fix 17건 — 라벨 잘림, 분류 휴리스틱, 사본 동기화, 미리보기 UI 등",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
@@ -75,6 +75,17 @@ TC_FILES_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
+
+# v0.13.0: HTML 응답 no-cache header — 코드 변경 시 즉시 반영
+@app.after_request
+def _add_no_cache_headers(response):
+    # HTML 응답만 — JSON / static 은 그대로
+    ct = (response.content_type or "").lower()
+    if "html" in ct:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # ── 세션 저장소 ────────────────────────────────────────────────────────────────
 SESSIONS: dict[str, dict] = {}
@@ -2839,88 +2850,121 @@ def step_propose_tc_update(scr_id: str, prev_scr_text: str, new_scr_text: str,
     system_prompt = """당신은 QA 도메인 전문가입니다. 기획서(SCR) 변경에 따라
 테스트 케이스를 어떻게 수정해야 할지 균형있게 제안합니다.
 
-## 원칙 (반드시 지킬 것)
+## ⭐ 최상위 원칙: TC 의 검증 차원과 SCR 변경의 차원이 일치해야 expected 에 추가
 
-1. **TC 의 검증 범위 인식 — 가장 중요**:
-   - **TC 제목이 "UI 확인", "화면 확인", "상태 표시", "Layout", "초기 화면" 등 광범위한 UI 검증** 이면,
-     SCR 의 새 UI 요소 (배너, CTA, 안내 영역, 새 컨디셔널 블록) 도 **반드시 기대결과에 추가**.
-   - **TC 가 특정 동작 1개만 검증** (예: 버튼 탭, 필터 전환, 특정 기능) 이면,
-     그 동작과 무관한 새 요소는 무시.
-   - 판단 기준: "이 TC 를 실행하면 새 UI 요소가 화면에 보일 텐데, TC 가 그걸 검증해야 하나?"
+각 TC 는 명확한 **검증 차원**(category) 이 있습니다. SCR 변경이 그 차원과
+같을 때만 expected 에 추가하세요. 차원이 다르면 별도 TC 가 필요합니다
+(needs_new_tc 응답).
 
-2. **새 컨디셔널/분기 추가 = 신규 검증 항목**:
-   - SCR 에 `conditional [...]` 또는 새 상태 (permission, state) 분기가 추가되면 → **검증 누락**.
-   - "디자인 변경" 으로 간주하지 말 것. 이건 새 **기능 분기**.
+### 검증 차원 분류
 
-3. **정책/플로우 변경**: 검증 조건, 분기, API 응답 처리, 임계치 변경 등은 step/expected 갱신.
+| 차원 | TC expected 형태 | 변경 시 처리 |
+|------|-----------------|------------|
+| **화면 구성/표시** | "X, Y, Z 가 표시된다" — 표시 요소 나열 | 새 표시 요소 추가 OK |
+| **상태 동기화/공유** | "X 가 Y 화면에 반영된다", "정렬이 공유된다" | 화면 구성 변경 무시 |
+| **사용자 동작** | "X 버튼 탭 시 Y 가 발생한다" | 새 동작은 별도 TC |
+| **에러 처리** | "X 에러 시 Y 표시" | 새 에러는 별도 TC |
+| **계산 정확성** | "X 공식이 정확히 표시된다" | 새 계산은 별도 TC |
+| **상태 변화** | "Normal/Loading/Empty/Error 상태" | 새 상태는 별도 TC |
 
-4. **디자인/문구 변경 — TC 본문이 인용했나로 판단**:
+### 사고 사례 (이런 식으로 우겨넣지 말 것!)
+
+❌ **잘못된 우겨넣기:**
+```
+TC: "정렬 상태 공유" (차원: 상태 동기화)
+  expected: "Coin Selector 의 정렬이 24h 기준으로 적용. 24h chip 활성"
+SCR 변경: Volume 컬럼 추가 (차원: 화면 구성)
+→ 기존 expected 에 "각 코인 행에 Volume 정보 표시" 추가 ❌
+
+이유: TC 는 정렬 동기화 검증인데 Volume 표시는 화면 구성 차원. 차원이 다름.
+올바른 처리: needs_new_tc=true + "Volume 컬럼 표시 검증" 별도 TC 권장
+```
+
+✅ **올바른 처리:**
+```
+TC: "Coin Selector 화면 표시" (차원: 화면 구성)
+  expected: "코인 목록 표시. 각 행에 심볼·이름·가격 표시"
+SCR 변경: Volume 컬럼 추가
+→ expected 에 "Volume 값 표시 ($N.NB / $N.NM 형식)" 추가 ✅
+```
+
+## 원칙
+
+1. **차원 매칭 우선**: 위 표 참조. TC 차원 ≠ SCR 변경 차원 → expected 추가 X.
+
+2. **차원 불일치 시 needs_new_tc=true 응답**:
+   - SCR 변경이 TC 검증 가치가 있지만 차원이 다르면
+   - 기존 TC 는 수정 안 함 (steps/expected/precondition 모두 null)
+   - needs_new_tc=true + new_tc_purpose 에 "어떤 TC 가 필요한지" 한 줄
+
+3. **새 컨디셔널/분기 추가 = 신규 기능**:
+   - SCR 에 `conditional [...]` 또는 새 상태 분기 추가 → 보통 별도 TC
+   - 단 광범위 화면 구성 TC 라면 expected 에 분기 표시 추가 가능
+
+4. **정책/플로우 변경**: 검증 조건, 분기, API 응답, 임계치 변경 → step/expected 갱신.
+
+5. **디자인/문구 변경 — TC 본문이 인용했나로 판단**:
 
    핵심 기준: **"TC 의 step 이나 expected 가 그 변경된 요소를 인용·명시하고 있는가?"**
 
    인용 안 함 → ✅ 무시 OK:
    - 색상, 폰트, 폰트 크기, 여백, 그림자, 둥근 모서리 (시각 속성)
-   - 애니메이션, 전환 효과 (fade-in → slide-up 등)
+   - 애니메이션, 전환 효과
    - 의미 동등한 아이콘 교체 (TC 가 아이콘 명시 안 함)
-   - 라벨 wording 변경 (TC 가 그 라벨 직접 안 씀)
+   - 라벨 wording (TC 가 그 라벨 직접 안 씀)
 
    인용·명시함 → ❌ 갱신 필요:
-   - TC step/expected 가 **정확한 라벨 인용**: '"Save" 버튼 탭' 인데 라벨이 "저장" 으로 바뀜
-   - TC 가 **위치/정렬 검증**: "우측 상단의 X 버튼" 인데 위치 이동
-   - TC 가 **아이콘 명시**: "🔔 아이콘 표시" 인데 다른 아이콘으로 교체
-   - TC 가 **명시적 시각 검증**: "빨간색 배경 표시" 같은 색 검증
-   - TC 가 **레이아웃 구조 검증**: "카드 리스트로 표시" → 구조 변경
+   - TC step/expected 가 **정확한 라벨 인용**
+   - TC 가 **위치/정렬 검증**
+   - TC 가 **아이콘 명시**
+   - TC 가 **명시적 시각 검증** (색, 크기 등)
 
-   ### 예시 1 — 무시 OK
-   ```
-   SCR 변경: Submit 버튼 색 #1E40AF → #2563EB
-   TC step: "저장하기를 시도한다"
-   TC expected: "데이터가 저장된다"
-   → 색 변경을 TC 가 인용 안 함 → no_change OK
-   ```
+6. **부분 수정**: 3개 필드 중 일부만 수정 필요하면 그것만. 변경 없는 필드는 null.
 
-   ### 예시 2 — 갱신 필요
-   ```
-   SCR 변경: "Save" 버튼 라벨 → "저장" 으로 변경
-   TC step: '"Save" 버튼을 탭한다'
-   TC expected: '"Saved successfully" 토스트 표시'
-   → step 이 "Save" 직접 인용 → "저장" 으로 갱신
-   ```
+7. **변경 없는 필드는 반드시 null — 같은 값 그대로 출력 금지**:
+   - 변경할 의도가 없는 필드는 반드시 null 로 응답
+   - 원본 텍스트 그대로 반복 출력하면 사용자가 "왜 변경됐다고?" 혼란
 
-   ### 예시 3 — 신규 UI 요소 추가 (가장 중요)
-   ```
-   SCR 변경: 화면 상단에 새 CTA 배너 conditional 추가
-   TC 제목: "UI 확인" / 기대결과: "상단 nav-bar, 필터 탭, 리스트 표시"
-   → TC 가 "무엇이 표시되는지" 검증 → 새 CTA 배너 검증 항목 추가 필수
-   (이건 디자인이 아니라 새 검증 항목 — 원칙 2 참조)
-   ```
-
-5. **부분 수정 가능**: 3개 필드 중 일부만 수정 필요하면 그것만. 변경 없는 필드는 `null`.
-
-6. **애매하면 수정 제안 우선** (no_change 보수적):
-   - 위 1-5 검토 후 **명확하게** 영향 없을 때만 `no_change: true`.
-   - 50/50 애매한 경우 → 수정안 제시 (사람이 거부 가능).
-   - 누락 위험이 잘못 제안 위험보다 큼 — 검증 공백을 만들지 말 것.
+8. **명확하게 영향 없으면 no_change=true** — 보수적으로.
+   - 50/50 애매한 케이스: 차원이 같으면 수정 제안, 차원이 다르면 needs_new_tc.
 
 ## 출력 형식 (JSON 만, 다른 텍스트 금지)
+
+### 케이스 A — TC 수정 필요
 ```json
 {
   "no_change": false,
-  "steps": "수정된 테스트 스텝 전문 또는 null (변경 없으면)",
+  "needs_new_tc": false,
+  "steps": "수정된 테스트 스텝 전문 또는 null",
   "expected": "수정된 기대결과 전문 또는 null",
   "precondition": "수정된 사전조건 전문 또는 null",
-  "rationale": "한 줄로 — 왜 이렇게 수정하는가 (SCR 변경의 어느 부분이 어떻게 반영됐는지)"
+  "rationale": "한 줄 — 왜 이렇게 수정 (SCR 의 어느 부분이 어떻게 반영됐는지)"
 }
 ```
 
-변경 필요 없으면:
+### 케이스 B — 변경 없음 (영향 없음)
 ```json
 {
   "no_change": true,
+  "needs_new_tc": false,
   "steps": null,
   "expected": null,
   "precondition": null,
-  "rationale": "이 TC 는 SCR 변경의 영향을 받지 않음 (이유 한 줄)"
+  "rationale": "TC 차원: <차원>. SCR 변경이 이 차원과 무관."
+}
+```
+
+### 케이스 C — 별도 TC 필요 (차원 불일치)
+```json
+{
+  "no_change": false,
+  "needs_new_tc": true,
+  "new_tc_purpose": "Volume 컬럼 표시 검증 (정렬·표시 형식)",
+  "new_tc_category": "화면 구성",
+  "steps": null,
+  "expected": null,
+  "precondition": null,
+  "rationale": "기존 TC 차원(<차원>) 과 SCR 변경 차원(<차원>) 이 달라 별도 TC 권장"
 }
 ```
 """
@@ -7935,26 +7979,62 @@ def admin_restart():
             "message": f"진행 중인 세션이 {active}개 있습니다. 정말 재시작하려면 force=1 로 다시 요청하세요.",
         }), 409
 
-    # 3) 응답을 먼저 보내고 백그라운드에서 실제 재시작 (1.5초 후 os.execv)
+    # 3) v0.13.0: 자기 재시작 방식 변경 — subprocess 로 외부 launcher 띄운 뒤 종료
+    # 기존 os.execv 방식이 일부 환경에서 새 프로세스 bind 실패하던 문제 해결.
+    # 외부 launcher 가 부모 종료 대기 → 새 서버 띄움 → 부모 sys.exit.
+    import subprocess as _sp
+    _launcher_code = (
+        "import os, sys, time, socket\n"
+        f"OLD_PID = {os.getpid()}\n"
+        f"PORT = {PORT}\n"
+        f"CMD = {json.dumps([sys.executable] + sys.argv)}\n"
+        "# 1) 부모 프로세스 종료 대기 (최대 10초)\n"
+        "for _ in range(40):\n"
+        "    try:\n"
+        "        os.kill(OLD_PID, 0)\n"
+        "    except (OSError, ProcessLookupError):\n"
+        "        break\n"
+        "    time.sleep(0.25)\n"
+        "# 2) 포트 free 대기 (최대 5초)\n"
+        "for _ in range(20):\n"
+        "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "    try:\n"
+        "        s.bind(('127.0.0.1', PORT))\n"
+        "        s.close()\n"
+        "        break\n"
+        "    except OSError:\n"
+        "        s.close()\n"
+        "        time.sleep(0.25)\n"
+        "# 3) 새 서버 실행 (detached, 부모 없이 독립)\n"
+        "os.execv(CMD[0], CMD)\n"
+    )
+
     def _do_restart():
         try:
-            time.sleep(1.5)  # 응답 도달 시간 확보
+            time.sleep(1.5)
         finally:
-            # listen socket 명시적 close — 새 프로세스만 incoming connection 처리하도록
+            try:
+                # 외부 launcher 스폰 (부모 죽음과 무관하게 살아남음)
+                _sp.Popen(
+                    [sys.executable, "-c", _launcher_code],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                    start_new_session=True,  # 부모 죽음 후에도 살아남도록 새 세션
+                )
+            except Exception:
+                pass
+            # listen socket close + 프로세스 종료
             try:
                 sk = getattr(app, "_listen_sock", None)
                 if sk is not None:
                     sk.close()
             except Exception:
                 pass
-            # 현재 인터프리터 + 동일 인자로 자기 자신 재실행
-            # SO_REUSEADDR 가 활성화되어 있어 새 프로세스도 즉시 bind 가능
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            os._exit(0)  # immediate exit — atexit / cleanup 건너뜀
 
     threading.Thread(target=_do_restart, daemon=True).start()
     return jsonify({
         "ok": True,
-        "message": "서버 재시작 중... 약 3~5초 후 자동 재연결됩니다.",
+        "message": "서버 재시작 중... 약 3~7초 후 자동 재연결됩니다.",
         "delay_sec": 1.5,
     })
 
@@ -10369,6 +10449,18 @@ def update_rollback():
                           "trace": traceback.format_exc()[-2500:]}), 500
 
 
+@app.route("/update/apply-bulk/progress/<session_id>", methods=["GET"])
+def update_apply_bulk_progress(session_id):
+    """v0.13.0: apply-bulk 진행 상황 polling — 클라이언트가 1~2초마다 호출."""
+    sess = _UPDATE_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"ok": False, "error": "세션 없음"}), 404
+    progress = sess.get("apply_progress")
+    if not progress:
+        return jsonify({"ok": True, "progress": None})
+    return jsonify({"ok": True, "progress": progress})
+
+
 @app.route("/update/apply-bulk", methods=["POST"])
 def update_apply_bulk():
     """선택된 후보들에 대해 AI 수정안 제안 + 사본 셀 갱신 + TC Edit Log 기록을 순차 실행.
@@ -10481,6 +10573,47 @@ def update_apply_bulk():
         new_log_rows = []
         from datetime import datetime
 
+        # v0.13.0: 진행 상황 sess 에 노출 — 클라이언트 polling 가능
+        total = len(targets)
+        sess["apply_progress"] = {
+            "total": total,
+            "processed": 0,
+            "applied": 0,
+            "no_change": 0,
+            "errors": 0,
+            "skipped": 0,
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "current_tc": "",
+            "done": False,
+        }
+
+        # v0.13.0: TC Edit Log incremental append — N건마다 flush
+        # 처음 N건은 한 번에, 그 이후엔 매 5건마다
+        FLUSH_EVERY = 5
+        def _flush_log():
+            if not new_log_rows:
+                return
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=target_id,
+                    range=f"'{log_title}'!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": new_log_rows},
+                ).execute()
+                new_log_rows.clear()
+            except Exception:
+                pass  # 다음 flush 에서 다시 시도
+
+        def _bump_progress(tc_id_now):
+            """v0.13.0: continue 경로에서도 진행률 갱신"""
+            sess["apply_progress"]["processed"] += 1
+            sess["apply_progress"]["applied"] = applied_count
+            sess["apply_progress"]["no_change"] = no_change_count
+            sess["apply_progress"]["errors"] = error_count
+            sess["apply_progress"]["skipped"] = skipped_count
+            sess["apply_progress"]["current_tc"] = tc_id_now
+
         for tgt in targets:
             tc_id = tgt["tc_id"]
             sheet_title = tgt.get("sheet_title", "")
@@ -10493,6 +10626,7 @@ def update_apply_bulk():
                 details.append({"tc_id": tc_id, "sheet": sheet_title,
                                   "status": "error",
                                   "error": f"사본에서 {tc_id} 행을 찾지 못함"})
+                _bump_progress(tc_id)
                 continue
             row_index = target_tc["row_index"]
 
@@ -10504,6 +10638,7 @@ def update_apply_bulk():
                 details.append({"tc_id": tc_id, "sheet": sheet_title,
                                   "status": "error",
                                   "error": f"행 읽기 실패: {e}"})
+                _bump_progress(tc_id)
                 continue
 
             # AI 호출
@@ -10515,6 +10650,7 @@ def update_apply_bulk():
                 details.append({"tc_id": tc_id, "sheet": sheet_title,
                                   "status": "error",
                                   "error": f"AI 호출 실패: {e}"})
+                _bump_progress(tc_id)
                 continue
 
             if not result.get("ok"):
@@ -10522,6 +10658,7 @@ def update_apply_bulk():
                 details.append({"tc_id": tc_id, "sheet": sheet_title,
                                   "status": "error",
                                   "error": result.get("error", "AI 응답 실패")})
+                _bump_progress(tc_id)
                 continue
 
             proposal = result["proposal"]
@@ -10530,6 +10667,18 @@ def update_apply_bulk():
                 details.append({"tc_id": tc_id, "sheet": sheet_title,
                                   "status": "no_change",
                                   "rationale": proposal.get("rationale", "")})
+                _bump_progress(tc_id)
+                continue
+
+            # v0.13.0: AI 가 "별도 TC 필요" 판단 — 기존 TC 안 건드림 + 별도 권장 누적
+            if proposal.get("needs_new_tc"):
+                no_change_count += 1   # 기존 TC 는 수정 안 함 (no_change 카운트)
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "needs_new_tc",
+                                  "new_tc_purpose": proposal.get("new_tc_purpose", ""),
+                                  "new_tc_category": proposal.get("new_tc_category", ""),
+                                  "rationale": proposal.get("rationale", "")})
+                _bump_progress(tc_id)
                 continue
 
             # 필드별 갱신 (사본 셀)
@@ -10604,18 +10753,17 @@ def update_apply_bulk():
                                   "status": "skipped",
                                   "reason": "이미 TC Edit Log 에 있어 skip"})
 
-        # TC Edit Log 에 일괄 append
-        if new_log_rows:
-            try:
-                svc.spreadsheets().values().append(
-                    spreadsheetId=target_id,
-                    range=f"'{log_title}'!A1",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": new_log_rows},
-                ).execute()
-            except Exception:
-                pass  # 핵심 셀은 이미 박힘 — 로그 실패는 치명적 X
+            # v0.13.0: 진행 상황 + 매 FLUSH_EVERY 건마다 incremental flush
+            _bump_progress(tc_id)
+            if sess["apply_progress"]["processed"] % FLUSH_EVERY == 0:
+                _flush_log()
+
+        # 마지막 flush — 남은 행
+        _flush_log()
+        sess["apply_progress"]["done"] = True
+
+        # v0.13.0: needs_new_tc 추출 (별도 TC 권장 목록)
+        needs_new_list = [d for d in details if d.get("status") == "needs_new_tc"]
 
         return jsonify({
             "ok": True,
@@ -10624,6 +10772,8 @@ def update_apply_bulk():
             "no_change": no_change_count,
             "skipped": skipped_count,
             "errors": error_count,
+            "needs_new_tc": len(needs_new_list),
+            "needs_new_tc_list": needs_new_list,
             "details": details,
             "log_sheet": log_title,
             "copy_url": sess.get("copy_info", {}).get("copy_url", ""),
@@ -12698,7 +12848,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TC 자동화 v2</title>
+<!-- v0.13.0: 브라우저 캐시 무효화 — 매 코드 변경 후 Cmd+Shift+R 부담 제거 -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>TC 자동화 v2 — {{ app_version }}</title>
 <style>
   :root {
     --bg: #EEF1F8;
@@ -17224,15 +17378,57 @@ async function applyBulk() {
   btn.disabled = true;
   btn.textContent = '⏳ 일괄 적용 중...';
   progressEl.classList.remove('hidden');
-  progressEl.innerHTML = ''
-    + '<div style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:#FEF3C7; border:1px solid #FBBF24; border-radius:6px;">'
-    +   '<div style="width:20px; height:20px; border:3px solid #FCD34D; border-top-color:#92400E; border-radius:50%; animation:plan-spin 0.8s linear infinite; flex-shrink:0;"></div>'
-    +   '<div style="flex:1; font-size:12px; color:#78350F;">'
-    +     '<strong>일괄 적용 중...</strong> AI 호출 + 사본 셀 갱신 — ' + checkedModifyCount + '건 처리 (약 ' + estimateMin + '분 소요).<br>'
-    +     '<span style="font-size:11px;">⚠ 페이지를 닫지 마세요. 완료 후 자동으로 결과가 표시됩니다.</span>'
-    +   '</div>'
-    + '</div>';
+  // v0.13.0: 진행률 표시 영역 — 처음엔 시작 메시지
+  function renderProgressBar(prog) {
+    if (!prog) {
+      return ''
+        + '<div style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:#FEF3C7; border:1px solid #FBBF24; border-radius:6px;">'
+        +   '<div style="width:20px; height:20px; border:3px solid #FCD34D; border-top-color:#92400E; border-radius:50%; animation:plan-spin 0.8s linear infinite; flex-shrink:0;"></div>'
+        +   '<div style="flex:1; font-size:12px; color:#78350F;">'
+        +     '<strong>일괄 적용 시작 중...</strong> ' + checkedModifyCount + '건 처리 (약 ' + estimateMin + '분 소요)'
+        +   '</div>'
+        + '</div>';
+    }
+    const pct = prog.total ? Math.floor(prog.processed * 100 / prog.total) : 0;
+    return ''
+      + '<div style="padding:12px 14px; background:#FEF3C7; border:1px solid #FBBF24; border-radius:6px;">'
+      +   '<div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">'
+      +     '<div style="width:18px; height:18px; border:3px solid #FCD34D; border-top-color:#92400E; border-radius:50%; animation:plan-spin 0.8s linear infinite; flex-shrink:0;"></div>'
+      +     '<strong style="font-size:13px; color:#78350F;">일괄 적용 진행 중 — ' + prog.processed + '/' + prog.total + ' (' + pct + '%)</strong>'
+      +   '</div>'
+      +   '<div style="width:100%; height:8px; background:#FCD34D; border-radius:4px; overflow:hidden; margin-bottom:8px;">'
+      +     '<div style="width:' + pct + '%; height:100%; background:#92400E; transition:width 0.3s;"></div>'
+      +   '</div>'
+      +   '<div style="display:flex; gap:8px; font-size:11px; color:#78350F; flex-wrap:wrap;">'
+      +     '<span>✏️ 적용 ' + prog.applied + '</span>'
+      +     '<span>✅ 변경 불필요 ' + prog.no_change + '</span>'
+      +     (prog.skipped ? '<span>⏭ skip ' + prog.skipped + '</span>' : '')
+      +     (prog.errors ? '<span style="color:#991B1B;">⚠ 오류 ' + prog.errors + '</span>' : '')
+      +     (prog.current_tc ? '<span style="margin-left:auto; font-family:monospace; font-size:10px;">현재: ' + escapeHtml(prog.current_tc) + '</span>' : '')
+      +   '</div>'
+      +   '<div style="font-size:10px; color:#92400E; margin-top:6px;">⚠ 페이지를 닫지 마세요. 진행률은 1.5초마다 갱신됩니다.</div>'
+      + '</div>';
+  }
+  progressEl.innerHTML = renderProgressBar(null);
   statusEl.innerHTML = '';
+
+  // 진행률 polling (1.5초 간격)
+  let pollTimer = null;
+  if (_updateSessionId) {
+    pollTimer = setInterval(async function() {
+      try {
+        const pr = await fetch('/update/apply-bulk/progress/' + _updateSessionId);
+        const pd = await pr.json();
+        if (pd && pd.ok && pd.progress) {
+          progressEl.innerHTML = renderProgressBar(pd.progress);
+          if (pd.progress.done) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        }
+      } catch (_) {}
+    }, 1500);
+  }
 
   try {
     const r = await fetch('/update/apply-bulk', {
@@ -17254,6 +17450,7 @@ async function applyBulk() {
   } catch (e) {
     progressEl.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ 네트워크 오류: ' + escapeHtml(e.message) + '</div>';
   } finally {
+    if (pollTimer) clearInterval(pollTimer);
     btn.disabled = false;
     btn.textContent = '📦 선택 항목 일괄 적용 (AI 호출 + 사본 셀 갱신)';
   }
@@ -17272,7 +17469,35 @@ function renderBulkResult(d) {
     +     '<span style="background:#FFF; color:#1E40AF; padding:4px 10px; border-radius:4px; border:1px solid #BFDBFE;">✅ 변경 불필요 ' + d.no_change + '건</span>';
   if (d.skipped) html += '<span style="background:#FFF; color:#6B7280; padding:4px 10px; border-radius:4px; border:1px solid #E5E7EB;">⏭ 중복 skip ' + d.skipped + '건</span>';
   if (d.errors) html += '<span style="background:#FEE2E2; color:#991B1B; padding:4px 10px; border-radius:4px; border:1px solid #FCA5A5;">⚠ 오류 ' + d.errors + '건</span>';
+  if (d.needs_new_tc) html += '<span style="background:#FFF7ED; color:#9A3412; padding:4px 10px; border-radius:4px; border:1px solid #FDBA74;">🆕 별도 TC 권장 ' + d.needs_new_tc + '건</span>';
   html += '</div>';
+
+  // v0.13.0: needs_new_tc 권장 목록 — 사용자가 신규 TC 생성 모드에서 참고
+  if (d.needs_new_tc_list && d.needs_new_tc_list.length) {
+    html += '<div style="margin-bottom:12px; padding:10px 14px; background:#FFF7ED; border:1px solid #FDBA74; border-radius:6px;">'
+      + '<div style="font-size:13px; font-weight:600; color:#9A3412; margin-bottom:6px;">'
+      + '🆕 AI 가 별도 TC 작성 권장 — ' + d.needs_new_tc_list.length + '건'
+      + '</div>'
+      + '<div style="font-size:11px; color:#7C2D12; margin-bottom:8px;">'
+      + 'SCR 변경이 기존 TC 의 검증 차원과 달라서 별도 TC 로 분리 권장됩니다. '
+      + '신규 TC 생성 모드에서 작성하세요.'
+      + '</div>'
+      + '<div style="max-height:200px; overflow-y:auto; background:#FFF; border:1px solid #FED7AA; border-radius:4px;">'
+      + '<table style="width:100%; font-size:11px; border-collapse:collapse;">'
+      + '<thead style="background:#FFEDD5; position:sticky; top:0;"><tr>'
+      +   '<th style="padding:5px 8px; text-align:left; border-bottom:1px solid #FED7AA;">기존 TC</th>'
+      +   '<th style="padding:5px 8px; text-align:left; border-bottom:1px solid #FED7AA;">권장 TC 목적</th>'
+      +   '<th style="padding:5px 8px; text-align:left; border-bottom:1px solid #FED7AA;">카테고리</th>'
+      + '</tr></thead><tbody>';
+    d.needs_new_tc_list.forEach(function(it) {
+      html += '<tr style="border-bottom:1px solid #FFEDD5;">'
+        + '<td style="padding:5px 8px; font-family:monospace;">' + escapeHtml(it.tc_id || '') + '</td>'
+        + '<td style="padding:5px 8px; color:#7C2D12;">' + escapeHtml(it.new_tc_purpose || '-') + '</td>'
+        + '<td style="padding:5px 8px; color:#9A3412;">' + escapeHtml(it.new_tc_category || '-') + '</td>'
+        + '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+  }
 
   if (d.copy_url) {
     html += '<div style="font-size:12px; color:#374151; margin-bottom:10px;">'
@@ -17296,10 +17521,11 @@ function renderBulkResult(d) {
       no_change: '<span style="color:#1E40AF;">✅ 불필요</span>',
       skipped: '<span style="color:#6B7280;">⏭ skip</span>',
       error: '<span style="color:#991B1B;">⚠ 오류</span>',
+      needs_new_tc: '<span style="color:#9A3412;">🆕 별도 TC</span>',  // v0.13.0
     }[item.status] || escapeHtml(item.status);
     const detail = item.fields_changed
       ? item.fields_changed.join(', ')
-      : (item.rationale || item.reason || item.error || '');
+      : (item.new_tc_purpose || item.rationale || item.reason || item.error || '');
     html += '<tr style="border-bottom:1px solid #F3F4F6;">'
       + '<td style="padding:5px 8px; font-family:monospace;">' + escapeHtml(item.tc_id || '') + '</td>'
       + '<td style="padding:5px 8px; white-space:nowrap;">' + stateLabel + '</td>'
@@ -18934,19 +19160,24 @@ async function previewSpecFolder() {
 }
 
 let _sseReconnectCount = 0;
-const _SSE_MAX_RECONNECT = 3;
+const _SSE_MAX_RECONNECT = 8;   // v0.13.0: 3→8회로 늘림 (긴 작업 끊김 견디기)
+let _sseLastSuccessAt = 0;       // 마지막 성공 연결 시각 (재연결 판단)
 
 function connectStream(sid) {
   // 이전 중단 배너 제거 + 재연결 카운트 리셋
   document.querySelectorAll('.stopped-banner, .error-banner, .session-lost-banner').forEach(el => el.remove());
   _sseReconnectCount = 0;
+  _sseLastSuccessAt = Date.now();
 
   eventSource = new EventSource('/stream/' + sid);
   eventSource.onopen = () => {
     // 성공 연결 → 재연결 카운트 리셋, 중단 버튼 활성
     _sseReconnectCount = 0;
+    _sseLastSuccessAt = Date.now();
     setStopButtonsDisabled(false);
     if (typeof updateRestartButtonState === 'function') updateRestartButtonState();
+    // 끊김 알림 배너 자동 제거 (재연결 됐으니)
+    document.querySelectorAll('.sse-reconnecting-banner').forEach(el => el.remove());
   };
   eventSource.onmessage = (e) => {
     try {
@@ -18988,17 +19219,39 @@ function connectStream(sid) {
     }
 
     // 세션은 살아있음 — 일반 네트워크 지연 등. 제한된 횟수만 재시도 안내
+    // v0.13.0: 8회까지 견딤 + 지속 끊김 (60초 이상) 시에만 alarm
     _sseReconnectCount++;
+    const sinceSuccess = Date.now() - _sseLastSuccessAt;
     if (_sseReconnectCount === 1) {
-      addLog('⚠️ SSE 연결 오류. 재연결 시도 중...', true);
-    } else if (_sseReconnectCount >= _SSE_MAX_RECONNECT) {
-      addLog(`⚠️ 재연결 실패(${_sseReconnectCount}회). 새로고침이나 세션 확인 필요.`, true);
+      // 첫 재시도는 조용히 — 브라우저가 자동 재연결 시도 (보통 성공)
+    } else if (_sseReconnectCount === 2 || sinceSuccess > 15000) {
+      // 두 번째부터 또는 15초 이상 끊김이면 배너 표시 (조용한 알림)
+      showSseReconnectingBanner(_sseReconnectCount);
+    } else if (_sseReconnectCount >= _SSE_MAX_RECONNECT || sinceSuccess > 60000) {
+      // 8회 실패 또는 60초 이상 끊김 → 명확한 안내
+      addLog(`⚠️ 재연결 실패 (${_sseReconnectCount}회, ${Math.floor(sinceSuccess/1000)}초). 새로고침 필요.`, true);
       if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
       showSessionLostBanner(true);
       return;
     }
     setStopButtonsDisabled(false);
   };
+}
+
+// v0.13.0: SSE 재연결 중 안내 배너 (조용한 알림 — 잠시 끊김이면 자동 복구)
+function showSseReconnectingBanner(count) {
+  if (document.querySelector('.sse-reconnecting-banner')) return;
+  const banner = document.createElement('div');
+  banner.className = 'sse-reconnecting-banner';
+  banner.style.cssText = 'margin:8px 0; padding:8px 12px; background:#FEF3C7; border:1px solid #F59E0B; border-radius:6px; color:#78350F; font-size:11px; display:flex; align-items:center; gap:8px;';
+  banner.innerHTML = '<span style="font-size:13px;">⏳</span>'
+    + '<span><strong>서버 연결 재시도 중</strong> — 잠시만요. 자동으로 복구됩니다 (' + count + '/' + _SSE_MAX_RECONNECT + ').</span>';
+  const card2 = document.getElementById('card2');
+  if (card2 && !card2.classList.contains('hidden')) {
+    card2.insertBefore(banner, card2.firstChild);
+  } else {
+    document.body.insertBefore(banner, document.body.firstChild);
+  }
 }
 
 function showSessionLostBanner(afterRetries, extraHint) {
