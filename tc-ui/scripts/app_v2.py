@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.16"
+APP_VERSION         = "v0.12.17"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -16472,20 +16472,38 @@ async function startUpdatePlan() {
           + '</div>';
       }
     } else {
-      filterNote = '<div style="margin-bottom:8px; padding:6px 10px; background:#F3F4F6; border:1px solid #D1D5DB; border-radius:4px; font-size:11px; color:#6B7280;">'
-        + 'ℹ️ 신규(add) 후보는 제외됨 — 신규 SCR 은 <strong>신규 TC 생성 모드</strong> 에서 처리하세요.'
+      // v0.12.17: 신규 SCR 별도 모드 안내 — 신규 vs 수정/삭제 차이 명확
+      const newScrCount = (s && s.scr_added) ? s.scr_added : 0;
+      filterNote = '<div style="margin-bottom:8px; padding:8px 12px; background:#F0FDF4; border:1px solid #86EFAC; border-radius:6px; font-size:12px; color:#166534;">'
+        + 'ℹ️ <strong>이 화면은 \\'기존 TC 수정/삭제\\'만 표시</strong>합니다.'
+        + (newScrCount ? ' <span style="color:#92400E;">신규 SCR ' + newScrCount + '개는 별도 \\'신규 TC 생성 모드\\'에서 처리하세요.</span>' : '')
         + '</div>';
     }
 
+    // v0.12.17: 수치 라벨 명확화 — TC 단위 vs SCR 단위 구분
+    // 시트 목록은 N개 표시 + details 로 접기 (긴 줄바꿈 방지)
+    const tabsList = (s.tabs || []);
+    const tabsHtml = tabsList.length
+      ? '<details style="margin-top:6px;"><summary style="font-size:11px;color:#6B7280;cursor:pointer;">📁 영향 시트 ' + tabsList.length + '개 — 펼쳐서 보기</summary>'
+        + '<div style="font-size:11px;color:#374151;margin-top:4px;padding:6px 10px;background:#F9FAFB;border-radius:4px;line-height:1.6;">'
+        + tabsList.map(escapeHtml).join(' · ')
+        + '</div></details>'
+      : '';
     statsEl.innerHTML = filterNote +
-      '<div style="display:flex;gap:10px;flex-wrap:wrap;font-size:12px;">' +
+      // 1줄 — TC 단위 후보 카운트 (사용자가 가장 자주 보는 수치)
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;font-size:12px;align-items:center;">' +
+      '<span style="font-size:11px;color:#6B7280;font-weight:600;">TC 후보:</span>' +
       '<span style="background:#DCFCE7;color:#166534;padding:4px 10px;border-radius:4px;">🆕 신규 ' + s.add + '</span>' +
       '<span style="background:#FEF3C7;color:#92400E;padding:4px 10px;border-radius:4px;">✏️ 수정 ' + s.modify + '</span>' +
       '<span style="background:#FEE2E2;color:#991B1B;padding:4px 10px;border-radius:4px;">🗑️ 삭제 ' + s.delete + '</span>' +
-      '<span style="background:#E0E7FF;color:#3730A3;padding:4px 10px;border-radius:4px;">기본 체크 ' + s.default_checked + '/' + s.total + '</span>' +
-      '<span style="background:#F3F4F6;color:#374151;padding:4px 10px;border-radius:4px;">기존 TC ' + s.tcs_total + '개</span>' +
+      '<span style="background:#E0E7FF;color:#3730A3;padding:4px 10px;border-radius:4px;" title="기본 체크된 TC 수 / 전체 TC 후보 수">☑ 기본 체크 ' + s.default_checked + '/' + s.total + '</span>' +
+      '<span style="background:#F3F4F6;color:#374151;padding:4px 10px;border-radius:4px;">📋 원본 TC 총 ' + s.tcs_total + '건</span>' +
       '</div>' +
-      '<div style="margin-top:6px;font-size:11px;color:#6B7280;">SCR diff — 신규 ' + s.scr_added + ' · 수정 ' + s.scr_modified + ' · 삭제 ' + s.scr_removed + ' · 동일 ' + s.scr_unchanged + ' | 시트: ' + (s.tabs || []).join(', ') + '</div>';
+      // 2줄 — SCR 단위 diff (1단계 결과 요약)
+      '<div style="margin-top:6px;font-size:11px;color:#6B7280;">' +
+      '<strong>SCR 변경:</strong> 🆕 신규 ' + s.scr_added + ' · ✏️ 수정 ' + s.scr_modified + ' · 🗑️ 삭제 ' + s.scr_removed + ' · ✅ 동일 ' + s.scr_unchanged +
+      '</div>' +
+      tabsHtml;
 
     if (data.copy_url) {
       linkEl.innerHTML = '📋 사본 생성됨: <a href="' + data.copy_url + '" target="_blank" style="color:#1E40AF;">' + escapeHtml(data.copy_title || '사본 Sheets') + '</a>';
