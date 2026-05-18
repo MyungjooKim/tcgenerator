@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.15"
+APP_VERSION         = "v0.12.16"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -16311,7 +16311,12 @@ async function startUpdatePlan() {
   btn.disabled = true;
   btn.textContent = '⏳ 사본 생성 + 매핑 중...';
   planArea.classList.remove('hidden');
-  // 큰 진행 배너 — 노란 배경 + 스피너 + 강조된 글자
+  // v0.12.16: AbortController — 사용자가 중단 가능
+  if (window._planAbortController) {
+    try { window._planAbortController.abort(); } catch (_) {}
+  }
+  window._planAbortController = new AbortController();
+  // 큰 진행 배너 — 노란 배경 + 스피너 + 강조된 글자 + ⏹ 중단 버튼
   statsEl.innerHTML =
     '<div style="display:flex; align-items:center; gap:12px; padding:14px 16px; '
     + 'background:linear-gradient(135deg, #FEF3C7 0%, #FDE68A 100%); '
@@ -16322,9 +16327,13 @@ async function startUpdatePlan() {
     +   '<div style="flex:1;">'
     +     '<div style="font-size:14px; font-weight:700; color:#78350F;">⏳ 후보 산출 중 — 잠시 기다려주세요</div>'
     +     '<div style="font-size:12px; color:#92400E; margin-top:4px;">'
-    +       'Sheets 사본 생성 → TC↔SCR 매핑 → 4-way 후보 리스트 산출'
+    +       'Sheets 사본 생성 → TC↔SCR 매핑 → 4-way 후보 리스트 산출 (30초~2분 소요)'
     +     '</div>'
     +   '</div>'
+    +   '<button type="button" id="planCancelBtn" onclick="cancelPlan()" '
+    +     'style="padding:8px 14px; background:#FFF; color:#991B1B; '
+    +     'border:1.5px solid #DC2626; border-radius:6px; cursor:pointer; '
+    +     'font-size:12px; font-weight:600; white-space:nowrap;">⏹ 중단</button>'
     + '</div>'
     + '<style>@keyframes plan-spin { to { transform:rotate(360deg); } }</style>';
   linkEl.innerHTML = '';
@@ -16407,6 +16416,7 @@ async function startUpdatePlan() {
     const resp = await fetch('/update/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: window._planAbortController.signal,   // v0.12.16: 중단 지원
       body: JSON.stringify({
         prev_folder: prevFolder,
         new_folder: newFolder,
@@ -16488,10 +16498,19 @@ async function startUpdatePlan() {
       showToast('✅ 영향 분석 완료 — 후보 ' + s.total + '건', 'success');
     }
   } catch (e) {
-    statsEl.innerHTML = '<span style="color:#DC2626;">❌ 네트워크 오류: ' + e.message + '</span>';
+    // v0.12.16: 사용자가 ⏹ 중단 버튼 누른 경우 — 친절한 메시지
+    if (e.name === 'AbortError') {
+      statsEl.innerHTML = '<div style="padding:12px 16px; background:#FEF3C7; border:1px solid #F59E0B; border-radius:6px; color:#78350F; font-size:13px;">'
+        + '⏹ <strong>중단됨</strong> — 사본 생성 + 매핑 작업이 취소되었습니다.<br>'
+        + '<span style="font-size:11px; color:#92400E;">⚠️ Google Drive 에 이미 만들어진 사본이 있을 수 있습니다 (정상). 다시 시작하면 새 사본이 생성됩니다.</span>'
+        + '</div>';
+    } else {
+      statsEl.innerHTML = '<span style="color:#DC2626;">❌ 네트워크 오류: ' + e.message + '</span>';
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = '🧭 2단계 — TC 매핑 + 영향 분석 (사본 생성)';
+    window._planAbortController = null;
     // 적용 버튼 다시 활성화 (로딩 끝)
     const applyBtn2 = document.getElementById('applyBtn');
     if (applyBtn2) {
@@ -16500,6 +16519,27 @@ async function startUpdatePlan() {
       applyBtn2.style.cursor = '';
       delete applyBtn2.dataset.loadingMsg;
     }
+  }
+}
+
+// v0.12.16: 사용자가 진행 중인 plan 호출 중단
+function cancelPlan() {
+  if (!window._planAbortController) {
+    return;
+  }
+  if (!confirm('⏹ 사본 생성 + 매핑 작업을 중단할까요?\\n\\n'
+              + '• 진행 중인 요청이 끊깁니다\\n'
+              + '• Google Drive 에 이미 만들어진 사본이 있을 수 있습니다 (정상)\\n'
+              + '• 다시 시작하면 새 사본이 만들어집니다')) {
+    return;
+  }
+  try { window._planAbortController.abort(); } catch (_) {}
+  // 즉시 버튼 disabled 처리 — 중복 클릭 방지
+  const cancelBtn = document.getElementById('planCancelBtn');
+  if (cancelBtn) {
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = '⏹ 중단 중...';
+    cancelBtn.style.opacity = '0.5';
   }
 }
 
