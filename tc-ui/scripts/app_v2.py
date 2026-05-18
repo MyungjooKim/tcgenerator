@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.9"
+APP_VERSION         = "v0.12.10"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -18961,6 +18961,12 @@ function handleEvent(evt) {
   if (evt.type === 'gate') {
     const isModify = evt.data.mode === 'modify';
     window._gateMode = isModify ? 'modify' : 'new';
+    // v0.12.10: gate 도달 시점에는 재생성 작업이 이미 끝남 → 버튼 강제 복원.
+    // (regenerateClassification 의 finally 가 timing 이슈로 늦게/안 실행된 케이스 안전망)
+    window._regenInFlight = false;
+    document.querySelectorAll('button[onclick="regenerateClassification()"]').forEach(function(b) {
+      b.disabled = false; b.style.opacity = ''; b.style.cursor = '';
+    });
     // 제목/안내문 전환
     document.getElementById('gateTitle').innerHTML = isModify
       ? '📋 영향도 검토 <span class="badge">Step 3 · Human Gate</span>'
