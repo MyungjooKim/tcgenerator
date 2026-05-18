@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.13.0"
+APP_VERSION         = "v0.13.1"
 APP_VERSION_DATE    = "2026-05-18"
 APP_VERSION_TAGLINE = "TC Update 모드 강화 — AI 차원 매칭 + 신규 TC 자동 권장 + 진행률 + 안정성"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -10461,6 +10461,43 @@ def update_apply_bulk_progress(session_id):
     return jsonify({"ok": True, "progress": progress})
 
 
+# v0.13.1: 장기 작업 중 macOS 자동 슬립 차단 (caffeinate)
+def _spawn_caffeinate():
+    """장기 작업 동안 macOS 슬립·디스플레이 잠금 차단.
+
+    Returns: subprocess.Popen 객체 또는 None (macOS 가 아니거나 실패 시).
+    호출자는 작업 끝나면 _kill_caffeinate(proc) 로 명시적 종료.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import subprocess as _sp
+        # -d: display 슬립 차단 (사용자가 화면 켜둔 채 자리 비워도 화면 안 꺼짐)
+        # -i: idle 시스템 슬립 차단 (사용자 입력 없어도 시스템 안 잠듦)
+        # -s: 외부 전원 연결 시 시스템 슬립 차단
+        # -w: 부모 프로세스 (이 Python) 가 살아있는 동안만
+        return _sp.Popen(
+            ["caffeinate", "-dis"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            start_new_session=False,  # 같은 세션 — 부모 죽으면 같이 죽도록
+        )
+    except (FileNotFoundError, OSError):
+        return None  # caffeinate 명령 없거나 실패 — 무시
+
+def _kill_caffeinate(proc):
+    """caffeinate 프로세스 종료. proc=None 이면 no-op."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 @app.route("/update/apply-bulk", methods=["POST"])
 def update_apply_bulk():
     """선택된 후보들에 대해 AI 수정안 제안 + 사본 셀 갱신 + TC Edit Log 기록을 순차 실행.
@@ -10489,6 +10526,9 @@ def update_apply_bulk():
     sess = _UPDATE_SESSIONS.get(session_id)
     if not sess:
         return jsonify({"ok": False, "error": "세션이 없습니다. /update/plan 을 다시 호출하세요."}), 404
+
+    # v0.13.1: 장기 작업 동안 macOS 자동 슬립 차단 (사용자 자리 비워도 작업 진행)
+    caffeinate_proc = _spawn_caffeinate()
 
     try:
         target_id = sess["target_sheets_id"]
@@ -10784,6 +10824,9 @@ def update_apply_bulk():
             "ok": False, "error": str(e),
             "trace": traceback.format_exc()[-2500:],
         }), 500
+    finally:
+        # v0.13.1: caffeinate 종료 — 슬립 차단 해제
+        _kill_caffeinate(caffeinate_proc)
 
 
 # 레거시 — 기존 /update/apply 는 그대로 두고 (호환성), 새 UI 는 /update/apply-bulk 사용
