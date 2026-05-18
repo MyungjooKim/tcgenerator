@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.12"
+APP_VERSION         = "v0.12.13"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -10539,6 +10539,7 @@ def update_apply_bulk():
                 "expected": current_tc["_col_exp"],
             }
             fields_changed = []
+            unchanged_fields = []  # 같은 값 skip 카운트 (v0.12.13)
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for field, new_value in [
                 ("precondition", proposal.get("precondition")),
@@ -10552,6 +10553,13 @@ def update_apply_bulk():
                     continue
                 ci = field_to_col.get(field, -1)
                 if ci < 0:
+                    continue
+                # v0.12.13: 현재 값 == 새 값 가드 — AI 가 같은 텍스트 그대로 반환한 경우
+                # 사본 셀 덮어쓰기 + TC Edit Log 박힘 사고 차단. 공백·줄바꿈 정규화 비교.
+                def _norm(s):
+                    return re.sub(r"\s+", " ", str(s or "")).strip()
+                if _norm(current_tc.get(field, "")) == _norm(new_value):
+                    unchanged_fields.append(field)
                     continue
                 col_letter = _col_index_to_letter(ci)
                 cell_range = f"'{sheet_title}'!{col_letter}{row_index}"
@@ -10581,8 +10589,14 @@ def update_apply_bulk():
                                   "status": "applied",
                                   "fields_changed": fields_changed,
                                   "rationale": proposal.get("rationale", "")})
+            elif unchanged_fields:
+                # v0.12.13: AI 가 같은 텍스트 반환 — 실질 no_change
+                no_change_count += 1
+                details.append({"tc_id": tc_id, "sheet": sheet_title,
+                                  "status": "no_change",
+                                  "rationale": "AI 가 변경 제안했으나 기존 값과 동일 (자동 가드)"})
             else:
-                # AI 가 변경 제안했는데 skip_existing 이 다 막은 경우 — 사실상 no_change
+                # skip_existing 이 다 막은 경우 — 사실상 no_change
                 skipped_count += 1
                 details.append({"tc_id": tc_id, "sheet": sheet_title,
                                   "status": "skipped",
