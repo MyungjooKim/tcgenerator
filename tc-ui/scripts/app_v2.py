@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.8"
+APP_VERSION         = "v0.12.9"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -18855,7 +18855,19 @@ function connectStream(sid) {
     if (!sessionAlive) {
       // 세션 소멸 확정 → 재연결 중단 + 명확한 안내
       if (eventSource) { eventSource.close(); eventSource = null; if (typeof updateRestartButtonState === 'function') updateRestartButtonState(); }
-      showSessionLostBanner();
+      // v0.12.9: state 파일이 gate_waiting 이면 '새로고침으로 복원 가능' 강조
+      // (분류표 자동 생성이 끝났는데 SSE 만 끊긴 경우)
+      const projectName = document.getElementById('projectName')?.value?.trim()
+        || (typeof selectedProject !== 'undefined' ? selectedProject : '') || '';
+      let stateInfo = null;
+      if (projectName) {
+        try {
+          const sr = await fetch('/projects/' + encodeURIComponent(projectName) + '/state');
+          stateInfo = await sr.json();
+        } catch(_) {}
+      }
+      const gateReady = stateInfo && stateInfo.has_state && stateInfo.stage === 'gate_waiting';
+      showSessionLostBanner(false, gateReady ? '분류표가 이미 완성되어 검토 대기 중입니다. 새로고침 후 \\'이어서 작업\\' 으로 복원하세요.' : null);
       setStopButtonsDisabled(true);
       stopCountdown();
       return;
@@ -18875,16 +18887,26 @@ function connectStream(sid) {
   };
 }
 
-function showSessionLostBanner(afterRetries) {
+function showSessionLostBanner(afterRetries, extraHint) {
   // 이미 표시되어 있으면 중복 방지
   if (document.querySelector('.session-lost-banner')) return;
   const banner = document.createElement('div');
   banner.className = 'session-lost-banner';
-  banner.style.cssText = 'margin:12px 0;padding:14px 18px;background:#FEF2F2;border:1.5px solid #DC2626;border-radius:10px;color:#991B1B;';
+  // gate_waiting 안내가 있으면 빨간 톤 대신 초록 톤 (작업 손실 아님)
+  const bg = extraHint ? '#F0FDF4' : '#FEF2F2';
+  const border = extraHint ? '#16A34A' : '#DC2626';
+  const titleColor = extraHint ? '#166534' : '#991B1B';
+  const bodyColor = extraHint ? '#15803D' : '#7F1D1D';
+  banner.style.cssText = 'margin:12px 0;padding:14px 18px;background:' + bg + ';border:1.5px solid ' + border + ';border-radius:10px;color:' + titleColor + ';';
+  const title = extraHint ? '✅ 분류표 완성됨 — 복원 가능' : '🔌 세션이 종료되었습니다';
+  const hintLine = extraHint
+    ? '<div style="font-size:12.5px;line-height:1.6;color:' + bodyColor + ';margin-bottom:4px;font-weight:600;">' + extraHint + '</div>'
+    : '';
   banner.innerHTML = `
-    <div style="font-weight:700;font-size:14px;margin-bottom:6px;">🔌 세션이 종료되었습니다</div>
-    <div style="font-size:12.5px;line-height:1.6;color:#7F1D1D;">
-      서버와의 연결이 끊어졌습니다${afterRetries ? ' (재연결 시도 실패)' : ''}. 다음 중 하나를 선택하세요:<br>
+    <div style="font-weight:700;font-size:14px;margin-bottom:6px;">${title}</div>
+    ${hintLine}
+    <div style="font-size:12.5px;line-height:1.6;color:${bodyColor};">
+      ${extraHint ? '' : '서버와의 연결이 끊어졌습니다' + (afterRetries ? ' (재연결 시도 실패)' : '') + '. 다음 중 하나를 선택하세요:<br>'}
       • <strong>새로 시작</strong>: 브라우저 새로고침 후 처음부터<br>
       • <strong>이어서 작업</strong>: 프로젝트 선택 후 아래 버튼 (승인 전 단계만 지원)
     </div>
@@ -20170,10 +20192,20 @@ async function sendGateChat() {
 
 async function regenerateClassification() {
   if (!currentSid) return;
+  // v0.12.9: 중복 클릭 가드 — 진행 중이면 무시 (두 번째 클릭이 새 sid 를 stop 시키는 사고 차단)
+  if (window._regenInFlight) {
+    showToast('이미 재생성 중입니다. 잠시만 기다려주세요.', 'info');
+    return;
+  }
   if (!confirm('분류표를 처음부터 다시 생성합니다. 현재 분류표는 삭제됩니다. 계속할까요?')) return;
+  window._regenInFlight = true;
+  // 모든 '분류표 다시 생성' 버튼 비활성화 (시각 피드백)
+  const regenButtons = document.querySelectorAll('button[onclick="regenerateClassification()"]');
+  regenButtons.forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; b.style.cursor = 'wait'; });
   try {
-    // 현재 파이프라인 중단
-    await fetch('/stop/' + currentSid, { method: 'POST' });
+    // 현재 파이프라인 중단 — 옛 sid 만 stop
+    const oldSid = currentSid;
+    await fetch('/stop/' + oldSid, { method: 'POST' });
     if (eventSource) eventSource.close();
     // 분류표 재생성 요청
     const projectName = document.getElementById('projectName').value.trim() || selectedProject || '';
@@ -20196,6 +20228,9 @@ async function regenerateClassification() {
     connectStream(d.sid);
   } catch(e) {
     alert('오류: ' + e.message);
+  } finally {
+    window._regenInFlight = false;
+    regenButtons.forEach(function(b) { b.disabled = false; b.style.opacity = ''; b.style.cursor = ''; });
   }
 }
 
