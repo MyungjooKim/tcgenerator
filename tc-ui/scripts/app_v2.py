@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.6"
+APP_VERSION         = "v0.12.7"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -754,6 +754,13 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
         if m_dash:
             head_dash = m_dash.group(1).strip()
             if len(head_dash) >= 4:  # 너무 짧으면 보존
+                # v0.12.7: dash cutoff 후 trigger 어미만 짧게 남으면 의미 없음 → 거부.
+                # 사고 사례: '진입 시 `loadNotifSettings()` — localStorage ...'
+                #            백틱 제거 → '진입 시 — localStorage ...'
+                #            dash cutoff → '진입 시' (의미 없음, 본문 백틱이 핵심이었음)
+                TRIGGER_ONLY_SUFFIXES = ("시", "탭", "후", "클릭", "진입", "선택", "시점")
+                if len(head_dash) <= 6 and any(head_dash.endswith(s) for s in TRIGGER_ONLY_SUFFIXES):
+                    return  # 본문이 백틱 안에 있었던 경우 — trigger 만으론 라벨 부적합
                 label = head_dash
         # 콜론·괄호 뒤 부연설명 cutoff — '키' 부분만 남김 (단, 너무 짧아지면 원본 유지)
         # Trigger label guard: head 가 trigger 라벨('… 시', '… 시점', '… 탭', '… 후',
@@ -860,10 +867,26 @@ def extract_minors_from_screen_md(md_text: str, max_minors: int = 20) -> list[st
             body = m.group(1)
             # "<요소> <이벤트> → <결과>" 형식이 흔함. 화살표 앞부분만 사용
             label = body.split("→")[0]
-            # 백틱·HTML 코드 제거
-            label = re.sub(r"`[^`]+`", "", label)
-            label = re.sub(r"<[^>]+>", "", label)
-            label = re.sub(r"\s+", " ", label).strip(" .·:")
+            # v0.12.7: 백틱 제거 전후 비율 + 잔재 패턴 검사 — 백틱이 본문 핵심이면 거부.
+            # 사고 사례: `.notif-toggle-row[data-subtype]` 의 toggle change → '의 toggle change'
+            #            `.top-nav > .btn-icon` ‹ 탭                       → '‹ 탭'
+            before = label.strip()
+            label = re.sub(r"`[^`]+`", "", label)        # 백틱 코드 제거
+            label = re.sub(r"<[^>]+>", "", label)        # HTML 태그 제거
+            after = re.sub(r"\s+", " ", label).strip(" .·:")
+            # 잔재 패턴 — 조사로 시작 / trigger 라벨만 / 한 글자 + 트리거
+            RESIDUE_PATTERNS = (
+                r"^[의가을를은는이도에서와과으로]\s",   # 조사로 시작 ('의 toggle change')
+                r"^[‹›<>]\s*[가-힣]{1,3}$",            # 'arrow + 짧은 trigger' ('‹ 탭')
+                r"^(진입 시|선택 시|클릭 시|탭 시|호버 시|진입|클릭|탭|선택)$",
+            )
+            if any(re.search(p, after) for p in RESIDUE_PATTERNS):
+                continue
+            # 백틱이 차지하는 비율 검사 — 50% 이상이 백틱이었다면 본문 핵심을 잃음
+            removed_ratio = (len(before) - len(after)) / max(len(before), 1)
+            if removed_ratio >= 0.5 and len(after) < 12:
+                continue
+            label = after
             if label and len(label) >= 3:
                 add(label)
 
