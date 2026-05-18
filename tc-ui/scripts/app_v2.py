@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.7"
+APP_VERSION         = "v0.12.8"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -7350,7 +7350,7 @@ def run_pipeline(sess: dict, sources: list, project_name: str):
         _sources_info = []
     try:
         # ── 파싱 ──
-        if resumed and resumed.get("stage") in ("policy", "features", "classifying", "gate_waiting", "tc_writing"):
+        if resumed and resumed.get("stage") in ("parsed", "policy", "features", "classifying", "gate_waiting", "tc_writing"):
             raw_text = resumed["data"].get("raw_text", "")
             push_log(sess, f"[이어서] 파싱 결과 복원됨 ({len(raw_text):,}자)")
             # v0.9.19: 입력 소스 SCR 매핑 복원 (체크포인트에 있으면 그것을, 없으면 raw_text 에서 자동 재추출)
@@ -11740,20 +11740,48 @@ def regenerate_classification():
 
     # 저장된 파이프라인 상태에서 이전 결과 로드
     state = load_pipeline_state(project_name)
-    if not state or not state["data"].get("features_text"):
+    if not state or not state["data"].get("raw_text"):
         return jsonify({"ok": False, "error": "이전 분석 결과가 없습니다. 처음부터 시작해주세요."}), 400
+
+    # v0.12.8: flow 두 가지 모두 지원
+    # (A) 구조화 spec 모드 — features_text 없이 raw_text + structured_spec_folder 만 있음.
+    #     이 경우 stage='parsed' 부터 재시작해 분류표를 다시 만든다.
+    # (B) 정책 반영 / Quick 모드 — features_text 가 있음. stage='features' 부터 재시작.
+    state_data = state["data"]
+    has_features = bool(state_data.get("features_text"))
 
     sess = new_session()
     sess["project_name"] = project_name
     sess["focus_area"] = focus_area
-    # 분류표 직전 단계(features)에서 재시작하도록 상태 설정
+
+    # 구조화 spec 폴더 정보 복원 (구조화 모드에서 필요)
+    if state_data.get("structured_spec_folder"):
+        sess["structured_spec_folder"] = state_data["structured_spec_folder"]
+    if state_data.get("prev_folder"):
+        sess["prev_folder"] = state_data["prev_folder"]
+    if "include_unchanged" in state_data:
+        sess["include_unchanged"] = state_data["include_unchanged"]
+
+    # 분류표만 새로 만드는 게 목표 — stage 결정
+    if has_features:
+        resumed_stage = "features"
+    else:
+        # 구조화 spec 모드 — raw_text 부터 다시 (분류 단계만 재실행, TC 작성은 진입 안 함)
+        resumed_stage = "parsed"
+
     sess["_resumed_state"] = {
-        "stage": "features",
+        "stage": resumed_stage,
         "data": {
-            "raw_text": state["data"].get("raw_text", ""),
-            "policy_text": state["data"].get("policy_text", ""),
-            "features_text": state["data"].get("features_text", ""),
+            "raw_text": state_data.get("raw_text", ""),
+            "policy_text": state_data.get("policy_text", ""),
+            "features_text": state_data.get("features_text", ""),
             "focus_area": focus_area,
+            "sources_info": state_data.get("sources_info", []),
+            "source_scr_map": state_data.get("source_scr_map", {}),
+            # 구조화 spec 모드용
+            "structured_spec_folder": state_data.get("structured_spec_folder"),
+            "prev_folder": state_data.get("prev_folder"),
+            "include_unchanged": state_data.get("include_unchanged"),
         }
     }
     t = threading.Thread(
