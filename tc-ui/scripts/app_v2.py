@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.11"
+APP_VERSION         = "v0.12.12"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -16026,20 +16026,11 @@ function classifyTcImpact(summary) {
     }
   }
   if (!line) return 'unclear';
-  // 명확한 '변경 없음' 시그널 — 보수적으로 좁게 매칭
-  const noChangePatterns = [
-    /^\s*없음/,
-    /영향[\s ]*없음/,
-    /변경[\s ]*없음/,
-    /수정[\s ]*불필요/,
-    /기능\/UI\/로직[\s ]*변경이[\s ]*감지되지[\s ]*않/,
-    /동일함/,
-    /TC[\s ]*수정이?[\s ]*필요[\s ]*없/,
-  ];
-  for (const p of noChangePatterns) {
-    if (p.test(line)) return 'no_change';
-  }
-  // 명확한 '수정 필요' 시그널
+  // v0.12.12: needs_fix 를 먼저 검사 — 한 라인에 두 시그널 공존 시 needs_fix 우선.
+  // 사고 사례 (SCR-221): '신규 TC 필요 (...), 기존 ... TC는 영향 없음'
+  //   → 앞부분 'TC 필요' (needs_fix) + 뒷부분 '영향 없음' (no_change) 공존
+  //   → 이전: no_change 먼저 검사라 잘못 분류
+  //   → 새: needs_fix 우선, 부분이라도 수정 필요하면 처리 대상으로 (안전 우선)
   const needsFixPatterns = [
     /수정[\s ]*필요/,
     /변경[\s ]*필요/,
@@ -16053,6 +16044,19 @@ function classifyTcImpact(summary) {
   ];
   for (const p of needsFixPatterns) {
     if (p.test(line)) return 'needs_fix';
+  }
+  // 명확한 '변경 없음' 시그널 — 보수적으로 좁게 매칭
+  const noChangePatterns = [
+    /^\s*없음/,
+    /영향[\s ]*없음/,
+    /변경[\s ]*없음/,
+    /수정[\s ]*불필요/,
+    /기능\/UI\/로직[\s ]*변경이[\s ]*감지되지[\s ]*않/,
+    /동일함/,
+    /TC[\s ]*수정이?[\s ]*필요[\s ]*없/,
+  ];
+  for (const p of noChangePatterns) {
+    if (p.test(line)) return 'no_change';
   }
   return 'unclear';
 }
