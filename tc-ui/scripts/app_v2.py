@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.14"
+APP_VERSION         = "v0.12.15"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -14136,8 +14136,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <!-- Promote 미리보기 모달 -->
-  <div id="promoteModal" class="hidden" style="position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; padding:20px;">
-    <div style="background:#FFF; border-radius:12px; max-width:880px; width:100%; max-height:88vh; display:flex; flex-direction:column; overflow:hidden;">
+  <div id="promoteModal" class="hidden" style="position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; padding:10px;">
+    <div style="background:#FFF; border-radius:12px; max-width:1000px; width:100%; height:95vh; max-height:95vh; display:flex; flex-direction:column; overflow:hidden;">
       <div style="padding:18px 22px; border-bottom:1px solid #E5E7EB; display:flex; align-items:center; justify-content:space-between;">
         <div style="font-size:16px; font-weight:700; color:#991B1B;">⚠️ 원본 Sheets 갱신 — 미리보기</div>
         <button onclick="closePromoteModal()" style="background:none; border:none; cursor:pointer; font-size:22px; color:#6B7280;">×</button>
@@ -17407,10 +17407,14 @@ function renderPromotePreview(d, copyUrl, sourceUrl) {
     + '&nbsp;&nbsp;4. 적용 후 <strong>🔄 마지막 적용 롤백</strong> 버튼 활성화'
     + '</div>';
 
-  // 적용 셀 리스트
+  // 적용 셀 리스트 — v0.12.15: max-height 280→520, 20개→50개로 확대
   if (plan.length) {
-    html += '<div style="font-size:13px; font-weight:600; color:#1E3A5F; margin-bottom:6px;">📝 적용 셀 (앞 20개)</div>';
-    html += '<div style="max-height:280px; overflow-y:auto; border:1px solid #E5E7EB; border-radius:6px; margin-bottom:14px;">';
+    const SHOW_N = 50;
+    const headerLabel = plan.length > SHOW_N
+      ? '📝 적용 셀 (앞 ' + SHOW_N + '개 — 총 ' + plan.length + '건)'
+      : '📝 적용 셀 (' + plan.length + '개)';
+    html += '<div style="font-size:13px; font-weight:600; color:#1E3A5F; margin-bottom:6px;">' + headerLabel + '</div>';
+    html += '<div style="max-height:520px; overflow-y:auto; border:1px solid #E5E7EB; border-radius:6px; margin-bottom:14px;">';
     html += '<table style="width:100%; font-size:11px; border-collapse:collapse;">';
     html += '<thead style="background:#F9FAFB; position:sticky; top:0;"><tr>'
       + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">TC ID</th>'
@@ -17418,7 +17422,7 @@ function renderPromotePreview(d, copyUrl, sourceUrl) {
       + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">원본 셀</th>'
       + '<th style="padding:6px 8px; text-align:left; border-bottom:1px solid #E5E7EB;">새 값 (앞 100자)</th>'
       + '</tr></thead><tbody>';
-    plan.slice(0, 20).forEach(function(p) {
+    plan.slice(0, SHOW_N).forEach(function(p) {
       html += '<tr style="border-bottom:1px solid #F3F4F6;">'
         + '<td style="padding:5px 8px; font-family:monospace;">' + escapeHtml(p.tc_id) + '</td>'
         + '<td style="padding:5px 8px;">' + escapeHtml(p.field) + '</td>'
@@ -17427,8 +17431,8 @@ function renderPromotePreview(d, copyUrl, sourceUrl) {
         + '</tr>';
     });
     html += '</tbody></table>';
-    if (plan.length > 20) {
-      html += '<div style="padding:8px; background:#F9FAFB; font-size:11px; color:#6B7280; text-align:center;">… 외 ' + (plan.length - 20) + '건</div>';
+    if (plan.length > SHOW_N) {
+      html += '<div style="padding:8px; background:#F9FAFB; font-size:11px; color:#6B7280; text-align:center;">… 외 ' + (plan.length - SHOW_N) + '건 (전체는 적용 후 사본 시트에서 확인)</div>';
     }
     html += '</div>';
   }
