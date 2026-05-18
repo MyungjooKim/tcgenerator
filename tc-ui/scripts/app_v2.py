@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.12.10"
+APP_VERSION         = "v0.12.11"
 APP_VERSION_DATE    = "2026-05-14"
 APP_VERSION_TAGLINE = "TC Update 모드 — 기획서 변경 기반 기존 TC 자동 갱신"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -16320,18 +16320,28 @@ async function startUpdatePlan() {
 
   const projectName = (document.getElementById('projectDropdown') || document.getElementById('projectSelect') || {}).value || '';
 
-  // 분류 기반 자동 필터링 — 1단계에서 'no_change' 로 분류된 SCR 은 2단계에서 제외.
+  // 분류 기반 자동 필터링 — 1단계 분석 결과 기반:
+  //   · 분석된 SCR 만 후보 (window._smartImpactBySrc 에 있는 SCR)
+  //   · 그 중 needs_fix / unclear 만 처리 (no_change 제외)
+  //   · 분석 안 한 SCR 은 제외 (사용자 의도: '분석된 것만 처리')
+  //   · _smartImpactBySrc 자체가 비어있으면 (1단계 분석 미실시) 전체 통과
   // 사용자가 '전체 보기' 토글로 끄지 않은 경우에만 적용.
   const includeAll = !!window._planIncludeAll;
   let scrFilter = (typeof _selectedScrs !== 'undefined' && _selectedScrs && _selectedScrs.length)
                     ? _selectedScrs.slice() : null;
   let filterReason = 'selected';   // selected | impact_filtered | all
   let impactSkipped = [];
-  if (!includeAll && scrFilter && window._smartImpactBySrc) {
+  let unanalyzedSkipped = [];
+  const impactMap = window._smartImpactBySrc || {};
+  const hasAnyAnalysis = Object.keys(impactMap).length > 0;
+  if (!includeAll && scrFilter && hasAnyAnalysis) {
     const filtered = scrFilter.filter(function(scr) {
-      const imp = window._smartImpactBySrc[scr];
-      // 분류 정보 없는 SCR 은 안전하게 포함
-      if (!imp) return true;
+      const imp = impactMap[scr];
+      if (!imp) {
+        // v0.12.10: 분석 안 한 SCR 은 제외 (사용자 명시: '분석된 것만 처리')
+        unanalyzedSkipped.push(scr);
+        return false;
+      }
       if (imp === 'no_change') { impactSkipped.push(scr); return false; }
       return true;  // needs_fix, unclear → 포함
     });
@@ -16344,11 +16354,29 @@ async function startUpdatePlan() {
   }
   // 빈 필터는 백엔드가 '전체 처리' 로 해석 → 의도 보존 위해 sentinel 처리
   if (scrFilter && scrFilter.length === 0) {
-    // 전부 no_change 로 제외된 경우 — 진행 의미 없음
+    // 분석은 했지만 모두 no_change 거나, 분석 안 한 SCR 만 있는 경우
+    const noChangeCount = impactSkipped.length;
+    const unanalyzedCount = unanalyzedSkipped.length;
+    let body;
+    if (noChangeCount > 0 && unanalyzedCount === 0) {
+      // 분석된 SCR 전부가 no_change
+      body = '1단계에서 분석된 SCR ' + noChangeCount + '개 모두 \\'변경 없음\\' 으로 분류됨 → 2단계 작업 불필요.';
+    } else if (unanalyzedCount > 0 && noChangeCount === 0) {
+      // 분석된 SCR 이 없음 (분석 진행 안 함)
+      body = '1단계에서 아직 분석되지 않은 SCR 만 선택됨 (' + unanalyzedCount + '개). '
+           + '먼저 1단계 \\'변경사항 분석\\'으로 분석을 진행하거나, '
+           + '\\'🔁 전체 ' + _selectedScrs.length + '개로 산출\\' 토글로 분석 없이 처리할 수 있습니다.';
+    } else {
+      body = '분석된 SCR ' + noChangeCount + '개는 \\'변경 없음\\', '
+           + '분석 안 한 SCR ' + unanalyzedCount + '개는 자동 제외됨. '
+           + '\\'🔁 전체로 산출\\' 토글로 강제 진행 가능.';
+    }
     statsEl.innerHTML = '<div style="padding:14px 16px; background:#F0FDF4; border:1px solid #86EFAC; border-radius:8px; color:#166534; font-size:13px;">'
-      + '🎉 <strong>수정 대상이 없습니다</strong><br>'
-      + '<span style="font-size:12px;">1단계 분석에서 모든 SCR 이 \\'변경 없음\\' 으로 분류되어 2단계 작업이 불필요합니다.'
-      + ' 그래도 진행하려면 합본 보고서에서 \\'🔁 전체 16개로 다시 산출\\' 토글을 켜고 다시 시도하세요.</span>'
+      + '🎉 <strong>2단계 처리 대상이 없습니다</strong><br>'
+      + '<span style="font-size:12px;">' + body + '</span><br>'
+      + '<button type="button" onclick="reRunPlanIncludeAll()" '
+      +   'style="margin-top:8px; font-size:12px; padding:5px 12px; background:#FFF; border:1px solid #86EFAC; border-radius:4px; cursor:pointer; color:#166534; font-weight:600;">'
+      +   '🔁 전체 ' + _selectedScrs.length + '개로 강제 산출</button>'
       + '</div>';
     btn.disabled = false;
     btn.textContent = '🧭 2단계 — TC 매핑 + 영향 분석 (사본 생성)';
@@ -16387,13 +16415,17 @@ async function startUpdatePlan() {
     let filterNote = '';
     if (scrFilter && scrFilter.length) {
       if (filterReason === 'impact_filtered') {
+        // v0.12.10: 분석 안 한 SCR 도 명시 (사용자 의도 — '분석된 것만 처리')
+        const exclusions = [];
+        if (impactSkipped.length) exclusions.push('✅ 변경 없음 ' + impactSkipped.length);
+        if (unanalyzedSkipped.length) exclusions.push('⏭ 분석 안 함 ' + unanalyzedSkipped.length);
         filterNote = '<div style="margin-bottom:8px; padding:8px 12px; background:#FEF3C7; border:1px solid #F59E0B; border-radius:6px; font-size:12px; color:#78350F;">'
           + '🛠 <strong>1단계 분류 기반 자동 필터</strong> — 수정 필요/판단 필요 <strong>' + scrFilter.length + '개</strong>만 처리'
-          + ' <span style="color:#92400E;">(✅ 변경 없음 ' + impactSkipped.length + '개 제외)</span><br>'
+          + ' <span style="color:#92400E;">(' + exclusions.join(' · ') + ' 제외)</span><br>'
           + '<span style="font-size:11px; font-family:monospace;">' + scrFilter.map(escapeHtml).join(', ') + '</span><br>'
           + '<button type="button" onclick="reRunPlanIncludeAll()" '
           +   'style="margin-top:6px; font-size:11px; padding:3px 10px; background:#FFF; border:1px solid #F59E0B; border-radius:3px; cursor:pointer; color:#78350F;">'
-          +   '🔁 \\'변경 없음\\' 포함 전체 ' + _selectedScrs.length + '개로 다시 산출</button>'
+          +   '🔁 전체 ' + _selectedScrs.length + '개로 다시 산출 (변경 없음·미분석 포함)</button>'
           + '</div>';
       } else if (filterReason === 'all') {
         filterNote = '<div style="margin-bottom:8px; padding:6px 10px; background:#EEF2FF; border:1px solid #C7D2FE; border-radius:4px; font-size:12px; color:#3730A3;">'
