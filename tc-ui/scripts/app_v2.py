@@ -53,7 +53,7 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.13.2"
+APP_VERSION         = "v0.13.3"
 APP_VERSION_DATE    = "2026-05-18"
 APP_VERSION_TAGLINE = "TC Update 모드 강화 — AI 차원 매칭 + 신규 TC 자동 권장 + 진행률 + 안정성"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
@@ -3472,12 +3472,38 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 ### 중분류: {중분류명}
 
 #### 소분류
-- {소분류명}: {설명}
+- {소분류명}
 
 규칙:
 - 대분류는 비즈니스 영역 단위 (예: Onboarding, Authentication, Trading)
 - 중분류는 주요 기능 단위
 - 소분류는 세부 케이스 단위
+
+⭐ 소분류 작성 원칙 (반드시 준수 — 자주 어김):
+- **핵심 식별 라벨만** (30자 이내 권장)
+- 검증할 동작/케이스의 짧은 이름 1개
+- ⛔ 설명/부연 절대 금지 — ': xxx' 형태로 설명 붙이지 마세요
+- ⛔ 영문 식별자 + 한국어 설명 결합 금지
+
+✅ 좋은 예 (간결, 핵심 단어):
+- Export
+- Set API Key
+- RSA Public Key 조회
+- Login Sync
+- JWT Validation
+- Normal 상태 표시
+- 에러 처리
+- 알림 row 탭
+
+❌ 나쁜 예 (긴 설명 포함 — 절대 금지):
+- "Export: 환경 데이터를 AES-256-GCM 암호화하여 서버에 저장"
+- "Set API Key: 거래소 API-Key 등록 또는 수정"
+- "RSA Public Key: API-Key 전송 암호화용 RSA 공개키 조회"
+
+→ 설명은 이후 TC 작성 단계에서 step/expected 에 들어갑니다.
+   소분류는 식별자일 뿐.
+
+기타 금지:
 - ⛔ 대분류/중분류/소분류 이름에 괄호 코드를 붙이지 마세요. 예: "FOOTER (FOOT)" ❌ → "Footer" ✅
 - ⛔ TC ID를 생성하지 마세요. TC ID는 이후 단계에서 검토자가 결정합니다.
 - ⛔ TC ID 생성 규칙, TC ID 예시표, 기능-TC 매핑표를 포함하지 마세요.
@@ -3518,10 +3544,55 @@ def step_classify(sess: dict, features_text: str, project_name: str, focus_area:
 ⚠️ 문서 전체를 빠짐없이 분석하여 모든 대분류와 중분류를 포함하세요.
 """
     result = call_claude(system, user, max_tokens=16000)
+    # v0.13.3: AI 가 또 어겼을 때 자동 정리 — 소분류의 ': 설명' 부분 제거
+    result = _strip_minor_descriptions(result)
     classify_path = sess["workspace"] / "04_classification_draft.md"
     classify_path.write_text(result, encoding="utf-8")
     push_log(sess, f"[분류] 분류표 생성 완료 → {len(result):,}자")
     return result
+
+
+# v0.13.3: 분류표 소분류 ': 설명' 자동 정리
+def _strip_minor_descriptions(classification_md: str) -> str:
+    """AI 가 system prompt 를 어기고 '- 소분류명: 부연 설명' 형태로 출력한 경우
+    설명 부분만 잘라 식별자 라벨만 남긴다.
+
+    동작:
+      - '#### 소분류' 헤더 이후 '- xxx: yyy' 패턴 행에서 ': yyy' 잘라냄
+      - 단 head 가 너무 짧으면 (4자 미만) 그대로 보존 (안전)
+      - trigger 라벨 ('시', '탭', '클릭' 등) 로 끝나는 head 는 그대로 (extract_minors 와 동일 정책)
+    """
+    if not classification_md or "#### 소분류" not in classification_md:
+        return classification_md
+
+    out_lines = []
+    in_minor = False
+    TRIGGER_SUFFIXES = ("시", "탭", "후", "클릭", "진입", "선택", "시점")
+
+    for line in classification_md.splitlines():
+        stripped = line.strip()
+        # 섹션 전환
+        if stripped.startswith("#### 소분류"):
+            in_minor = True
+            out_lines.append(line)
+            continue
+        if stripped.startswith("#"):
+            # 다른 헤더 진입 — 소분류 구역 끝
+            in_minor = False
+            out_lines.append(line)
+            continue
+
+        if in_minor and stripped.startswith("-"):
+            # bullet 패턴 - 라벨: 설명
+            m = re.match(r"^(\s*-\s+)([^:]+):\s+(.+)$", line)
+            if m:
+                prefix, head, _tail = m.group(1), m.group(2).strip(), m.group(3)
+                if len(head) >= 4 and not head.endswith(TRIGGER_SUFFIXES):
+                    out_lines.append(f"{prefix}{head}")
+                    continue
+        out_lines.append(line)
+
+    return "\n".join(out_lines)
 
 
 # ── Quick 모드 전용 3단계: 인벤토리 → 분류 → 섹션발췌 ──────────────────────
@@ -3596,12 +3667,34 @@ def step_classify_from_inventory(sess: dict, inventory_text: str,
 ### 중분류: {중분류명}
 
 #### 소분류
-- {소분류명}: {설명}
+- {소분류명}
 
 규칙:
 - 대분류는 비즈니스 영역 단위 (예: Onboarding, Authentication, Trading)
 - 중분류는 화면/주요 기능 단위 (인벤토리의 각 화면/기능이 중분류가 됨)
 - 소분류는 해당 중분류의 테스트 가능한 세부 케이스
+
+⭐ 소분류 작성 원칙 (반드시 준수 — 자주 어김):
+- **핵심 식별 라벨만** (30자 이내 권장)
+- 검증할 동작/케이스의 짧은 이름 1개
+- ⛔ 설명/부연 절대 금지 — ': xxx' 형태로 설명 붙이지 마세요
+- ⛔ 영문 식별자 + 한국어 설명 결합 금지
+
+✅ 좋은 예 (간결, 핵심 단어):
+- Export
+- Set API Key
+- Login Sync
+- JWT Validation
+- Normal 상태 표시
+- 에러 처리
+
+❌ 나쁜 예 (긴 설명 포함 — 절대 금지):
+- "Export: 환경 데이터를 AES-256-GCM 암호화하여 서버에 저장"
+- "Set API Key: 거래소 API-Key 등록 또는 수정"
+
+→ 설명은 TC 작성 단계에서 step/expected 에 들어갑니다. 소분류는 식별자.
+
+기타 금지:
 - ⛔ 대분류/중분류/소분류 이름에 괄호 코드를 붙이지 마세요. 예: "FOOTER (FOOT)" ❌ → "Footer" ✅
 - ⛔ TC ID를 생성하지 마세요.
 - ⛔ TC ID 생성 규칙, TC ID 예시표, 기능-TC 매핑표를 포함하지 마세요.
@@ -3638,6 +3731,8 @@ def step_classify_from_inventory(sess: dict, inventory_text: str,
 ⚠️ 인벤토리의 **모든 항목**을 반드시 포함하세요. 빠뜨리면 안 됩니다.
 """
     result = call_claude(system, user, max_tokens=16000)
+    # v0.13.3: AI 가 또 어겼을 때 자동 정리
+    result = _strip_minor_descriptions(result)
     classify_path = sess["workspace"] / "04_classification_draft.md"
     classify_path.write_text(result, encoding="utf-8")
     push_log(sess, f"[Quick 2/3] 분류표 생성 완료 → {len(result):,}자")
