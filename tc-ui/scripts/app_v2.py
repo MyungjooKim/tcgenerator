@@ -53,11 +53,12 @@ PORT             = int(os.environ.get("PORT", 5001))
 MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
-APP_VERSION         = "v0.13.3"
+APP_VERSION         = "v0.13.4"
 APP_VERSION_DATE    = "2026-05-19"
 APP_VERSION_TAGLINE = "TC 품질 강화 — 블랙박스 원칙 + 분류표 정제 + 차원 매칭 + 안정성"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
+    "🚧 브라우저 이탈 가드 (v0.13.4) — 작업 중 뒤로가기·새로고침·탭 종료 시 확인 다이얼로그 (실수로 작업 손실 차단)",
     "🎯 분류표 소분류 정제 (v0.13.3) — 핵심 라벨만 (설명 자동 제거). 'Export: 환경 데이터를...' → 'Export'",
     "🛡 블랙박스 원칙 강제 (v0.13.2) — expected 에 state.xxx / 함수() / DOM ID 노출 차단",
     "🌙 macOS 자동 슬립 차단 (v0.13.1) — apply-bulk 동안 caffeinate 자동 — 밤새 작업 안전",
@@ -15150,6 +15151,64 @@ function isPipelineRunning() {
   return !!(eventSource && currentSid);
 }
 
+// v0.13.4: 통합 작업 진행 여부 — 브라우저 navigation 가드용
+// 여러 진행 시점 (파이프라인 / plan / apply-bulk / promote) 모두 포함
+function isAnyLongTaskRunning() {
+  // 1. 파이프라인 (분류표 / TC 작성)
+  if (isPipelineRunning()) return { running: true, reason: 'TC 작성 파이프라인' };
+  // 2. plan (사본 생성 + 매핑)
+  if (window._planAbortController) return { running: true, reason: '사본 생성 + 매핑' };
+  // 3. apply-bulk (AI + 셀 갱신, 보통 30분+)
+  if (window._applyBulkRunning) return { running: true, reason: '일괄 적용 (AI + 셀 갱신)' };
+  // 4. promote (사본 → 원본)
+  if (window._promoteRunning) return { running: true, reason: '원본 적용 (백업 + 갱신)' };
+  return { running: false };
+}
+
+// v0.13.4: 브라우저 navigation 가드 (뒤로가기 / 새로고침 / 탭 종료)
+// 등록은 한 번만 — 모듈 초기화 시점에 자동 실행
+(function _installNavGuard() {
+  if (window._navGuardInstalled) return;
+  window._navGuardInstalled = true;
+
+  // 1) beforeunload — 새로고침 / 탭 종료 / 창 닫기
+  window.addEventListener('beforeunload', function(e) {
+    const s = isAnyLongTaskRunning();
+    if (!s.running) return undefined;
+    // 모던 브라우저는 returnValue 만 설정해도 자동 다이얼로그 (메시지는 무시되지만 안전을 위해 설정)
+    const msg = '진행 중인 작업이 있습니다 (' + s.reason + ').';
+    e.preventDefault();
+    e.returnValue = msg;
+    return msg;
+  });
+
+  // 2) popstate — 브라우저 뒤로가기 / 앞으로가기
+  // history 에 dummy state 를 1개 미리 push → 뒤로가기 시 popstate 발생
+  try { history.pushState({ _navGuard: 1 }, ''); } catch (_) {}
+  window.addEventListener('popstate', function(e) {
+    const s = isAnyLongTaskRunning();
+    if (!s.running) {
+      // 작업 없으면 한 번 더 뒤로 — 실제 navigation 허용
+      return;
+    }
+    // 작업 중 — confirm 다이얼로그 + 같은 page 유지
+    const ok = confirm(
+      '⚠️ 뒤로가기 감지\\n\\n' +
+      '진행 중인 작업이 있습니다: ' + s.reason + '\\n\\n' +
+      '뒤로가기 시 작업이 끊기고 결과를 잃을 수 있습니다.\\n' +
+      '계속 진행할까요?\\n\\n' +
+      '(취소 = 현재 페이지 유지 — 권장)'
+    );
+    if (!ok) {
+      // 가드 유지 — 다시 dummy state push 해서 뒤로가기 재무력화
+      try { history.pushState({ _navGuard: 1 }, ''); } catch (_) {}
+      return;
+    }
+    // 사용자가 명시 동의 — 그대로 navigation 진행 (이 경우 작업 끊김 감수)
+    // 추가 동작 없이 popstate 통과 — 브라우저가 이전 page 로 감
+  });
+})();
+
 function restartFromScratch() {
   // 진행 중 가드 — 사용자에게 명확히 알림 + 강제 종료 방지
   if (isPipelineRunning()) {
@@ -17515,6 +17574,9 @@ async function applyBulkForScr(scrId) {
   }
   if (statusEl) statusEl.innerHTML = '';
 
+  // v0.13.4: 브라우저 이탈 가드
+  window._applyBulkRunning = true;
+
   try {
     const r = await fetch('/update/apply-bulk', {
       method: 'POST',
@@ -17540,6 +17602,7 @@ async function applyBulkForScr(scrId) {
       progressEl.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ 네트워크 오류: ' + escapeHtml(e.message) + '</div>';
     }
   } finally {
+    window._applyBulkRunning = false;
     if (groupBtn) {
       groupBtn.disabled = false;
       groupBtn.textContent = '📦 SCR 일괄 적용';
@@ -17644,6 +17707,9 @@ async function applyBulk() {
     }, 1500);
   }
 
+  // v0.13.4: 브라우저 이탈 가드 플래그
+  window._applyBulkRunning = true;
+
   try {
     const r = await fetch('/update/apply-bulk', {
       method: 'POST',
@@ -17667,6 +17733,7 @@ async function applyBulk() {
     if (pollTimer) clearInterval(pollTimer);
     btn.disabled = false;
     btn.textContent = '📦 선택 항목 일괄 적용 (AI 호출 + 사본 셀 갱신)';
+    window._applyBulkRunning = false;
   }
 }
 
@@ -17967,6 +18034,9 @@ async function confirmPromote() {
   confirmBtn.disabled = true;
   confirmBtn.textContent = '⏳ 백업 + 적용 중...';
 
+  // v0.13.4: 브라우저 이탈 가드
+  window._promoteRunning = true;
+
   try {
     const r = await fetch('/update/promote', {
       method: 'POST',
@@ -18021,6 +18091,9 @@ async function confirmPromote() {
     body.innerHTML = '<div style="padding:12px; background:#FEE2E2; color:#991B1B; border-radius:6px;">❌ ' + escapeHtml(e.message) + '</div>';
     confirmBtn.disabled = false;
     confirmBtn.textContent = '✏️ 원본에 적용 (백업 + 갱신)';
+  } finally {
+    // v0.13.4: 브라우저 이탈 가드 해제
+    window._promoteRunning = false;
   }
 }
 
