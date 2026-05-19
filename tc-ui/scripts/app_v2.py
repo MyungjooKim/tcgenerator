@@ -54,18 +54,19 @@ MODEL          = "claude-opus-4-5"
 
 # ── 앱 버전 (단일 소스 — 여기 한 곳만 수정하면 UI 배지/배너/모달/JS 상수 모두 자동 반영) ──
 APP_VERSION         = "v0.13.3"
-APP_VERSION_DATE    = "2026-05-18"
-APP_VERSION_TAGLINE = "TC Update 모드 강화 — AI 차원 매칭 + 신규 TC 자동 권장 + 진행률 + 안정성"
+APP_VERSION_DATE    = "2026-05-19"
+APP_VERSION_TAGLINE = "TC 품질 강화 — 블랙박스 원칙 + 분류표 정제 + 차원 매칭 + 안정성"
 # 릴리즈 요약 — UI 배너/모달용 (4~5줄 권장)
 APP_VERSION_HIGHLIGHTS = [
-    "⭐ AI 차원 매칭 — TC 검증 차원과 SCR 변경 차원 일치 검사 (우겨넣기 사고 차단)",
-    "🆕 needs_new_tc 자동 권장 — 차원 불일치 시 별도 TC 작성 권장 + 카테고리 표시",
-    "📊 일괄 적용 진행률 실시간 — 1.5초마다 polling + 처리 카운트/현재 TC ID 표시",
-    "📝 TC Edit Log incremental append — 5건마다 자동 flush (긴 작업도 중간 확인 가능)",
-    "🔌 SSE 재연결 강화 — 8회/60초 견딤 + 조용한 자동 복구 안내",
-    "🔄 admin/restart 안정화 — subprocess launcher 로 자기 재시작 (execv 한계 우회)",
-    "💨 브라우저 캐시 자동 무효화 — meta no-cache + HTTP header (Cmd+Shift+R 불필요)",
-    "🛠 기존 v0.12.x 누적 fix 17건 — 라벨 잘림, 분류 휴리스틱, 사본 동기화, 미리보기 UI 등",
+    "🎯 분류표 소분류 정제 (v0.13.3) — 핵심 라벨만 (설명 자동 제거). 'Export: 환경 데이터를...' → 'Export'",
+    "🛡 블랙박스 원칙 강제 (v0.13.2) — expected 에 state.xxx / 함수() / DOM ID 노출 차단",
+    "🌙 macOS 자동 슬립 차단 (v0.13.1) — apply-bulk 동안 caffeinate 자동 — 밤새 작업 안전",
+    "⭐ AI 차원 매칭 (v0.13.0) — TC 검증 차원 ≠ SCR 변경 차원 → 우겨넣기 사고 차단",
+    "🆕 needs_new_tc 자동 권장 (v0.13.0) — 차원 불일치 시 별도 TC 작성 권장 + 카테고리 표시",
+    "📊 일괄 적용 진행률 실시간 (v0.13.0) — 1.5초 polling + 진행 바 + 현재 TC ID",
+    "📝 TC Edit Log incremental (v0.13.0) — 5건마다 자동 flush (긴 작업 중간 확인 가능)",
+    "🔄 admin/restart 안정화 (v0.13.0) + 캐시 자동 무효화 (Cmd+Shift+R 불필요)",
+    "🛠 v0.12.x 누적 17건 — 라벨 32자 절단 제거, 백틱 잔재 차단, scr_filter 미분석 제외 등",
 ]
 
 WORKSPACE_ROOT.mkdir(exist_ok=True)
